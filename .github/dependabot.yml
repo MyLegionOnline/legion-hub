@@ -16,6 +16,13 @@ updates:
     schedule: { interval: weekly }
     groups:
       python: { patterns: ["*"] }
+    ignore:
+      # 0.0.45+ rejects naive datetimes; the backend writes datetime.utcnow() everywhere.
+      - dependency-name: "sqlmodel"
+        versions: [">=0.0.45"]
+      # passlib 1.7.4 probes bcrypt with a 255-byte secret, which bcrypt 5 refuses.
+      - dependency-name: "bcrypt"
+        versions: [">=4.1"]
   - package-ecosystem: pip
     directory: "/hub/workspaced"
     schedule: { interval: weekly }
@@ -38,6 +45,11 @@ updates:
     schedule: { interval: weekly }
     groups:
       npm: { patterns: ["*"] }
+    ignore:
+      # ESLint 9+ drops .eslintrc and --ext and eslint-plugin-react does not
+      # accept 10 yet; moving to flat config is its own change.
+      - dependency-name: "eslint"
+        update-types: ["version-update:semver-major"]
 
   # ── Base images ──────────────────────────────────────────────────────────
   - package-ecosystem: docker

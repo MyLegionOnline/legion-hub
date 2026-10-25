@@ -46,9 +46,9 @@ updates:
     groups:
       npm: { patterns: ["*"] }
     ignore:
-      # ESLint 9+ drops .eslintrc and --ext and eslint-plugin-react does not
-      # accept 10 yet; moving to flat config is its own change.
-      - dependency-name: "eslint"
+      # Majors are migrations, not bumps (React 19, Router 7, Tailwind 4, Vite 8,
+      # ESLint 9+ flat config): each is its own change, made by hand.
+      - dependency-name: "*"
         update-types: ["version-update:semver-major"]
 
   # ── Base images ──────────────────────────────────────────────────────────

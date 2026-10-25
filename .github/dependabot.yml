@@ -50,6 +50,9 @@ updates:
       # ESLint 9+ flat config): each is its own change, made by hand.
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
+      # A 0.x "minor" that needs ESLint 9+: part of the ESLint move, not a bump.
+      - dependency-name: "eslint-plugin-react-refresh"
+        versions: [">=0.5"]
 
   # ── Base images ──────────────────────────────────────────────────────────
   - package-ecosystem: docker

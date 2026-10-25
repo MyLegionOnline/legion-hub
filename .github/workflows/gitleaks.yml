@@ -25,4 +25,4 @@ jobs:
           curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
             | tar -xz -C "$RUNNER_TEMP/gitleaks" gitleaks
       - name: Scan the history
-        run: "$RUNNER_TEMP/gitleaks/gitleaks" git --redact --verbose
+        run: '"$RUNNER_TEMP/gitleaks/gitleaks" git --redact --verbose'

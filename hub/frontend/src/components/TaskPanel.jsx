@@ -36,12 +36,10 @@ export const RUNTIME_META = {
 
 // Truly active right now — Start must be hidden/disabled and the ephemeral
 // live badge is meaningful.
-// eslint-disable-next-line react-refresh/only-export-components
 export const RUNTIME_ACTIVE = new Set(['running', 'dispatching']);
 // Any runtime status where a "…→ in_progress" transition (Start/Resume/
 // Unblock/Rework) must not be offered: either it's already executing, or the
 // lifecycle contract says only the explicit Retry action may restart it.
-// eslint-disable-next-line react-refresh/only-export-components
 export const RUNTIME_BLOCKS_START = new Set(['running', 'dispatching', 'needs_retry', 'dispatch_failed']);
 
 // ── session-interruption reason formatting (internal design notes, part 4) ──

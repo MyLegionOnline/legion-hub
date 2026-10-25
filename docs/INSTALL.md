@@ -143,6 +143,26 @@ page: keep registration `closed` or `invite`.
 `HUB_PUBLIC_URL=http://<this machine's address>:8080`. Traffic is not
 encrypted, so use this on a network you trust.
 
+## Connecting to Legion Market
+
+The Hub works without Legion Market and, out of the box, never contacts it.
+Connect it if you want to browse and install from the Market catalogue, or use
+Market tools (web search, the SSH tool for servers, image understanding) paid
+for with Legion account credits.
+
+1. In `.env` in the install folder, add `MARKET_ENABLED=true`.
+2. Apply it: `docker compose up -d`. The Marketplace button appears in the Hub.
+3. To use Market tools, each user links their own Legion account: create an API
+   key in the Legion profile, then paste it in **Settings → Profile → Legion
+   account**. Unlinking there forgets the key on this Hub.
+
+Once an account is linked, the Market's
+[Terms of Service](https://market.mylegion.online/terms) and
+[Privacy Policy](https://market.mylegion.online/privacy) apply to it. What the
+Hub sends to Legion is in [SELF_HOSTING_PRIVACY.md](SELF_HOSTING_PRIVACY.md);
+the setting itself is in [CONFIGURATION.md](CONFIGURATION.md#legion-market). To
+disconnect, remove the line (or set `false`) and run `docker compose up -d` again.
+
 ## Updating
 
 ```bash

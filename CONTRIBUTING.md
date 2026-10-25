@@ -101,3 +101,4 @@ After a change in one service, `docker compose build <service> && docker compose
 - New dependencies: prefer none. If one is needed, its license must be compatible
   with AGPL-3.0 (MIT, BSD, Apache-2.0, ISC and similar), and it goes into
   [docs/DEPENDENCY_LICENSES.md](docs/DEPENDENCY_LICENSES.md).
+

@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional, List, TYPE_CHECKING
 from uuid import UUID, uuid4
-from sqlalchemy import Column, Integer, String, DateTime, Uuid
+from sqlalchemy import Column, Integer, String, DateTime, Uuid, text
 from sqlmodel import SQLModel, Field, Relationship, JSON
 
 if TYPE_CHECKING:
@@ -265,7 +265,7 @@ class Task(SQLModel, table=True):
     )
     checkpoint_payload: dict = Field(
         default_factory=dict,
-        sa_column=Column(JSON, nullable=False),
+        sa_column=Column(JSON, nullable=False, server_default=text("'{}'")),
     )
     checkpoint_choice: Optional[dict] = Field(
         default=None,

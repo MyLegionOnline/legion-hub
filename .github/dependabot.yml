@@ -61,6 +61,10 @@ updates:
   - package-ecosystem: docker
     directory: "/mcp_runner"
     schedule: { interval: weekly }
-  - package-ecosystem: docker
+  # The install stack is a Compose file, not a Dockerfile. Its own images are
+  # pinned to the release tag, so only the third-party ones are watched.
+  - package-ecosystem: docker-compose
     directory: "/deploy/selfhost"
     schedule: { interval: weekly }
+    ignore:
+      - dependency-name: "ghcr.io/mylegiononline/*"

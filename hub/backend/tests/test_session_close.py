@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import os
 import types
+import json
 import uuid
 from typing import AsyncGenerator
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -667,10 +668,11 @@ async def _insert_fixtures(db, room_id, user_id, agent_id):
     )
     await db.execute(
         text(
-            "INSERT INTO room (id, name, type, room_type, has_coordinator, creator_id, state) "
-            "VALUES (:id, 'test', 'group', 'group', false, :cid, 'PLANNING') ON CONFLICT DO NOTHING"
+            "INSERT INTO room (id, name, type, room_type, has_coordinator, creator_id, state, coordinator_config) "
+            "VALUES (:id, 'test', 'group', 'group', false, :cid, 'PLANNING', CAST(:coord AS JSON)) ON CONFLICT DO NOTHING"
         ),
-        {"id": str(room_id), "cid": str(user_id)},
+        # The agent is also the room's ChatMaster: a task is dispatched only in a room that has one.
+        {"id": str(room_id), "cid": str(user_id), "coord": json.dumps({"agent_id": str(agent_id)})},
     )
     await db.execute(
         text(
@@ -685,6 +687,11 @@ async def _insert_fixtures(db, room_id, user_id, agent_id):
             "oid": str(user_id),
             "tok": f"tok-{agent_id}",
         },
+    )
+    # A task is dispatched only to an agent that is a member of the room.
+    await db.execute(
+        text("INSERT INTO roomagentlink (room_id, agent_id) VALUES (:rid, :aid) ON CONFLICT DO NOTHING"),
+        {"rid": str(room_id), "aid": str(agent_id)},
     )
     await db.execute(
         text(

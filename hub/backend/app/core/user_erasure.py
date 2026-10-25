@@ -79,6 +79,7 @@ HANDLED_TABLES: dict[str, tuple[str, str]] = {
     "personal_mcp_event": (ERASE, "log of a runner"),
     "personal_mcp_import_preview": (ERASE, "uploaded MCP config previews"),
     "provider_connection": (ERASE, "LLM provider connections"),
+    "chatgpt_authorization": (ERASE, "pending ChatGPT sign-ins, encrypted; go with the provider connection"),
     "user_secret": (ERASE, "secrets, ciphertext included"),
     "secret_binding": (ERASE, "bindings of secrets to rooms, MCPs, agents"),
     "secret_lease": (ERASE, "leases of secrets"),
@@ -302,11 +303,13 @@ async def _erase_connectors(user_id: UUID, db: AsyncSession) -> dict[str, int]:
 
 
 async def _erase_keys_and_secrets(user_id: UUID, db: AsyncSession) -> dict[str, int]:
+    from app.models.chatgpt_auth import ChatGPTAuthorization
     from app.models.legion_link import LegionLink
     from app.models.provider_connection import ProviderConnection
     from app.models.secret import SecretAudit, SecretBinding, SecretLease, UserSecret
 
     secret_ids = (await db.execute(select(UserSecret.id).where(UserSecret.owner_id == user_id))).scalars().all()
+    await db.execute(delete(ChatGPTAuthorization).where(ChatGPTAuthorization.owner_id == user_id))
     await db.execute(delete(ProviderConnection).where(ProviderConnection.user_id == user_id))
     await db.execute(delete(SecretLease).where(SecretLease.owner_id == user_id))
     await db.execute(delete(SecretBinding).where(SecretBinding.owner_id == user_id))

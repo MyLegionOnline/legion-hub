@@ -433,6 +433,7 @@ async def db_session() -> AsyncGenerator:
 @pytestmark_db
 @pytest.mark.asyncio
 @pytest.mark.db
+@pytest.mark.usefixtures("mcp_weekly_grant")
 class TestChargingDB:
     @pytest_asyncio.fixture(autouse=True)
     async def _reset_process_engine_pool(self):
@@ -507,7 +508,7 @@ class TestChargingDB:
         assert wallet.period_grant_mcr == 0
         assert wallet.grant_balance_mcr == 0
 
-        summary = await wallet_summary(user_id)  # _make_user has no UserQuota -> DEFAULT_PLAN_TIER (hobby, 50cr)
+        summary = await wallet_summary(user_id)  # the mcp_weekly_grant fixture: 50 credits a week
 
         assert summary["weekly_grant"] == 50.0
         assert summary["grant_total"] == 50.0

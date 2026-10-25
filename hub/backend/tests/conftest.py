@@ -36,6 +36,44 @@ os.environ.setdefault("VPS_EGRESS_TICKET_SECRET", "test-egress-ticket-secret")
 # The Market integration is off unless switched on; most tests exercise it, and
 # tests/test_market_switch.py covers the off state explicitly.
 os.environ.setdefault("MARKET_ENABLED", "true")
+# Market MCP calls are paid from the Hub's own wallet in most tests; the tests of
+# the Legion wallet (tests/test_legion_wallet.py) set "legion" themselves.
+os.environ.setdefault("MCP_CREDITS_WALLET", "hub")
+
+
+def _test_keyring() -> None:
+    """A throwaway encryption keyring for stored secrets, as keyring-init makes one."""
+    if os.getenv("SECRET_KEYRING_PATH"):
+        return
+    import base64
+    import json
+    import secrets
+    import tempfile
+
+    fd, path = tempfile.mkstemp(prefix="legion-test-keyring-")  # created 0600
+    with os.fdopen(fd, "w") as handle:
+        json.dump({"active_key_id": "test", "keys": {"test": base64.b64encode(secrets.token_bytes(32)).decode()}}, handle)
+    os.environ["SECRET_KEYRING_PATH"] = path
+
+
+_test_keyring()
+
+
+@pytest.fixture
+def mcp_weekly_grant(monkeypatch):
+    """A weekly MCP credit grant of 50 credits, as the cloud's tariffs give one.
+
+    A self-hosted Hub grants none by default (``mcp_weekly_credits`` is 0), and
+    the tariffs live in the cloud plugin, so credit tests that spend from the
+    grant set it here instead of depending on that plugin being installed.
+    """
+    from app.core import mcp_credits
+
+    async def _grant(user_id, db):
+        return mcp_credits.credits_to_mcr(50)
+
+    monkeypatch.setattr(mcp_credits, "_weekly_grant_mcr_for", _grant)
+    return 50
 
 
 @pytest.fixture

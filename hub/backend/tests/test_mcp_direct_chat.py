@@ -332,4 +332,6 @@ async def test_process_user_turn_never_publishes_a_result_after_external_stop():
         still_open = await process_user_turn(session, "stop now", db)
 
     assert still_open is False
-    broadcast.assert_not_awaited()
+    # Only the "turn accepted" status may go out; no message or result.
+    sent = [call.args[0] for call in broadcast.await_args_list]
+    assert all(event.get("type") == "agent_status" and event.get("status") == "turn_accepted" for event in sent), sent

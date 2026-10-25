@@ -1296,8 +1296,17 @@ async def init_db():
     """
     import app.models  # noqa: F401 — registers ALL tables in SQLModel.metadata
 
+    from app.db.server_defaults import apply_missing_server_defaults, give_scalar_server_defaults
+
+    give_scalar_server_defaults(SQLModel.metadata)  # again: plugin models load after app.models
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
+
+    try:
+        async with engine.begin() as conn:
+            await apply_missing_server_defaults(conn, SQLModel.metadata)
+    except Exception as exc:
+        logger.warning("init_db: server defaults not applied — %s: %s", type(exc).__name__, exc)
 
     from app.plugins import get_registry
 

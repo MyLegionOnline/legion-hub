@@ -555,13 +555,16 @@ class TestRegistrySanity:
         assert "grep" in cm_names
 
     def test_allowed_filter_restricts_tools(self):
-        """tools_allowed restricts the set to the specified subset."""
+        """tools_allowed restricts the set to the specified subset, plus the
+        tools every agent is always offered (reply_to_user)."""
+        always = {t.name for t in REGISTRY.tools_for("agent") if t.always_offered}
+        assert always  # reply_to_user at least
         restricted = {t.name for t in REGISTRY.tools_for("agent", allowed=["bash", "read_file"])}
-        assert restricted == {"bash", "read_file"}
+        assert restricted == {"bash", "read_file"} | always
 
-    def test_allowed_filter_empty_list_returns_empty(self):
+    def test_allowed_filter_empty_list_leaves_only_the_always_offered(self):
         restricted = REGISTRY.tools_for("agent", allowed=[])
-        assert restricted == []
+        assert restricted and all(t.always_offered for t in restricted)
 
     def test_allowed_none_returns_all_role_tools(self):
         all_agent = REGISTRY.tools_for("agent", allowed=None)

@@ -32,8 +32,11 @@ permissions:
 
 jobs:
   cla:
+    # Dependabot's pull requests get no repository secrets, and a bot signs no
+    # CLA: the job is skipped for them, and a skipped required check passes.
     if: >-
       github.repository == 'MyLegionOnline/legion-hub' &&
+      github.actor != 'dependabot[bot]' &&
       (github.event_name == 'pull_request_target' ||
        (github.event.issue.pull_request &&
         (github.event.comment.body == 'recheck' ||

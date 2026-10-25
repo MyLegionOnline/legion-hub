@@ -551,6 +551,7 @@ class _FakeWebSocket:
 
 @pytest.mark.asyncio
 async def test_websocket_cap_is_per_service_and_slots_are_released(monkeypatch):
+    monkeypatch.setenv("WORKSPACE_PREVIEW_GATEWAY_ENABLED", "true")
     monkeypatch.setenv("WORKSPACE_PREVIEW_MAX_WEBSOCKETS", "2")
     gateway._OPEN_WEBSOCKETS.clear()
     first, second = uuid4(), uuid4()
@@ -593,6 +594,7 @@ async def test_websocket_cap_is_per_service_and_slots_are_released(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_websocket_slot_is_released_when_the_relay_fails(monkeypatch):
+    monkeypatch.setenv("WORKSPACE_PREVIEW_GATEWAY_ENABLED", "true")
     monkeypatch.setenv("WORKSPACE_PREVIEW_MAX_WEBSOCKETS", "1")
     gateway._OPEN_WEBSOCKETS.clear()
     service_id = uuid4()

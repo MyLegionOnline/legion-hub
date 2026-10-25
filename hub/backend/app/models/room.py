@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional, List, TYPE_CHECKING, Dict, Any
 from uuid import UUID, uuid4
-from sqlalchemy import DateTime
+from sqlalchemy import DateTime, func
 from sqlmodel import SQLModel, Field, Relationship, Column, JSON
 
 if TYPE_CHECKING:
@@ -77,7 +77,7 @@ class Room(RoomBase, table=True):
     # (see internal design notes Part 2, Stage 1).
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
-        sa_column=Column(DateTime(timezone=True), nullable=False),
+        sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()),
     )
     # Durable marker for the two-system room deletion transaction.  It keeps
     # new workspace starts out while the external destroy is retried.

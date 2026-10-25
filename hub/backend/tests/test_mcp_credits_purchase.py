@@ -48,6 +48,7 @@ async def db_session() -> AsyncGenerator:
 @pytestmark_db
 @pytest.mark.asyncio
 @pytest.mark.db
+@pytest.mark.usefixtures("mcp_weekly_grant")
 class TestInstallPurchaseDB:
     @pytest_asyncio.fixture(autouse=True)
     async def _reset_process_engine_pool(self):

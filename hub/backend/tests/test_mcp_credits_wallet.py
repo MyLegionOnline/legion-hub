@@ -258,6 +258,16 @@ async def db_session() -> AsyncGenerator:
 @pytest.mark.asyncio
 @pytest.mark.db
 class TestWalletDB:
+    @pytest_asyncio.fixture(autouse=True)
+    async def _reset_process_engine_pool(self):
+        """wallet_summary/topup/adjust use the process-global engine; each test
+        has its own event loop, so connections pooled by an earlier test must go
+        (the same reason as TestChargingDB in test_mcp_credits.py)."""
+        from app.db.session import engine
+
+        await engine.dispose()
+        yield
+
     async def _make_user(self, db) -> uuid.UUID:
         from sqlalchemy import text
 
@@ -307,6 +317,7 @@ class TestWalletDB:
         from app.core.mcp_credits import wallet_summary
 
         user_id = await self._make_user(db_session)
+        await db_session.commit()  # wallet_summary opens its own session and must see the user
         # wallet_summary opens its own session; DATABASE_URL points at the same DB.
         summary = await wallet_summary(user_id)
 

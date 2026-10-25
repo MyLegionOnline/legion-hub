@@ -142,7 +142,9 @@ class TestNeverInARoom:
         db = AsyncMock()
         db.add = MagicMock()
         db.get = AsyncMock(return_value=router)
-        room = SimpleNamespace(id=uuid.uuid4())
+        from app.models.room import RoomType
+
+        room = SimpleNamespace(id=uuid.uuid4(), room_type=RoomType.group)
         with pytest.raises(rm.RoomAgentMembershipError) as exc:
             await rm.add_agent_to_room(room, router.id, router.owner_id, db)
         assert exc.value.code == "system_agent"

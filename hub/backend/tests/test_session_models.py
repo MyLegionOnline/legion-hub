@@ -327,10 +327,10 @@ class TestSessionRepositoryDB:
         )
         await db.execute(
             text(
-                "INSERT INTO agent (id, name, owner_id, system_prompt, short_description)"
-                " VALUES (:id, 'a', :oid, '', '')"
+                "INSERT INTO agent (id, nickname, agent_uid, token, owner_id)"
+                " VALUES (:id, 'a', :uid, :uid, :oid)"
             ),
-            {"id": str(agent_id), "oid": str(user_id)},
+            {"id": str(agent_id), "uid": f"agent-{agent_id}", "oid": str(user_id)},
         )
         await db.flush()
         return room_id, user_id, agent_id

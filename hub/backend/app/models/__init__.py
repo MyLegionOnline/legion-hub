@@ -133,3 +133,9 @@ __all__ = [
 ]
 
 from .chatgpt_auth import ChatGPTAuthorization, ChatGPTHost
+
+# Last, once every table is registered: see app/db/server_defaults.py.
+from sqlmodel import SQLModel as _SQLModel
+from app.db.server_defaults import give_scalar_server_defaults as _give_scalar_server_defaults
+
+_give_scalar_server_defaults(_SQLModel.metadata)

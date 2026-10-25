@@ -62,6 +62,12 @@ class Market:
     def handle(self, request: httpx.Request) -> httpx.Response:
         if self.down:
             raise httpx.ConnectError("down", request=request)
+        if request.url == f"{MARKET}/api/wallet":
+            # The settings card also shows the Own Hubs wallet; not counted in ``seen``.
+            account = self.accounts.get(request.headers.get("authorization", "").partition(" ")[2])
+            if account is None:
+                return httpx.Response(401, json={"detail": "API key is invalid or revoked"})
+            return httpx.Response(200, json={"account": account, "wallet": {"balance": 0, "ledger": []}})
         assert request.url == f"{MARKET}/api/account/me"
         scheme, _, key = request.headers.get("authorization", "").partition(" ")
         assert scheme == "Bearer"

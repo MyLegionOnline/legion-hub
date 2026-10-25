@@ -6,6 +6,7 @@ import { Meter, McpPriceInfo, formatCredits } from './ConnectionsPanel';
 import { LegionLinkCard } from './LegionLinkCard';
 import { InvitesCard } from './InvitesCard';
 import { useFeatures } from '../lib/features';
+import { firstSelectableModel, isModelSelectable, unavailableLabel } from '../lib/modelAvailability';
 import { LEVEL_COLORS, cleanDependencies, cleanResultText, fetchUsage, formatMb, levelOf, saveActiveRooms } from '../lib/storageQuota';
 import { useBillingLinks } from '../lib/authConfig';
 import { BILLING_APPLIED_EVENT, openBillingOffer } from '../lib/billingOffer';
@@ -814,7 +815,8 @@ function ApiKeyProviderCard({ provider, onDelete, onSetDefault, isDefault, taken
         setStatus('ok');
         setModels(data.models);
         setWarningMsg(data.warning || '');
-        const sel = data.models.find(m => m.id === selectedModel) ? selectedModel : (data.models[0]?.id || '');
+        const kept = data.models.find(m => m.id === selectedModel);
+        const sel = kept && isModelSelectable(kept) ? selectedModel : (firstSelectableModel(data.models)?.id || '');
         setSelectedModel(sel);
         onSetDefault(provider.uid, { base_url: baseUrl, models: data.models, selectedModel: sel, status: 'ok', errorMsg: '' });
       } else {
@@ -946,7 +948,9 @@ function ApiKeyProviderCard({ provider, onDelete, onSetDefault, isDefault, taken
                 style={{ background: 'var(--bg-base)', border: '1px solid rgba(16,185,129,0.4)', color: 'var(--text-primary)', cursor: 'pointer' }}
               >
                 {models.map(m => (
-                  <option key={m.id} value={m.id}>{m.name || m.id}</option>
+                  <option key={m.id} value={m.id} disabled={!isModelSelectable(m)}>
+                    {m.name || m.id}{isModelSelectable(m) ? '' : ` — ${unavailableLabel(m)}`}
+                  </option>
                 ))}
               </select>
               <ChevronDown size={13} className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none" style={{ color: 'var(--text-secondary)' }} />

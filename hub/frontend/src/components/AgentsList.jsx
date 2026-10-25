@@ -11,6 +11,7 @@ import {
   validateAvatarFile,
 } from '../lib/agentAvatars';
 import { useProviderConnections } from '../lib/providerConnections';
+import { firstSelectableModel, isModelSelectable, unavailableLabel } from '../lib/modelAvailability';
 import { bindAgentSecret } from '../lib/agentSecrets';
 import { useOnboarding } from '../lib/onboardingContext';
 import { Spot } from './OnboardingHint';
@@ -180,7 +181,7 @@ function ProviderModelPicker({ providerId, providerUid, providerName, baseUrl, m
     if (!selectedProvider || autoPicked.current) return;
     autoPicked.current = true;
     if (selectedProvider.id !== providerId) {
-      onChange(providerChange(selectedProvider, selectedProvider.models?.[0] || null));
+      onChange(providerChange(selectedProvider, firstSelectableModel(selectedProvider.models)));
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedProvider?.uid]);
@@ -201,11 +202,12 @@ function ProviderModelPicker({ providerId, providerUid, providerName, baseUrl, m
   const handleProviderChange = (p) => {
     setModelFilter('');
     setListOpen(true);
-    onChange(providerChange(p, p.models?.[0] || null));
+    onChange(providerChange(p, firstSelectableModel(p.models)));
   };
 
   const handleModelSelect = (modelId) => {
     const m = allModels.find(x => x.id === modelId) || null;
+    if (m && !isModelSelectable(m)) return;
     setModelFilter('');
     setListOpen(false);
     // Picking a model keeps whatever key the user chose for this agent.
@@ -292,22 +294,37 @@ function ProviderModelPicker({ providerId, providerUid, providerName, baseUrl, m
                   ) : (
                     filtered.map(m => {
                       const isSelected = model === m.id;
+                      // The gateway lists it but refused this key: shown, not choosable.
+                      const selectable = isModelSelectable(m);
                       return (
                         <button
                           key={m.id}
                           type="button"
-                          onMouseDown={(e) => { e.preventDefault(); handleModelSelect(m.id); }}
+                          disabled={!selectable}
+                          aria-disabled={!selectable}
+                          title={selectable ? undefined : unavailableLabel(m)}
+                          onMouseDown={(e) => { e.preventDefault(); if (selectable) handleModelSelect(m.id); }}
                           className="w-full text-left px-3 py-2 text-xs font-mono transition-all flex items-center justify-between gap-2"
                           style={{
                             background: isSelected ? 'rgba(99,102,241,0.2)' : 'transparent',
                             color: isSelected ? 'var(--accent-light)' : 'var(--text-secondary)',
                             borderBottom: '1px solid var(--border)',
                             fontWeight: isSelected ? 600 : 400,
+                            opacity: selectable ? 1 : 0.45,
+                            cursor: selectable ? 'pointer' : 'not-allowed',
                           }}
                         >
                           <span className="flex items-center gap-1.5 min-w-0">
                             <span className="truncate">{m.id}</span>
                             {renderExtra && renderExtra(m)}
+                            {!selectable && (
+                              <span
+                                className="text-[9px] px-1.5 py-0.5 rounded-md font-sans whitespace-nowrap"
+                                style={{ background: 'rgba(245,158,11,0.12)', color: '#fbbf24', border: '1px solid rgba(245,158,11,0.3)' }}
+                              >
+                                {unavailableLabel(m)}
+                              </span>
+                            )}
                           </span>
                           {isSelected && <Check size={12} style={{ color: 'var(--accent-light)', flexShrink: 0 }} />}
                         </button>

@@ -1,0 +1,1 @@
+"""Legion MCP Gateway service."""

@@ -1,0 +1,137 @@
+name: CLA
+
+# Contributor License Agreement acceptance (CLA.md, CONTRIBUTING.md).
+# A contributor accepts by posting the exact sign phrase below on their pull
+# request. The acceptance record is kept outside this public repository, in the
+# private repository MyLegionOnline/legion-cla-signatures, one file per CLA
+# version: GitHub login, numeric user id, comment id, pull request number,
+# repository id and time. The comment itself stays on the pull request.
+# A tag can be moved, so a second file next to it records the commit the
+# cla-v<version> tag pointed at when each acceptance was made (CLA.md, header
+# and section 9). The bot's own file has no place for it.
+#
+# A new CLA version needs: a new tag `cla-v<version>`, a new signatures file
+# and a new sign phrase, so every contributor accepts the new text once.
+#
+# Secrets: CLA_SIGNATURES_TOKEN is a fine-grained token with "Contents: read and
+# write" on MyLegionOnline/legion-cla-signatures only.
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, closed, synchronize]
+
+# pull_request_target runs with secrets: this workflow never checks out or runs
+# code from the pull request.
+permissions:
+  actions: write
+  contents: read
+  pull-requests: write
+  statuses: write
+
+jobs:
+  cla:
+    if: >-
+      github.repository == 'MyLegionOnline/legion-hub' &&
+      (github.event_name == 'pull_request_target' ||
+       (github.event.issue.pull_request &&
+        (github.event.comment.body == 'recheck' ||
+         github.event.comment.body == 'I have read the Legion Hub Contributor License Agreement version 1.0 and I accept it.')))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: contributor-assistant/github-action@v2.6.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_SIGNATURES_TOKEN }}
+        with:
+          remote-organization-name: MyLegionOnline
+          remote-repository-name: legion-cla-signatures
+          branch: main
+          path-to-signatures: legion-hub/cla-v1.0.json
+          # The tag pins the exact text that was accepted.
+          path-to-document: https://github.com/MyLegionOnline/legion-hub/blob/cla-v1.0/CLA.md
+          allowlist: dependabot[bot],github-actions[bot]
+          custom-notsigned-prcomment: >-
+            Thank you for your contribution. Before we can merge it, please read the
+            [Contributor License Agreement, version 1.0](https://github.com/MyLegionOnline/legion-hub/blob/cla-v1.0/CLA.md)
+            and accept it by posting the comment below exactly as written. You only
+            need to do this once. What we record when you accept, and why, is in
+            [About the acceptance record](https://github.com/MyLegionOnline/legion-hub/blob/main/CONTRIBUTING.md#about-the-acceptance-record).
+          custom-pr-sign-comment: I have read the Legion Hub Contributor License Agreement version 1.0 and I accept it.
+          custom-allsigned-prcomment: All contributors have accepted the Contributor License Agreement.
+          lock-pullrequest-aftermerge: false
+
+      # Runs only after the step above passed, that is when every contributor of
+      # the pull request has an acceptance in the signatures file. An acceptance
+      # of this pull request that has no commit yet gets the commit the tag
+      # points at now; on a failed write the next "recheck" fills it in.
+      - name: Record the commit of the accepted text
+        uses: actions/github-script@v7.0.1
+        env:
+          SIGNATURES_TOKEN: ${{ secrets.CLA_SIGNATURES_TOKEN }}
+        with:
+          script: |
+            const remote = getOctokit(process.env.SIGNATURES_TOKEN);
+            const store = { owner: 'MyLegionOnline', repo: 'legion-cla-signatures' };
+            const branch = 'main';
+            const version = '1.0';
+            const tag = `cla-v${version}`;
+            const signaturesPath = `legion-hub/${tag}.json`;
+            const commitsPath = `legion-hub/${tag}-commits.json`;
+            const pr = context.issue.number;
+
+            async function read(path) {
+              try {
+                const { data } = await remote.rest.repos.getContent({ ...store, path, ref: branch });
+                return { sha: data.sha, json: JSON.parse(Buffer.from(data.content, 'base64').toString('utf8')) };
+              } catch (e) {
+                if (e.status === 404) return { sha: undefined, json: null };
+                throw e;
+              }
+            }
+
+            const { json: signatures } = await read(signaturesPath);
+            const accepted = (signatures?.signedContributors ?? []).filter(s => s.pullRequestNo === pr);
+            if (accepted.length === 0) {
+              core.info(`No acceptance was made in pull request #${pr}.`);
+              return;
+            }
+
+            // Follow an annotated tag to its commit.
+            let { data: { object: target } } = await github.rest.git.getRef({ ...context.repo, ref: `tags/${tag}` });
+            while (target.type === 'tag') {
+              ({ data: { object: target } } = await github.rest.git.getTag({ ...context.repo, tag_sha: target.sha }));
+            }
+            if (target.type !== 'commit') throw new Error(`${tag} points at a ${target.type}, not a commit`);
+
+            for (let attempt = 1; ; attempt++) {
+              const { sha, json } = await read(commitsPath);
+              const ledger = json ?? { acceptances: [] };
+              const known = new Set(ledger.acceptances.map(a => a.comment_id));
+              const missing = accepted.filter(s => !known.has(s.comment_id));
+              if (missing.length === 0) {
+                core.info('Every acceptance of this pull request already has its commit.');
+                return;
+              }
+              for (const s of missing) {
+                ledger.acceptances.push({
+                  name: s.name, id: s.id, comment_id: s.comment_id, created_at: s.created_at,
+                  repoId: s.repoId, pullRequestNo: s.pullRequestNo,
+                  version, tag, commit: target.sha, recorded_at: new Date().toISOString(),
+                });
+              }
+              try {
+                await remote.rest.repos.createOrUpdateFileContents({
+                  ...store, branch, path: commitsPath, sha,
+                  message: `Record the ${tag} commit for ${missing.map(s => s.name).join(', ')} (#${pr})`,
+                  content: Buffer.from(JSON.stringify(ledger, null, 2) + '\n').toString('base64'),
+                });
+                core.info(`Recorded ${tag} at ${target.sha} for ${missing.length} acceptance(s).`);
+                return;
+              } catch (e) {
+                // Another run wrote the file since it was read: read it again.
+                if (attempt >= 5 || ![409, 422].includes(e.status)) throw e;
+              }
+            }

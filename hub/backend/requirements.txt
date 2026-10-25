@@ -1,0 +1,24 @@
+fastapi
+uvicorn[standard]
+sqlalchemy[asyncio]
+sqlmodel<0.0.45  # 0.0.45 maps datetime to UTCDateTime and rejects naive values; the backend writes datetime.utcnow() everywhere
+pydantic[email]
+email-validator
+pydantic-settings
+alembic
+asyncpg
+python-jose[cryptography]
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+python-multipart
+pyyaml
+websockets
+httpx
+openai
+aioboto3
+redis[asyncio]
+prometheus-client
+markdownify
+pynacl
+playwright
+Pillow

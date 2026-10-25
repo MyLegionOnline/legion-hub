@@ -1,0 +1,15 @@
+# Test-only dependencies. Deliberately NOT in requirements.txt and NOT in the
+# Dockerfile: the production image has no reason to carry a test runner.
+#
+# The catch this file exists for: the running backend container had these
+# installed by hand, so recreating it (docker compose up -d backend, as opposed
+# to restart) silently left a container where `python -m pytest` no longer
+# exists — the test suite looks gone rather than broken. Reinstall with:
+#
+#   docker exec deployment-backend-1 pip install -r /app/requirements-dev.txt
+#
+# pytest.ini sets asyncio_mode = strict, so pytest-asyncio is required, not
+# optional. pytest-randomly is what `-p no:randomly` refers to.
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pytest-randomly==5.0.0

@@ -1,0 +1,9 @@
+{
+  "_comment": "Skills shipped with the Hub image (internal design notes stage 3). The only source of these skills: Market does not republish them (Market-only skills are kept with Market). default=true -> installed for every new user without asking Market; default=false -> shipped so starter agents work offline (Kevin uses skill-vps-deploy) but installed only on demand. Bump the SKILL.md version when editing a skill.",
+  "skills": [
+    {"slug": "skill-arch", "default": true, "category": "design"},
+    {"slug": "skill-coder", "default": true, "category": "dev-tools"},
+    {"slug": "skill-writer", "default": true, "category": "productivity"},
+    {"slug": "skill-vps-deploy", "default": false, "category": "cloud"}
+  ]
+}

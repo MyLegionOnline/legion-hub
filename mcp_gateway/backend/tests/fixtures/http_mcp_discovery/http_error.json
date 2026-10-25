@@ -1,0 +1,40 @@
+{
+  "contract": "http-mcp-discovery.v1",
+  "case": "http_error",
+  "request": {
+    "headers": {
+      "Authorization": "Bearer <gateway-token>",
+      "X-Legion-MCP-Upstream-Authorization": "Bearer <fixture-upstream-token>"
+    },
+    "body": {
+      "installed_item_id": "00000000-0000-0000-0000-000000000049",
+      "custom_config": {
+        "url": "https://mcp.example.test/rate-limited",
+        "auth": {"mode": "bearer"}
+      }
+    }
+  },
+  "upstream": {
+    "frames": [
+      {
+        "method": "initialize",
+        "response": {
+          "status": 429,
+          "headers": {"retry-after": "17"},
+          "body": "<not-retained>"
+        }
+      }
+    ]
+  },
+  "expected": {
+    "status_code": 502,
+    "status": "error",
+    "error": {
+      "code": "mcp_http_error",
+      "message": "MCP server returned an HTTP error",
+      "retryable": true,
+      "retry_after_seconds": 17
+    },
+    "raw_upstream_body_in_response": false
+  }
+}

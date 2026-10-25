@@ -1,0 +1,9 @@
+{
+  "name": "fixture-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Deterministic stdio MCP fixture for Legion CI smoke tests",
+  "bin": {
+    "fixture-mcp": "server.js"
+  }
+}

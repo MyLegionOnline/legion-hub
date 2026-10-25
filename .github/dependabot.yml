@@ -1,0 +1,66 @@
+version: 2
+
+# Weekly, one grouped pull request per ecosystem and folder: updates arrive in
+# a size one person can review. Security updates open as soon as they are
+# published, whatever the schedule says.
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule: { interval: weekly }
+    groups:
+      actions: { patterns: ["*"] }
+
+  # ── Python services ──────────────────────────────────────────────────────
+  - package-ecosystem: pip
+    directory: "/hub/backend"
+    schedule: { interval: weekly }
+    groups:
+      python: { patterns: ["*"] }
+  - package-ecosystem: pip
+    directory: "/hub/workspaced"
+    schedule: { interval: weekly }
+    groups:
+      python: { patterns: ["*"] }
+  - package-ecosystem: pip
+    directory: "/mcp_gateway/backend"
+    schedule: { interval: weekly }
+    groups:
+      python: { patterns: ["*"] }
+  - package-ecosystem: pip
+    directory: "/mcp_host/backend"
+    schedule: { interval: weekly }
+    groups:
+      python: { patterns: ["*"] }
+
+  # ── Node projects ────────────────────────────────────────────────────────
+  - package-ecosystem: npm
+    directory: "/hub/frontend"
+    schedule: { interval: weekly }
+    groups:
+      npm: { patterns: ["*"] }
+
+  # ── Base images ──────────────────────────────────────────────────────────
+  - package-ecosystem: docker
+    directory: "/hub/backend"
+    schedule: { interval: weekly }
+  - package-ecosystem: docker
+    directory: "/hub/frontend"
+    schedule: { interval: weekly }
+  - package-ecosystem: docker
+    directory: "/hub/workspaced"
+    schedule: { interval: weekly }
+  - package-ecosystem: docker
+    directory: "/hub/workspaced/workspace-image"
+    schedule: { interval: weekly }
+  - package-ecosystem: docker
+    directory: "/mcp_host/backend"
+    schedule: { interval: weekly }
+  - package-ecosystem: docker
+    directory: "/mcp_gateway/backend"
+    schedule: { interval: weekly }
+  - package-ecosystem: docker
+    directory: "/mcp_runner"
+    schedule: { interval: weekly }
+  - package-ecosystem: docker
+    directory: "/deploy/selfhost"
+    schedule: { interval: weekly }

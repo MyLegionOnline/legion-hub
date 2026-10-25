@@ -1,0 +1,10 @@
+# Used by the "caddy" profile of docker-compose.yml. Caddy gets and renews a
+# Let's Encrypt certificate for HUB_DOMAIN by itself; the domain must point at
+# this machine and ports 80 and 443 must be reachable from the internet.
+{$HUB_DOMAIN} {
+	encode zstd gzip
+	# Long-lived sockets (rooms, events) and large uploads pass through.
+	reverse_proxy frontend:80 {
+		flush_interval -1
+	}
+}

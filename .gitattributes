@@ -1,0 +1,12 @@
+# Shell scripts run inside Linux containers and WSL; CRLF breaks bash.
+*.sh text eol=lf
+# restic reads it line by line inside the backup image; CR would end up in every pattern.
+hub/deployment/backup/files-exclude text eol=lf
+# Files that end up inside Linux containers or are read by Docker Compose on any host.
+Dockerfile text eol=lf
+**/Dockerfile text eol=lf
+deploy/selfhost/docker-compose.yml text eol=lf
+deploy/selfhost/Caddyfile text eol=lf
+deploy/selfhost/.env.example text eol=lf
+hub/legion.example.toml text eol=lf
+hub/frontend/nginx.conf text eol=lf

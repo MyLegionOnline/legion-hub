@@ -1,0 +1,20 @@
+# Default gitleaks rules plus the exact fake values used by the redaction tests.
+# Allowlist literals only: a real secret in the same files must still be found.
+title = "legion-hub"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Fake credentials in redaction tests"
+regexes = [
+  '''^abcdef1234567890$''',
+  '''^0123456789abcdef$''',
+  '''^abcDEF123456xyz$''',
+  '''^sk-live-abc123$''',
+  # Swagger's example UUID.
+  '''^3fa85f64-5717-4562-b3fc-2c963f66afa6$''',
+  # OpenSSH container header ("none" cipher, one key) with no key material.
+  '''PRIVATE KEY-----\\n"\s*"b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB\\n"\s*"-----END OPENSSH PRIVATE KEY''',
+  '''PRIVATE KEY-----\\nabc\\n-----END OPENSSH PRIVATE KEY''',
+]

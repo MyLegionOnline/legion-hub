@@ -1,0 +1,80 @@
+# SearXNG settings overlay for the Legion Market MCP pilot (§9.1 of
+# internal design notes). Mounted read-only at /etc/searxng/settings.yml.
+#
+# This instance is never reachable outside the private Gateway network (see
+# the "internal" docker network in the surrounding docker-compose files) — it
+# is only ever called by the mcp-searxng adapter, itself only reachable by
+# Gateway. The threat model that normally justifies SearXNG's public-instance
+# hardening (limiter, Valkey, reverse-proxy trust) does not apply here, so
+# this overlay stays deliberately minimal.
+#
+# `search.formats` MUST include `json` — mcp-searxng's primary search path
+# calls SearXNG with `format=json`, which SearXNG's default settings disable.
+#
+# `server.secret_key` below is a fixed, non-secret value suitable only for
+# this private, internal-only deployment. Generate a real secret
+# (`openssl rand -hex 32`) and inject it through your deployment's normal
+# secret mechanism before running SearXNG anywhere reachable from outside
+# this Docker network.
+use_default_settings: true
+
+server:
+  secret_key: "legion-market-pilot-searxng-internal-only-not-a-real-secret"
+  limiter: false
+
+search:
+  formats:
+    - html
+    - json
+
+# The bundled instance runs from a single datacenter IP with no upstream API
+# keys or proxy pool, so the big consumer search engines periodically flag it
+# and serve CAPTCHAs / hard timeouts. When enough default engines are
+# suspended at once, a niche query returns zero results and mcp-searxng
+# reports `isError`, which used to stall agent tasks (see the SearXNG
+# availability runbook: hub/SEARXNG_AVAILABILITY_RUNBOOK.md).
+#
+# `outgoing.request_timeout` is raised from SearXNG's tight 3.0s default so a
+# merely-slow engine is not counted as dead on every query.
+outgoing:
+  request_timeout: 6.0
+  max_request_timeout: 15.0
+  pool_connections: 100
+  pool_maxsize: 20
+
+# Engine overlay (merged into the defaults by name because
+# `use_default_settings: true`). We disable the engines that block this
+# instance most aggressively and lean on the ones that stay reachable from a
+# datacenter IP without credentials. Re-enable an engine here once it has a
+# real API key or a working proxy (see the runbook, "Point 4").
+engines:
+  # Chronic offenders for this deployment — always timing out or CAPTCHA-walled.
+  - name: brave
+    disabled: true
+  - name: startpage
+    disabled: true
+  # DuckDuckGo CAPTCHAs in bursts but recovers on its own; keep it, just let
+  # SearXNG suspend/resume it automatically.
+  - name: duckduckgo
+    disabled: false
+  # Mojeek: the bundled `mojeek` engine scrapes their HTML site, which their
+  # terms (3.5 d/e) reserve for API users — so it stays off. `mojeek api` is
+  # the official paid API (searxng/mojeek_api.py, copied into searx/engines at
+  # container start). It needs MOJEEK_API_KEY; without it the engine drops
+  # itself on startup and the rest of the engines carry on.
+  - name: mojeek
+    disabled: true
+  - name: mojeek api
+    engine: mojeek_api
+    shortcut: mjka
+    disabled: false
+    timeout: 6.0
+    # Heavier than the keyless scrapers on purpose: it is the one source that
+    # does not get CAPTCHA'd from a datacenter IP.
+    weight: 2
+  - name: bing
+    disabled: false
+  - name: wikipedia
+    disabled: false
+  - name: wikidata
+    disabled: false

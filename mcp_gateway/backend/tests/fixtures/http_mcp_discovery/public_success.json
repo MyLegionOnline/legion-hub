@@ -1,0 +1,44 @@
+{
+  "contract": "http-mcp-discovery.v1",
+  "case": "public_success",
+  "request": {
+    "headers": {"Authorization": "Bearer <gateway-token>"},
+    "body": {
+      "installed_item_id": "00000000-0000-0000-0000-000000000043",
+      "market_item_id": "00000000-0000-0000-0000-000000000044",
+      "market_slug": "public-fixture-mcp",
+      "custom_config": {
+        "url": "https://mcp.example.test/public",
+        "auth": {"mode": "none"}
+      }
+    }
+  },
+  "upstream": {
+    "assertions": {
+      "upstream_authorization_header": "absent",
+      "gateway_authorization_header": "not_forwarded"
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {
+          "tools": [
+            {
+              "name": "health_check",
+              "description": "Return fixture health.",
+              "inputSchema": {"type": "object", "properties": {}}
+            }
+          ]
+        }
+      }
+    }
+  },
+  "expected": {
+    "status_code": 200,
+    "status": "verified",
+    "tool_names": ["health_check"],
+    "ttl_seconds": 60
+  }
+}

@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings
+# exec/stream code targets the 0.27+ API (container.exec kwargs, Stream.read_out)
+aiodocker>=0.27
+pathspec>=0.12,<1
+# Room archives in S3/MinIO (internal design notes T11); only with ROOM_ARCHIVE_S3_BUCKET
+boto3>=1.34

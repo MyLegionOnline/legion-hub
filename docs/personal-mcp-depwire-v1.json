@@ -1,0 +1,111 @@
+{
+  "contract_version": "personal-mcp.v1",
+  "description": "Stage-0 JSON examples for the Depwire managed_stdio flow. Values are illustrative and contain no secrets.",
+  "import_request": {
+    "mcpServers": {
+      "depwire": {
+        "command": "npx",
+        "args": ["-y", "depwire-cli", "mcp"]
+      }
+    }
+  },
+  "preview_response": {
+    "contract_version": "personal-mcp.v1",
+    "preview_id": "00000000-0000-0000-0000-000000000101",
+    "expires_at": "2026-08-05T18:35:00Z",
+    "candidates": [
+      {
+        "candidate_id": "00000000-0000-0000-0000-000000000102",
+        "source_name": "depwire",
+        "display_name": "depwire",
+        "mode": "managed_stdio",
+        "runtime_profile": "node_npx_v1",
+        "transport": "stdio",
+        "package": {
+          "requested": "depwire-cli",
+          "registry_name": "depwire-cli",
+          "requested_version": null
+        },
+        "command_args": ["mcp"],
+        "env_names": [],
+        "normalized_argv": ["npx", "--yes", "depwire-cli", "mcp"],
+        "shell": false,
+        "pinning": {
+          "status": "pending",
+          "version": null,
+          "integrity": null,
+          "resolved_at": null
+        },
+        "warnings": ["The package version will be pinned before launch."],
+        "supported": true
+      }
+    ],
+    "rejected": []
+  },
+  "create_request": {
+    "contract_version": "personal-mcp.v1",
+    "preview_id": "00000000-0000-0000-0000-000000000101",
+    "candidate_id": "00000000-0000-0000-0000-000000000102",
+    "display_name": "Depwire",
+    "memory_reservation_mb": 1024,
+    "storage_reservation_mb": 1024,
+    "secret_bindings": []
+  },
+  "verify_response": {
+    "id": "00000000-0000-0000-0000-000000000103",
+    "contract_version": "personal-mcp.v1",
+    "name": "Depwire",
+    "mode": "managed_stdio",
+    "runtime_profile": "node_npx_v1",
+    "transport": "stdio",
+    "desired_status": "running",
+    "actual_status": "verified",
+    "ready_for_room": true,
+    "revision": 1,
+    "launch_profile": {
+      "mode": "managed_stdio",
+      "runtime_profile": "node_npx_v1",
+      "transport": "stdio",
+      "package": "depwire-cli",
+      "command_args": ["mcp"],
+      "env_names": [],
+      "normalized_argv": ["npx", "--yes", "depwire-cli", "mcp"],
+      "shell": false
+    },
+    "resolved_artifact": {
+      "package": "depwire-cli",
+      "version": "1.4.2",
+      "integrity": "sha512-<base64-integrity>",
+      "resolved_at": "2026-08-05T18:30:00Z"
+    },
+    "resources": {
+      "memory_reservation_mb": 1024,
+      "memory_usage_mb": 80,
+      "storage_reservation_mb": 1024,
+      "storage_used_mb": 420
+    },
+    "tools": {
+      "count": 2,
+      "names": ["search", "fetch"],
+      "fingerprint": "sha256:<hex>"
+    },
+    "room_bindings": [],
+    "secret_bindings": [],
+    "last_error": null,
+    "correlation_id": "01JXXXXXVERIFY",
+    "created_at": "2026-08-05T18:29:00Z",
+    "updated_at": "2026-08-05T18:30:00Z"
+  },
+  "room_binding_request": {
+    "room_id": "00000000-0000-0000-0000-000000000201"
+  },
+  "stopped_usage_note": {
+    "actual_status": "stopped",
+    "ready_for_room": false,
+    "memory_reserved_mb": 0,
+    "memory_usage_mb": 0,
+    "storage_reservation_mb": 1024,
+    "storage_used_mb": 420,
+    "user_facing_copy": "Stopped: 0 MB RAM, uses 420 MB storage. Data and bindings are kept."
+  }
+}

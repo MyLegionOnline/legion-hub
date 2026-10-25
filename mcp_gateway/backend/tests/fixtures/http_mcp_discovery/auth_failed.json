@@ -1,0 +1,41 @@
+{
+  "contract": "http-mcp-discovery.v1",
+  "case": "auth_failed",
+  "request": {
+    "headers": {
+      "Authorization": "Bearer <gateway-token>",
+      "X-Legion-MCP-Upstream-Authorization": "Bearer <fixture-upstream-token>"
+    },
+    "body": {
+      "installed_item_id": "00000000-0000-0000-0000-000000000045",
+      "custom_config": {
+        "url": "https://mcp.example.test/protected",
+        "auth": {"mode": "bearer"}
+      }
+    }
+  },
+  "upstream": {
+    "frames": [
+      {
+        "method": "initialize",
+        "response": {
+          "status": 401,
+          "headers": {"www-authenticate": "<redacted>"},
+          "body": "<not-retained>"
+        }
+      }
+    ],
+    "assertions": {"tools_list_requests": 0}
+  },
+  "expected": {
+    "status_code": 502,
+    "status": "error",
+    "error": {
+      "code": "mcp_auth_failed",
+      "message": "MCP server authentication failed",
+      "retryable": false
+    },
+    "tools": [],
+    "secret_in_response": false
+  }
+}

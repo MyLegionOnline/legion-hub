@@ -1,0 +1,225 @@
+name: Release
+
+# A tag v* builds every image for linux/amd64 and linux/arm64, publishes them
+# to GitHub Container Registry and attaches the install bundle to a GitHub
+# release. "Run workflow" (workflow_dispatch) with push=false builds everything
+# without publishing: use it to check that both architectures still build.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Publish the images (otherwise only check that they build)"
+        type: boolean
+        default: false
+      version:
+        description: "Tag suffix for a published manual run, e.g. v0.1.0-rc1"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Checks before building
+    if: github.repository == 'MyLegionOnline/legion-hub'
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tags: ${{ steps.v.outputs.tags }}
+      base_tags: ${{ steps.v.outputs.base_tags }}
+      office_tags: ${{ steps.v.outputs.office_tags }}
+      push: ${{ steps.v.outputs.push }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Plans never ship (the tree and, below, the images).
+      - name: No plan files in the tree
+        if: github.repository == 'MyLegionOnline/legion-hub'
+        run: sh .github/scripts/check_no_plans.sh
+
+      - name: Version and tags
+        id: v
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_PUSH: ${{ inputs.push }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$EVENT" = "push" ]; then
+            version="$REF_NAME"; push=true
+          else
+            version="${INPUT_VERSION:-dev}"; push="$INPUT_PUSH"
+          fi
+          # v0.1.0-rc1 is a pre-release: it never takes the "latest" tag.
+          case "$version" in
+            v*-*|dev) prerelease=true; latest="" ;;
+            *) prerelease=false; latest="latest" ;;
+          esac
+          {
+            echo "version=$version"
+            echo "push=$push"
+            echo "prerelease=$prerelease"
+            echo "tags<<EOF"; echo "$version"; [ -z "$latest" ] || echo "$latest"; echo "EOF"
+            echo "base_tags<<EOF"; echo "base-$version"; [ -z "$latest" ] || echo "base-$latest"; echo "EOF"
+            echo "office_tags<<EOF"; echo "office-$version"; [ -z "$latest" ] || echo "office-$latest"; echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  images:
+    name: ${{ matrix.name }}
+    needs: guard
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: hub-backend, context: hub/backend }
+          - { name: hub-workspaced, context: hub/workspaced }
+          - { name: mcp-host, context: mcp_host/backend }
+          - { name: mcp-gateway, context: mcp_gateway/backend }
+          - { name: mcp-node-runner, context: mcp_runner }
+    uses: ./.github/workflows/_build-image.yml
+    with:
+      name: ${{ matrix.name }}
+      context: ${{ matrix.context }}
+      tags: ${{ needs.guard.outputs.tags }}
+      push: ${{ needs.guard.outputs.push == 'true' }}
+
+  frontend:
+    name: hub-frontend
+    needs: guard
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/_build-image.yml
+    with:
+      name: hub-frontend
+      context: hub/frontend
+      tags: ${{ needs.guard.outputs.tags }}
+      # The "Marketplace" button of a Hub that is linked to Legion Market.
+      build-args: VITE_MARKET_URL=https://market.mylegion.online
+      push: ${{ needs.guard.outputs.push == 'true' }}
+
+  workspace-base:
+    name: workspace base
+    needs: guard
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/_build-image.yml
+    with:
+      name: legion-workspace
+      context: hub/workspaced/workspace-image
+      tags: ${{ needs.guard.outputs.base_tags }}
+      push: ${{ needs.guard.outputs.push == 'true' }}
+
+  # The office image starts FROM the base one: build it second.
+  workspace-office:
+    name: workspace office
+    if: needs.guard.outputs.push == 'true'
+    needs: [guard, workspace-base]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/_build-image.yml
+    with:
+      name: legion-workspace
+      context: hub/workspaced/workspace-image-office
+      tags: ${{ needs.guard.outputs.office_tags }}
+      build-contexts: legion-workspace:base=docker-image://ghcr.io/mylegiononline/legion-workspace:base-${{ needs.guard.outputs.version }}
+      push: ${{ needs.guard.outputs.push == 'true' }}
+
+  # An unpublished check has no GHCR base image to use as a named context.
+  # Build both layers on each native runner so workflow_dispatch(push=false)
+  # really checks the office image on amd64 and arm64 without publishing.
+  workspace-office-check:
+    name: workspace office check ${{ matrix.arch }}
+    if: needs.guard.outputs.push != 'true'
+    needs: guard
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t legion-workspace:base hub/workspaced/workspace-image
+      - run: docker build -t legion-workspace:office hub/workspaced/workspace-image-office
+
+  # Plans never ship in an image either (Release check, O16).
+  no-plans-in-images:
+    name: No plan files in the images
+    if: needs.guard.outputs.push == 'true'
+    needs: [guard, images, frontend, workspace-base, workspace-office]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Look for plan files
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          status=0
+          for image in hub-backend hub-frontend hub-workspaced mcp-host mcp-gateway mcp-node-runner; do
+            found=$(docker run --rm --entrypoint sh "ghcr.io/${owner}/${image}:${VERSION}" -c "find / -xdev \( -iname '*plan*.md' -o -type d -iname 'plans' \) -not -path '*/node_modules/*' -not -path '/usr/lib/*' -not -path '/usr/share/*' 2>/dev/null" || true)
+            if [ -n "$found" ]; then echo "plan files in ${image}:" >&2; echo "$found" >&2; status=1; fi
+          done
+          exit $status
+
+  bundle:
+    name: Release with the install bundle
+    if: needs.guard.outputs.push == 'true' && github.event_name == 'push'
+    needs: [guard, no-plans-in-images]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pack deploy/selfhost
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          mkdir bundle
+          cp deploy/selfhost/docker-compose.yml deploy/selfhost/.env.example deploy/selfhost/Caddyfile \
+             deploy/selfhost/install.sh deploy/selfhost/install.ps1 hub/legion.example.toml bundle/
+          # The bundle runs this release, not "latest".
+          sed -i "s/^LEGION_VERSION=.*/LEGION_VERSION=${VERSION}/" bundle/.env.example
+          chmod +x bundle/install.sh
+          tar -czf legion-selfhost.tar.gz -C bundle .
+          (cd bundle && zip -qr ../legion-selfhost.zip .)
+          cp bundle/install.sh install.sh
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.guard.outputs.version }}
+          PRERELEASE: ${{ needs.guard.outputs.prerelease }}
+        run: |
+          flags=""
+          [ "$PRERELEASE" = "true" ] && flags="--prerelease"
+          notes="docs/RELEASE_NOTES_${VERSION}.md"
+          if [ -f "$notes" ]; then
+            notes_args=(--notes-file "$notes")
+          else
+            notes_args=(--generate-notes)
+          fi
+          gh release create "$VERSION" $flags "${notes_args[@]}" --title "Legion Hub $VERSION" \
+            legion-selfhost.tar.gz legion-selfhost.zip install.sh deploy/selfhost/install.ps1

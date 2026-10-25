@@ -1,0 +1,42 @@
+{
+  "contract": "http-mcp-discovery.v1",
+  "case": "protocol_error",
+  "request": {
+    "headers": {
+      "Authorization": "Bearer <gateway-token>",
+      "X-Legion-MCP-Upstream-Authorization": "Bearer <fixture-upstream-token>"
+    },
+    "body": {
+      "installed_item_id": "00000000-0000-0000-0000-000000000047",
+      "custom_config": {
+        "url": "https://mcp.example.test/protocol-error",
+        "auth": {"mode": "bearer"}
+      }
+    }
+  },
+  "upstream": {
+    "frames": [
+      {
+        "method": "initialize",
+        "response": {
+          "status": 200,
+          "body": {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"protocolVersion": "1999-01-01"}
+          }
+        }
+      }
+    ]
+  },
+  "expected": {
+    "status_code": 502,
+    "status": "error",
+    "error": {
+      "code": "mcp_protocol_error",
+      "message": "MCP server protocol validation failed",
+      "retryable": false
+    },
+    "tools": []
+  }
+}

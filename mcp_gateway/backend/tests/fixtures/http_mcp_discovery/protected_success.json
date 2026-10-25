@@ -1,0 +1,121 @@
+{
+  "contract": "http-mcp-discovery.v1",
+  "case": "protected_success",
+  "request": {
+    "headers": {
+      "Authorization": "Bearer <gateway-token>",
+      "X-Legion-MCP-Upstream-Authorization": "Bearer <fixture-upstream-token>"
+    },
+    "body": {
+      "installed_item_id": "00000000-0000-0000-0000-000000000042",
+      "market_item_id": null,
+      "market_slug": null,
+      "custom_config": {
+        "url": "https://mcp.example.test/github/readonly",
+        "auth": {"mode": "bearer"}
+      }
+    }
+  },
+  "upstream": {
+    "frames": [
+      {
+        "method": "initialize",
+        "headers": {
+          "authorization": "Bearer <fixture-upstream-token>",
+          "content-type": "application/json",
+          "accept": "application/json, text/event-stream"
+        },
+        "body": {
+          "jsonrpc": "2.0",
+          "id": 1,
+          "method": "initialize",
+          "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {
+              "name": "legion-mcp-gateway",
+              "version": "0.1.0"
+            }
+          }
+        },
+        "response": {
+          "status": 200,
+          "headers": {"mcp-session-id": "fixture-session-001"},
+          "body": {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+              "protocolVersion": "2025-03-26",
+              "capabilities": {"tools": {}},
+              "serverInfo": {"name": "fixture-github", "version": "1.0.0"}
+            }
+          }
+        }
+      },
+      {
+        "method": "tools/list",
+        "headers": {
+          "authorization": "Bearer <fixture-upstream-token>",
+          "mcp-session-id": "fixture-session-001"
+        },
+        "body": {
+          "jsonrpc": "2.0",
+          "id": 2,
+          "method": "tools/list",
+          "params": {}
+        },
+        "response": {
+          "status": 200,
+          "body": {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+              "tools": [
+                {
+                  "name": "get_commit",
+                  "description": "Read a commit by repository and SHA.",
+                  "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                      "repository": {"type": "string"},
+                      "sha": {"type": "string"}
+                    },
+                    "required": ["repository", "sha"]
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
+    ]
+  },
+  "expected": {
+    "status_code": 200,
+    "response": {
+      "installed_item_id": "00000000-0000-0000-0000-000000000042",
+      "status": "verified",
+      "tools": [
+        {
+          "name": "get_commit",
+          "description": "Read a commit by repository and SHA.",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "repository": {"type": "string"},
+              "sha": {"type": "string"}
+            },
+            "required": ["repository", "sha"]
+          }
+        }
+      ],
+      "fingerprint": "sha256:<computed-canonical-tools-hash>",
+      "ttl_seconds": 60
+    },
+    "forbidden_values": [
+      "<fixture-upstream-token>",
+      "<gateway-token>",
+      "https://mcp.example.test/github/readonly"
+    ]
+  }
+}

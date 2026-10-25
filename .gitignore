@@ -1,0 +1,56 @@
+# .gitignore for the PUBLIC repository (MyLegionOnline/legion-hub).
+# The exporter copies this file to the repository root as ".gitignore".
+# Do not add this content to the private repository's .gitignore: plans
+# are written there on purpose.
+
+# Planning artifacts never go public.
+*_plan.md
+*_plan.*.md
+*PLAN*.md
+plan/
+plans/
+
+# Virtual environments
+mcp_venv/
+venv/
+.venv/
+__pycache__/
+
+# Binaries and build artifacts
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+dist/
+node_modules/
+
+# Database and logs
+*.db
+*.sqlite3
+*.log
+postgres_data/
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+config.json
+crush.json
+legion.toml
+hub/deployment/secrets/*
+!hub/deployment/secrets/.gitkeep
+!hub/deployment/secrets/*.sops.json
+
+# Frontend test output
+hub/frontend/playwright-report/
+hub/frontend/test-results/
+
+# Python cache
+*.pyc
+
+# Local tooling
+.claude/
+.agents/
+.mimocode/
+.legion/

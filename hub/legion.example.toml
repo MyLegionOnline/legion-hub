@@ -1,0 +1,159 @@
+# Legion Hub configuration for a self-hosted install.
+#
+# Copy this file to /etc/legion/legion.toml (or point LEGION_CONFIG at it).
+# Everything here is optional: a key you leave out keeps its default, and a
+# missing file means "all defaults".
+#
+# Every limit can also be set with an environment variable named
+# LEGION_LIMIT_<KEY>, for example LEGION_LIMIT_MAX_RUNNING=8. The variable
+# wins over this file. A numeric limit accepts a whole number (0 and up) or
+# the word "unlimited" (as a string here, as plain text in the variable).
+# An unknown key stops the Hub at startup instead of being ignored.
+#
+# These limits apply to every user of this Hub.
+
+[limits]
+
+# --- Rooms ---------------------------------------------------------------
+
+# Rooms whose workspace container may run at the same time, per user.
+# Must be a whole number. Default: 5.
+# max_running = 5
+
+# Rooms one user may have. Default: unlimited.
+# max_rooms = "unlimited"
+
+# Hours the workspaces of one user may run per month. Default: unlimited.
+# monthly_hours = "unlimited"
+
+# Memory a room container gets when the room has no setting of its own, MB.
+# Default: 2048.
+# mem_limit_mb = 2048
+
+# Largest memory one room may be given, MB. Default: unlimited
+# (the Hub's hard ceiling still applies).
+# room_max_memory_mb = "unlimited"
+
+# Memory pool shared by all running rooms of one user, MB. Default: unlimited.
+# rooms_memory_pool_mb = "unlimited"
+
+# Files stored in one room, MB. Default: unlimited.
+# room_storage_quota_mb = "unlimited"
+
+# Writable layer of a room container outside its files, MB. Default: unlimited.
+# container_layer_mb = "unlimited"
+
+# Soft limit on the data one user keeps in the Hub, MB. Default: unlimited.
+# hub_data_soft_quota_mb = "unlimited"
+
+# --- Personal MCP servers ------------------------------------------------
+
+# Personal MCP containers running at the same time, per user.
+# Must be a whole number. Default: 3.
+# mcp_personal_max_running = 3
+
+# Personal MCP servers one user may install. Default: unlimited.
+# mcp_personal_max_installed = "unlimited"
+
+# Memory of one personal MCP container when nothing else is set, MB.
+# Default: 2048.
+# mcp_personal_mem_limit_mb = 2048
+
+# Memory across all running personal MCP containers of one user, MB.
+# Default: unlimited.
+# mcp_personal_max_total_memory_mb = "unlimited"
+
+# Memory of one personal MCP server, MB. Default: unlimited.
+# mcp_personal_max_memory_per_server_mb = "unlimited"
+
+# Storage across all personal MCP servers of one user, MB. Default: unlimited.
+# mcp_personal_storage_quota_mb = "unlimited"
+
+# Storage of one personal MCP server, MB. Default: unlimited.
+# mcp_personal_max_storage_per_server_mb = "unlimited"
+
+# Rooms one personal MCP server may be bound to. Default: unlimited.
+# mcp_personal_max_room_bindings_per_server = "unlimited"
+
+# Rooms that may use personal MCP servers (legacy alias of the line above).
+# Default: unlimited.
+# mcp_personal_max_rooms = "unlimited"
+
+# Monthly hours of personal MCP containers. Default: unlimited.
+# mcp_personal_monthly_hours = "unlimited"
+
+# MCP servers added by link (a remote MCP URL), per user. Default: unlimited.
+# link_mcp_max = "unlimited"
+
+# --- Skills --------------------------------------------------------------
+
+# Largest uploaded skill package, MB. Default: unlimited (the package format
+# has its own ceiling).
+# skill_package_max_mb = "unlimited"
+
+# All uploaded skills of one user, MB. Default: unlimited.
+# skills_storage_mb = "unlimited"
+
+# --- Market --------------------------------------------------------------
+
+# Paid Market tiers this Hub may install; leave empty when the Hub sells
+# nothing. Default: none.
+# market_paid_tiers = []
+
+# MCP credits granted to each user every week. Credits of a self-hosted Hub
+# come from the Legion account, so the default is 0.
+# mcp_weekly_credits = 0
+
+# =========================================================================
+# What this machine can hold, all users together
+# =========================================================================
+
+[capacity]
+
+# The limits above are per user; these are for the whole server. When a start
+# would go over, it is refused with "the server is at capacity, try again in
+# a few minutes" instead of the machine running out of memory. Set them when
+# several people use this Hub. The variable LEGION_CAPACITY_<KEY>, for example
+# LEGION_CAPACITY_MEMORY_MB=3072, wins over this file.
+
+# Room workspaces running at the same time, all users. Default: unlimited.
+# max_workspaces = "unlimited"
+
+# Memory limits of running room workspaces and personal MCP servers added up,
+# all users, MB. Leave headroom for the Hub itself and the database: this is
+# what the rooms may take, not the size of the machine. Default: unlimited.
+# memory_mb = "unlimited"
+
+# =========================================================================
+# Who may register
+# =========================================================================
+
+[registration]
+
+# The first person to register on an empty Hub becomes its owner. After that:
+#   "closed" - nobody else can register (the default);
+#   "invite" - only people with an invitation link made by the owner in
+#              Settings -> Profile;
+#   "open"   - anyone who can reach this Hub.
+# Everyone who registers gets a shell in containers on this machine, so keep
+# it closed or by invitation unless the Hub is on a private network.
+# The variable LEGION_REGISTRATION overrides this line.
+# mode = "closed"
+
+# =========================================================================
+# Personal MCP servers installed for the owner at startup
+# =========================================================================
+
+# One block per server. Either a link to an MCP server, or a Docker image that
+# this Hub starts on demand. A server whose name the owner already has is left
+# alone, so changes made in Settings stay. Passwords and tokens do not go here:
+# add them in Settings -> Secrets and bind them to the server.
+
+# [[personal_mcp]]
+# name = "docs"
+# url = "http://docs-mcp:8080/mcp"
+
+# [[personal_mcp]]
+# name = "notes"
+# image = "ghcr.io/owner/notes-mcp:1.2"
+# port = 8000

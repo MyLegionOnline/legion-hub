@@ -1,0 +1,88 @@
+services:
+  fixture-registry:
+    build:
+      context: ../smoke
+      dockerfile: registry/Dockerfile
+    networks: [legion-mcp-smoke]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8081/fixture-mcp').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  runner:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      NODE_ENV: ci
+      MCP_RUNNER_PROFILE_JSON: >-
+        {"mode":"managed_stdio","runtime_profile":"node_npx_v1","transport":"stdio","package":"fixture-mcp","command_args":["mcp"],"env_names":[],"shell":false,"resolved_artifact":null,"correlation_id":"stage6-smoke-1"}
+      MCP_RUNNER_NPM_REGISTRY: http://fixture-registry:8081
+      MCP_RUNNER_NPM_REGISTRY_HOSTS: fixture-registry
+      MCP_RUNNER_ALLOW_INSECURE_REGISTRY: "1"
+      MCP_RUNNER_EGRESS_PROFILE: mcp_runtime_v1
+      MCP_RUNNER_DATA_DIR: /data
+    volumes:
+      - runner-data:/data
+    expose: ["8080"]
+    depends_on:
+      fixture-registry:
+        condition: service_healthy
+    networks: [legion-mcp-smoke]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/readyz').then(r=>process.exit(r.status===200?0:1)).catch(()=>process.exit(1))"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  fixture-market:
+    build:
+      context: ../smoke
+      dockerfile: market/Dockerfile
+    expose: ["8300"]
+    networks: [legion-mcp-smoke]
+
+  gateway:
+    build:
+      context: ../../mcp_gateway/backend
+    environment:
+      MCP_GATEWAY_TOKEN: smoke-gateway
+      MARKET_API_URL: http://fixture-market:8300
+      MARKET_API_TOKEN: smoke-market
+      REDIS_URL: ""
+      MCP_GATEWAY_REQUEST_TIMEOUT_SEC: "5"
+    expose: ["8310"]
+    depends_on:
+      runner:
+        condition: service_healthy
+      fixture-market:
+        condition: service_started
+    networks: [legion-mcp-smoke]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8310/health', timeout=5)"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  smoke:
+    build:
+      context: ../smoke
+      dockerfile: smoke.Dockerfile
+    environment:
+      RUNNER_URL: http://runner:8080
+      GATEWAY_URL: http://gateway:8310
+    depends_on:
+      runner:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    networks: [legion-mcp-smoke]
+
+volumes:
+  runner-data:
+
+networks:
+  legion-mcp-smoke:
+    driver: bridge

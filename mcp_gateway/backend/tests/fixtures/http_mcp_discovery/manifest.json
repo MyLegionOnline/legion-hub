@@ -1,0 +1,19 @@
+{
+  "contract": "http-mcp-discovery.v1",
+  "placeholder_policy": {
+    "gateway_token": "<gateway-token>",
+    "upstream_token": "<fixture-upstream-token>",
+    "rule": "Placeholders are test substitutions only; no committed fixture may contain a real credential."
+  },
+  "cases": [
+    "protected_success.json",
+    "public_success.json",
+    "auth_failed.json",
+    "unreachable.json",
+    "protocol_error.json",
+    "bad_response.json",
+    "http_error.json",
+    "secret_unavailable.json",
+    "execute_protected_success.json"
+  ]
+}

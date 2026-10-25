@@ -1,0 +1,51 @@
+{
+  "contract": "http-mcp-discovery.v1",
+  "case": "bad_response",
+  "request": {
+    "headers": {
+      "Authorization": "Bearer <gateway-token>",
+      "X-Legion-MCP-Upstream-Authorization": "Bearer <fixture-upstream-token>"
+    },
+    "body": {
+      "installed_item_id": "00000000-0000-0000-0000-000000000048",
+      "custom_config": {
+        "url": "https://mcp.example.test/bad-response",
+        "auth": {"mode": "bearer"}
+      }
+    }
+  },
+  "upstream": {
+    "frames": [
+      {
+        "method": "tools/list",
+        "response": {
+          "status": 200,
+          "body": {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+              "tools": [
+                {
+                  "name": "bad name with spaces",
+                  "description": "fixture payload is invalid",
+                  "inputSchema": []
+                }
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "alternative_payloads": ["invalid-json", "response-over-1MiB"]
+  },
+  "expected": {
+    "status_code": 502,
+    "status": "error",
+    "error": {
+      "code": "mcp_bad_response",
+      "message": "MCP server returned an invalid response",
+      "retryable": false
+    },
+    "tools": []
+  }
+}

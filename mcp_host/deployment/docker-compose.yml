@@ -1,0 +1,33 @@
+services:
+  mcp-host:
+    build: ../backend
+    environment:
+      MCP_HOST_TOKEN: ${MCP_HOST_TOKEN:?set MCP_HOST_TOKEN}
+      MCP_HOST_PUBLIC_BASE_URL: ${MCP_HOST_PUBLIC_BASE_URL:-}
+      MCP_HOST_NETWORK: ${MCP_HOST_NETWORK:-legion-mcp}
+      MCP_HOST_RUNNER_IMAGE: ${MCP_HOST_RUNNER_IMAGE:-legion/mcp-node-runner:1.0.0}
+      MCP_HOST_RUNNER_NETWORK: ${MCP_HOST_RUNNER_NETWORK:-legion-mcp}
+      MCP_HOST_RUNNER_PORT: ${MCP_HOST_RUNNER_PORT:-8080}
+      MCP_HOST_RUNNER_NPM_REGISTRY: ${MCP_HOST_RUNNER_NPM_REGISTRY:-https://registry.npmjs.org/}
+      MCP_HOST_RUNNER_NPM_REGISTRY_HOSTS: ${MCP_HOST_RUNNER_NPM_REGISTRY_HOSTS:-registry.npmjs.org}
+      MCP_HOST_HUB_URL: ${MCP_HOST_HUB_URL:-http://hub:8000}
+      MCP_HOST_INSTALL_EGRESS_PROFILE: ${MCP_HOST_INSTALL_EGRESS_PROFILE:-npm_registry_only}
+      MCP_HOST_RUNTIME_EGRESS_PROFILE: ${MCP_HOST_RUNTIME_EGRESS_PROFILE:-mcp_runtime_v1}
+      MCP_HOST_STORAGE_QUOTA_MODE: ${MCP_HOST_STORAGE_QUOTA_MODE:-best_effort}
+      MCP_HOST_VOLUME_DRIVER: ${MCP_HOST_VOLUME_DRIVER:-local}
+      MCP_HOST_VOLUME_SIZE_OPTION: ${MCP_HOST_VOLUME_SIZE_OPTION:-size}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    expose:
+      - "8320"
+    networks:
+      - legion-mcp
+
+networks:
+  legion-mcp:
+    external: true
+
+# Build the operator-owned runner separately and publish it to the configured
+# private registry. It is intentionally not exposed with a host port.
+#
+#   docker build -t legion/mcp-node-runner:1.0.0 ../../mcp_runner

@@ -1,0 +1,55 @@
+{
+  "contract": "http-mcp-discovery.v1",
+  "case": "execute_protected_success",
+  "request": {
+    "headers": {
+      "Authorization": "Bearer <gateway-token>",
+      "X-Legion-MCP-Upstream-Authorization": "Bearer <fixture-upstream-token>"
+    },
+    "body": {
+      "installed_item_id": "00000000-0000-0000-0000-000000000042",
+      "tool": "get_commit",
+      "arguments": {"repository": "legion/legion", "sha": "fixture-sha"}
+    },
+    "forbidden_body_fields": ["token", "api_key", "runtime_auth", "secret", "headers"]
+  },
+  "upstream": {
+    "frames": [
+      {
+        "method": "initialize",
+        "headers": {"authorization": "Bearer <fixture-upstream-token>"},
+        "response": {"status": 200, "headers": {"mcp-session-id": "fixture-session-002"}}
+      },
+      {
+        "method": "tools/call",
+        "headers": {
+          "authorization": "Bearer <fixture-upstream-token>",
+          "mcp-session-id": "fixture-session-002"
+        },
+        "body": {
+          "jsonrpc": "2.0",
+          "id": 2,
+          "method": "tools/call",
+          "params": {
+            "name": "get_commit",
+            "arguments": {"repository": "legion/legion", "sha": "fixture-sha"}
+          }
+        },
+        "response": {
+          "status": 200,
+          "body": {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"content": [{"type": "text", "text": "fixture commit"}]}
+          }
+        }
+      }
+    ]
+  },
+  "expected": {
+    "status_code": 200,
+    "result": {"content": [{"type": "text", "text": "fixture commit"}]},
+    "same_upstream_header_on_initialize_and_call": true,
+    "secret_value_in_result_or_logs": false
+  }
+}

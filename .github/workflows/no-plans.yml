@@ -15,5 +15,5 @@ jobs:
     if: github.repository == 'MyLegionOnline/legion-hub'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: sh .github/scripts/check_no_plans.sh

@@ -34,7 +34,7 @@ jobs:
       push: ${{ steps.v.outputs.push }}
       prerelease: ${{ steps.v.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Plans never ship (the tree and, below, the images).
       - name: No plan files in the tree
@@ -151,7 +151,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: docker build -t legion-workspace:base hub/workspaced/workspace-image
       - run: docker build -t legion-workspace:office hub/workspaced/workspace-image-office
 
@@ -191,7 +191,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Pack deploy/selfhost
         env:

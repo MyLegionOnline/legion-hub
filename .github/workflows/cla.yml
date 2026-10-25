@@ -71,7 +71,7 @@ jobs:
       # of this pull request that has no commit yet gets the commit the tag
       # points at now; on a failed write the next "recheck" fills it in.
       - name: Record the commit of the accepted text
-        uses: actions/github-script@v7.0.1
+        uses: actions/github-script@v9.0.0
         env:
           SIGNATURES_TOKEN: ${{ secrets.CLA_SIGNATURES_TOKEN }}
         with:

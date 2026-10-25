@@ -1,5 +1,5 @@
 # Multi-stage build for React + Vite frontend
-FROM node:18-alpine AS builder
+FROM node:24-alpine AS builder
 
 ARG VITE_MARKET_URL=http://localhost:8301
 ENV VITE_MARKET_URL=$VITE_MARKET_URL

@@ -58,6 +58,10 @@ updates:
   - package-ecosystem: docker
     directory: "/hub/frontend"
     schedule: { interval: weekly }
+    ignore:
+      # Node stays on an LTS line; moving to the next one is a deliberate change.
+      - dependency-name: "node"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: docker
     directory: "/hub/workspaced"
     schedule: { interval: weekly }
@@ -73,6 +77,10 @@ updates:
   - package-ecosystem: docker
     directory: "/mcp_runner"
     schedule: { interval: weekly }
+    ignore:
+      # Node stays on an LTS line; moving to the next one is a deliberate change.
+      - dependency-name: "node"
+        update-types: ["version-update:semver-major"]
   # The install stack is a Compose file, not a Dockerfile. Its own images are
   # pinned to the release tag, so only the third-party ones are watched.
   - package-ecosystem: docker-compose

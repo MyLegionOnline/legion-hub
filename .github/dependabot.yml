@@ -80,3 +80,7 @@ updates:
     schedule: { interval: weekly }
     ignore:
       - dependency-name: "ghcr.io/mylegiononline/*"
+      # A new PostgreSQL major starts an empty cluster next to the old one;
+      # installs need a pg_upgrade step and release notes, not a bump.
+      - dependency-name: "postgres"
+        update-types: ["version-update:semver-major"]

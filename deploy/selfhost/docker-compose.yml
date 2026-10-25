@@ -26,13 +26,16 @@ x-logging: &default-logging
 
 services:
   db:
-    image: postgres:15-alpine
+    image: postgres:18-alpine
     environment:
       POSTGRES_USER: legion
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run install.sh, or copy .env.example to .env and fill it in}
       POSTGRES_DB: legion
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      # From 18 the image keeps its data in /var/lib/postgresql/<major>/docker, so
+      # the volume holds the parent folder; a later major can sit beside it for
+      # pg_upgrade. Mounting /var/lib/postgresql/data makes the image refuse to start.
+      - postgres_data:/var/lib/postgresql
     networks:
       - hub
     healthcheck:

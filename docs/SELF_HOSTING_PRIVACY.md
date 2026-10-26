@@ -1,9 +1,6 @@
 # Self-hosting: what your Hub sends to Legion, and your duties as its operator
 
-> Status: DRAFT for `v0.1.0`. Every statement below was checked against the Hub
-> code on 2026-10-24 and the findings are applied here; the release tag does not
-> exist yet, so if the Hub code changes before it is tagged the checks are run
-> again and this block is replaced with «checked against `v0.1.0` on <date>».
+> Status: checked against `v0.1.0` on 2026-10-26.
 > This note is information, not legal advice, and it is not a contract; the legal
 > documents for our hosted services are at <https://market.mylegion.online/terms>.
 
@@ -80,5 +77,4 @@ Version 2026-10-26. Changed from the 2026-10-25 text: the §2 table was correcte
 against the Hub code — the API Key is not sent with catalogue or skill-package
 requests, and the Hub's own user and room identifiers do reach the Gateway — and
 the fields stored when an Account is linked, and the `HTTP-Referer` detail in §1,
-are now named. See `MAINTAINER_RELEASE_CHECKS.md` for the checks and
-`legal/PENDING.md` #24.
+are now named.

@@ -40,21 +40,35 @@ present an unchecked platform as supported.
 These checks do not replace the full Hub backend CI suite, a native arm64
 build, or installation from a published release bundle.
 
-## Still required before the first public release
+## Checked on published release candidates (2026-10-26)
 
-- Run the documented installer from a clean Ubuntu host and complete a
-  start/login/room smoke test. No clean Ubuntu host was available for the
-  2026-10-15 check.
-- Run the documented Windows PowerShell installer from a freshly unpacked
-  release bundle. The local Windows check above used `docker compose build`
-  from the source checkout; it did not download a published release bundle.
-- Run the arm64 GitHub Actions build and inspect the resulting multi-platform
-  manifests. This must use the native `ubuntu-24.04-arm` job defined in
-  `.github/workflows/_build-image.yml`, not an amd64 emulation result.
-- Install the resulting release on Apple Silicon when a Mac is available.
-  Apple Silicon is **not yet live-validated** as of this record.
-- Run a connector pairing smoke test against the release Hub; it depends on
-  the public connector release artifact and remains a P1 release check.
+- `v0.1.0-rc.1`: the Windows PowerShell installer from a freshly unpacked
+  `legion-selfhost.zip` on Windows 11 with Docker Desktop: all services
+  healthy, sign-up and sign-in, a room started from the release workspace
+  image.
+- `v0.1.0-rc.1` to `rc.3`: `install.sh` from the release page on a clean
+  Ubuntu 24.04 amd64 host (Docker Engine 29): all services healthy, the first
+  account became the owner, six starter agents, a room with Node.js 24.
+- `v0.1.0-rc.3` with `--domain` on the same host: Caddy obtained a Let's
+  Encrypt certificate, HTTP redirects to HTTPS, sign-in and a room chat work
+  over HTTPS.
+- The release workflow built every image natively on amd64 and on
+  `ubuntu-24.04-arm`; the published manifests of all eight images list
+  `linux/amd64` and `linux/arm64`.
+- Connector pairing from a fresh clone of `legion-connector` against the
+  release Hub, under the dedicated user its installer creates; a direct chat
+  with the external agent was answered from the connector's machine.
+- With `MARKET_ENABLED=false`, no container opened a connection outside the
+  Docker networks during two minutes after a backend restart.
+
+The `v0.1.0` tag carries fixes made after `rc.3` (the installer's `.env`
+permissions, the agent card after pairing, the connector's dedicated user);
+each was checked on the same Ubuntu host before tagging.
+
+## Not yet checked
+
+- Apple Silicon. The arm64 images are built natively, but no installation on a
+  Mac has been checked. Treat it as unverified.
 
 ## arm64 source review
 

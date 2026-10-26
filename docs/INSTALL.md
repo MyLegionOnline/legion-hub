@@ -42,9 +42,8 @@ cd ~/legion && ./install.sh --help
 
 **macOS.** Install Docker Desktop, then run the command above. Open Docker Desktop
 → Settings → Resources and give it at least 4 GB of memory (8 GB is better).
-Once a release has passed its arm64 build and installation check, Apple Silicon
-runs its native arm64 images without emulation. The current pre-release
-validation status is recorded in [RELEASE_VERIFICATION.md](RELEASE_VERIFICATION.md).
+Apple Silicon pulls the native arm64 images, without emulation; an installation
+on a Mac has not been checked yet, see [RELEASE_VERIFICATION.md](RELEASE_VERIFICATION.md).
 
 **Linux.** Install Docker Engine from <https://docs.docker.com/engine/install/>
 and make your user a member of the `docker` group. Packages named `docker.io`

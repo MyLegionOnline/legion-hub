@@ -88,19 +88,24 @@ random_hex() {
   fi
 }
 
-# set_var NAME VALUE — replace NAME=… in .env, or add it.
+# set_var NAME VALUE — replace NAME=… in .env, or add it. The new file is
+# written under umask 077: it replaces .env, so it must stay owner-only.
 set_var() {
-  { grep -v "^$1=" .env || true; } > .env.tmp
-  printf '%s=%s\n' "$1" "$2" >> .env.tmp
+  (
+    umask 077
+    { grep -v "^$1=" .env || true; } > .env.tmp
+    printf '%s=%s\n' "$1" "$2" >> .env.tmp
+  )
   mv .env.tmp .env
 }
 
 log "Checking .env"
 if [ -f .env ]; then
   echo ".env already exists, leaving the secrets in it alone"
-else
-  cp .env.example .env
+  # Earlier installers left it readable by everyone (set_var lost the mode).
   chmod 600 .env 2>/dev/null || true
+else
+  (umask 077; cp .env.example .env)
   for name in POSTGRES_PASSWORD SECRET_KEY WORKSPACED_TOKEN MCP_HOST_TOKEN MCP_GATEWAY_TOKEN; do
     set_var "$name" "$(random_hex)"
   done

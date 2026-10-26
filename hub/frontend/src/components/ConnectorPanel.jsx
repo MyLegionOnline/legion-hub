@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Check, Copy, Loader, Plug, X } from 'lucide-react';
 
 // "Connect an external agent" on the agent card — pairing code + install
@@ -168,28 +168,63 @@ function PairingModal({ pairing, onClose }) {
   );
 }
 
+// How the agents list shows a connector agent (api/v1/agents.py reads it the same way).
+const agentStatusOf = (connector) =>
+  connector.revoked_at ? 'offline'
+    : connector.status === 'busy' ? 'busy'
+    : connector.status === 'idle' ? 'online'
+    : 'offline';
+
+// Nothing pushes connector state to the browser, so the card asks again: often
+// while the connector has never connected (install.sh is running somewhere),
+// rarely afterwards.
+const POLL_UNSEEN_MS = 3000;
+const POLL_SEEN_MS = 15000;
+
 export function ConnectorSection({ agent, token, onUpdated }) {
   const [connector, setConnector] = useState(null);
   const [loading, setLoading] = useState(false);
   const [pairing, setPairing] = useState(null);
   const [busy, setBusy] = useState(false);
+  // The latest agent and callback, for the poll below without restarting it.
+  const latest = useRef({ agent, onUpdated });
+  latest.current = { agent, onUpdated };
 
   useEffect(() => {
     let cancelled = false;
+    let timer = null;
     if (!agent.connector_id) {
       setConnector(null);
       return;
     }
-    setLoading(true);
-    fetch('/api/v1/connectors', { headers: authHeaders(token) })
-      .then((res) => (res.ok ? res.json() : []))
-      .then((list) => {
-        if (cancelled) return;
-        setConnector((list || []).find((c) => c.id === agent.connector_id) || null);
-      })
-      .catch(() => {})
-      .finally(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
+    const load = async (first) => {
+      if (first) setLoading(true);
+      let found = null;
+      try {
+        if (first || !document.hidden) {
+          const res = await fetch('/api/v1/connectors', { headers: authHeaders(token) });
+          const list = res.ok ? await res.json() : [];
+          if (cancelled) return;
+          found = (list || []).find((c) => c.id === agent.connector_id) || null;
+          setConnector(found);
+          if (found) {
+            // The pairing code has been used once the connector connects.
+            if (found.last_seen_at) setPairing(null);
+            const { agent: current, onUpdated: notify } = latest.current;
+            const status = agentStatusOf(found);
+            if (current.status !== status) notify?.({ ...current, status });
+          }
+        }
+      } catch {
+        // Keep what the card shows; the next poll tries again.
+      } finally {
+        if (!cancelled && first) setLoading(false);
+      }
+      if (cancelled || found?.revoked_at) return;
+      timer = setTimeout(() => load(false), found?.last_seen_at ? POLL_SEEN_MS : POLL_UNSEEN_MS);
+    };
+    load(true);
+    return () => { cancelled = true; clearTimeout(timer); };
   }, [agent.connector_id, token]);
 
   const handleConnect = async () => {

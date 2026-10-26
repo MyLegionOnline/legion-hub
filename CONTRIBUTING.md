@@ -60,7 +60,7 @@ this is how to run them locally.
 |---|---|
 | `hub/backend` (Python 3.11) | `pip install -r requirements.txt -r requirements-dev.txt`, then `python -m pytest`. Tests marked `db` need PostgreSQL: set `DATABASE_URL=postgresql+asyncpg://…/legion_test` (the database name must contain `test`) or skip them with `-m "not db"` |
 | `hub/workspaced`, `mcp_gateway/backend`, `mcp_host/backend` | `pip install -r requirements.txt pytest pytest-asyncio httpx`, then `python -m pytest` |
-| `hub/frontend` (Node 20) | `npm ci`, `npm run lint`, `npm run build` |
+| `hub/frontend` (Node 24) | `npm ci`, `npm run lint`, `npm run build` |
 
 The connector lives in its own repository,
 [MyLegionOnline/legion-connector](https://github.com/MyLegionOnline/legion-connector),

@@ -31,8 +31,14 @@ it elsewhere), writes `.env` with new random secrets, copies
 <http://localhost:8080>.
 
 To inspect before you run it, download the bundle (`legion-selfhost.tar.gz` on the
-[releases page](https://github.com/MyLegionOnline/legion-hub/releases)), unpack it and run
-`./install.sh` yourself. `./install.sh --help` lists the options.
+[releases page](https://github.com/MyLegionOnline/legion-hub/releases)), unpack it into
+its own directory and run `./install.sh` yourself. The archive has no top-level
+folder:
+
+```bash
+mkdir ~/legion && tar -xzf legion-selfhost.tar.gz -C ~/legion
+cd ~/legion && ./install.sh --help
+```
 
 **macOS.** Install Docker Desktop, then run the command above. Open Docker Desktop
 → Settings → Resources and give it at least 4 GB of memory (8 GB is better).

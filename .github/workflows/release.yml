@@ -203,7 +203,9 @@ jobs:
           # The bundle runs this release, not "latest".
           sed -i "s/^LEGION_VERSION=.*/LEGION_VERSION=${VERSION}/" bundle/.env.example
           chmod +x bundle/install.sh
-          tar -czf legion-selfhost.tar.gz -C bundle .
+          # Files only, owned by root: a "./" entry owned by the runner's uid would
+          # take over the directory it is unpacked into (as root, even ~ itself).
+          (cd bundle && tar --owner=0 --group=0 --numeric-owner -czf ../legion-selfhost.tar.gz -- * .env.example)
           (cd bundle && zip -qr ../legion-selfhost.zip .)
           cp bundle/install.sh install.sh
 

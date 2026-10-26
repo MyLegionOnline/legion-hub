@@ -101,7 +101,10 @@ function App() {
         API('/api/v1/users/me', tok),
       ]);
 
-      if (agentsRes.status === 401) { handleLogout(); return; }
+      // Any signed-in user can read /users/me, so 401/403/404 there means the token
+      // is no longer usable: 403 for a bad JWT (new secrets after a reinstall),
+      // 404 for a user that is gone (database recreated).
+      if (agentsRes.status === 401 || [401, 403, 404].includes(meRes.status)) { handleLogout(); return; }
 
       const [agentsData, roomsData, meData] = await Promise.all([
         agentsRes.ok ? agentsRes.json() : [],

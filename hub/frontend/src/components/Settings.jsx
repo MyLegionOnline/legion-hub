@@ -137,7 +137,7 @@ function ProfileTab({ user, onUpdate, token }) {
           <StyledInput value={form.full_name} onChange={e => setForm({ ...form, full_name: e.target.value })} placeholder="Your name" />
         </Field>
         <Field label="Email">
-          <StyledInput type="email" value={form.email} onChange={e => setForm({ ...form, email: e.target.value })} placeholder="admin@legion.local" />
+          <StyledInput type="email" value={form.email} onChange={e => setForm({ ...form, email: e.target.value })} placeholder="you@example.com" />
         </Field>
 
         <button

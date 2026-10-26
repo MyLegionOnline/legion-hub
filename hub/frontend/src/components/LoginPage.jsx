@@ -170,7 +170,7 @@ export function LoginPage({ onAuth }) {
                 type="email"
                 value={form.email}
                 onChange={set('email')}
-                placeholder="admin@legion.local"
+                placeholder="you@example.com"
                 autoFocus={mode === 'login'}
               />
             </Field>

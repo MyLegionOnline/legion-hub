@@ -91,6 +91,17 @@ def _patch_owned(agent):
     return patch.object(agents_api, "_get_owned_agent", new=AsyncMock(return_value=agent))
 
 
+@pytest.fixture(autouse=True)
+def _serialize_as_is(monkeypatch):
+    """The upload answers through `_with_skill_names`, which queries skills and
+    connectors; these tests check the agent row itself, so pass it through."""
+
+    async def _as_is(db, agents, owner_id):
+        return agents
+
+    monkeypatch.setattr(agents_api, "_with_skill_names", _as_is)
+
+
 # ── POST /agents/{id}/avatar ────────────────────────────────────────────────
 
 

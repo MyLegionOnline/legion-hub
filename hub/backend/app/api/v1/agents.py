@@ -19,6 +19,7 @@ from app.db.release import release_db
 from app.db.session import get_session
 from app.models.agent import Agent
 from app.models.agent_avatar import AgentAvatar
+from app.models.connector import Connector
 from app.models.user import User
 from app.models.user_quota import UserQuota
 from app.models.market import AgentSkill, UserInstalledItem
@@ -292,12 +293,33 @@ async def _with_skill_names(
         )
         for agent_id, name in assigned.all():
             names.setdefault(agent_id, []).append(name)
+    connector_ids = {agent.connector_id for agent in agents if agent.connector_id is not None}
+    connector_status: dict[UUID, str] = {}
+    if connector_ids:
+        rows = await db.execute(
+            select(Connector.id, Connector.status, Connector.revoked_at).where(
+                Connector.id.in_(connector_ids)
+            )
+        )
+        for connector_id, status_value, revoked_at in rows.all():
+            connector_status[connector_id] = agent_status_from_connector(status_value, revoked_at)
     out = []
     for agent in agents:
         item = AgentOut.model_validate(agent)
         item.skill_names = names.get(agent.id, [])
+        if agent.connector_id is not None:
+            item.status = connector_status.get(agent.connector_id, "offline")
         out.append(item)
     return out
+
+
+def agent_status_from_connector(connector_status: str, revoked_at: Optional[datetime]) -> str:
+    """An external agent's status is its connector's: nothing else ever writes
+    ``agent.status`` for it, so the stored value would read "offline" while
+    the connector is connected and taking tasks."""
+    if revoked_at is not None:
+        return "offline"
+    return {"idle": "online", "busy": "busy"}.get(connector_status, "offline")
 
 
 @router.get("/{agent_id}/skills", response_model=list[InstalledItemOut])
@@ -632,7 +654,7 @@ async def upload_agent_avatar(
     db.add(agent)
     await db.commit()
     await db.refresh(agent)
-    return agent
+    return (await _with_skill_names(db, [agent], current_user.id))[0]
 
 
 @router.get("/{agent_id}/avatar")

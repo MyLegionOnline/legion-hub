@@ -25,6 +25,66 @@ function Row({ label, children }) {
   );
 }
 
+// Rooms this connector may take tasks from, each with Revoke
+// (GET /connectors/{id}/grants, DELETE /rooms/{room}/connectors/{id}).
+function RoomAccessList({ connectorId, token }) {
+  const [grants, setGrants] = useState(null);
+  const [revoking, setRevoking] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`/api/v1/connectors/${connectorId}/grants`, { headers: authHeaders(token) })
+      .then((res) => (res.ok ? res.json() : []))
+      .then((list) => { if (!cancelled) setGrants(list || []); })
+      .catch(() => { if (!cancelled) setGrants([]); });
+    return () => { cancelled = true; };
+  }, [connectorId, token]);
+
+  const revoke = async (roomId) => {
+    setRevoking(roomId);
+    try {
+      const res = await fetch(`/api/v1/rooms/${roomId}/connectors/${connectorId}`, {
+        method: 'DELETE',
+        headers: authHeaders(token),
+      });
+      if (!res.ok && res.status !== 204) throw new Error(await readError(res, `HTTP ${res.status}`));
+      setGrants((list) => (list || []).filter((g) => g.room_id !== roomId));
+    } catch (err) {
+      alert(`Failed to revoke access: ${err.message}`);
+    } finally {
+      setRevoking(null);
+    }
+  };
+
+  return (
+    <div className="px-4 py-3 rounded-xl space-y-2" style={{ background: 'var(--bg-card)', border: '1px solid var(--border)' }}>
+      <span className="text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>Rooms with access</span>
+      {grants === null && <Loader size={12} className="animate-spin" />}
+      {grants && grants.length === 0 && (
+        <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+          No rooms yet. Open a direct chat with this agent, or grant access in a room's Members panel.
+        </p>
+      )}
+      {grants && grants.map((g) => (
+        <div key={g.room_id} className="flex items-center justify-between gap-2" data-testid="connector-grant-row">
+          <span className="text-xs truncate" style={{ color: 'var(--text-primary)' }}>
+            {g.room_name}
+            {g.room_type === 'direct' && <span style={{ color: 'var(--text-muted)' }}> · direct</span>}
+          </span>
+          <button
+            onClick={() => revoke(g.room_id)}
+            disabled={revoking === g.room_id}
+            className="btn-ghost text-xs px-2 py-0.5 rounded-lg shrink-0"
+            style={{ color: '#ef4444', opacity: revoking === g.room_id ? 0.5 : 1 }}
+          >
+            Revoke
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function PairingModal({ pairing, onClose }) {
   const [copiedCode, setCopiedCode] = useState(false);
   const [copiedCmd, setCopiedCmd] = useState(false);
@@ -272,6 +332,9 @@ export function ConnectorSection({ agent, token, onUpdated }) {
             Get a new connection code
           </button>
         </Row>
+      )}
+      {connector && !connector.revoked_at && (
+        <RoomAccessList connectorId={connector.id} token={token} />
       )}
       {!connector?.revoked_at && (
         <Row label="Revoke">

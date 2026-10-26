@@ -6606,6 +6606,13 @@ async def prepare_task_dispatch(
     if room is None:
         raise TaskDispatchPreflightError("room_not_found", "room not found")
 
+    from app.core.connector_direct import is_direct_connector
+
+    if is_direct_connector(room, agent):
+        # A direct room with a connector agent has no ChatMaster: the result
+        # goes straight back to the chat (core/connector_direct.py).
+        return TaskDispatchContext(task.goal_id, plan_id, agent, None, False)
+
     coord_cfg = room.coordinator_config or {}
     cm_agent_id_raw = (
         coord_cfg.get("agent_id")
@@ -6633,7 +6640,12 @@ async def prepare_task_dispatch(
 
 
 async def _emit_dispatch_failed(
-    task: Task, room_id: UUID, reason: str, db, run_id: str | None = None
+    task: Task,
+    room_id: UUID,
+    reason: str,
+    db,
+    run_id: str | None = None,
+    extra_metadata: dict[str, Any] | None = None,
 ) -> None:
     """Persistent, user-visible marker that a claimed task will NOT get a session.
 
@@ -6666,7 +6678,7 @@ async def _emit_dispatch_failed(
             ),
             db=db,
             task_id=task.id,
-            metadata={"task_id": str(task.id), "reason": reason},
+            metadata={"task_id": str(task.id), "reason": reason, **(extra_metadata or {})},
         )
         await db.commit()
     except Exception:
@@ -6870,7 +6882,13 @@ async def handle_task_created(
             and await has_active_grant(db, connector_id=agent.connector_id, room_id=room_id)
         )
         if not granted:
-            await _emit_dispatch_failed(task, room_id, "connector_not_granted", db, run_id=run_id)
+            await _emit_dispatch_failed(
+                task, room_id, "connector_not_granted", db, run_id=run_id,
+                extra_metadata={
+                    "connector_id": str(agent.connector_id) if agent.connector_id else None,
+                    "agent_id": str(agent.id),
+                },
+            )
             from app.core.task_runtime import finalize_run
             await finalize_run(task.id, run_id, db, failed=True, task=task)
             return
@@ -6896,13 +6914,19 @@ async def handle_task_created(
         await finalize_run(task.id, run_id, db, failed=True, task=task)
         return
 
+    from app.core.connector_direct import is_direct_connector
+
+    direct_connector = is_direct_connector(room, agent)
     coord_cfg = room.coordinator_config or {}
     cm_agent_id_raw = (
         coord_cfg.get("agent_id")
         or coord_cfg.get("chat_master_agent_id")
         or coord_cfg.get("master_agent_id")
     )
-    if not cm_agent_id_raw:
+    if direct_connector:
+        # No ChatMaster side: the connector's answer goes straight to the chat.
+        cm_agent_id_raw = None
+    elif not cm_agent_id_raw:
         logger.info("proxy_session: room %s has no master_agent_id — skipping", room_id)
         await _emit_dispatch_failed(task, room_id, "no_chat_master", db, run_id=run_id)
         from app.core.task_runtime import finalize_run
@@ -6910,7 +6934,7 @@ async def handle_task_created(
         return
 
     try:
-        cm_agent_id = UUID(str(cm_agent_id_raw))
+        cm_agent_id = UUID(str(cm_agent_id_raw)) if cm_agent_id_raw else None
     except (ValueError, AttributeError):
         logger.error(
             "proxy_session: invalid master_agent_id %r in room %s — aborting",
@@ -6939,23 +6963,25 @@ async def handle_task_created(
     )
 
     # Create CM-side linked to agent
-    cm_session = await repo.create(
-        CmAgentProxySessionCreate(
-            kind="cm_agent_proxy",
-            room_id=room_id,
-            side="chat_master",
-            task_id=task_id,
-            goal_id=goal_id,
-            plan_id=plan_id,
-            agent_id=cm_agent_id,
-            peer_session_id=agent_session.id,
+    cm_session = None
+    if cm_agent_id is not None:
+        cm_session = await repo.create(
+            CmAgentProxySessionCreate(
+                kind="cm_agent_proxy",
+                room_id=room_id,
+                side="chat_master",
+                task_id=task_id,
+                goal_id=goal_id,
+                plan_id=plan_id,
+                agent_id=cm_agent_id,
+                peer_session_id=agent_session.id,
+            )
         )
-    )
 
-    # Back-link: agent now points to CM
-    agent_session.peer_session_id = cm_session.id
-    db.add(agent_session)
-    await db.flush()
+        # Back-link: agent now points to CM
+        agent_session.peer_session_id = cm_session.id
+        db.add(agent_session)
+        await db.flush()
 
     if resume:
         try:
@@ -6973,8 +6999,11 @@ async def handle_task_created(
                 agent_session.id,
             )
 
-    for session, side in ((agent_session, "agent"), (cm_session, "chat_master")):
-        peer_id = cm_session.id if side == "agent" else agent_session.id
+    pair = [(agent_session, "agent")]
+    if cm_session is not None:
+        pair.append((cm_session, "chat_master"))
+    for session, side in pair:
+        peer_id = (cm_session.id if cm_session else None) if side == "agent" else agent_session.id
         await emit_event(
             room_id=room_id,
             event_type="SESSION_STARTED",
@@ -6987,7 +7016,7 @@ async def handle_task_created(
                 "task_id": str(task_id),
                 "goal_id": str(goal_id) if goal_id else None,
                 "plan_id": str(plan_id) if plan_id else None,
-                "peer_session_id": str(peer_id),
+                "peer_session_id": str(peer_id) if peer_id else None,
             },
         )
 
@@ -6996,17 +7025,26 @@ async def handle_task_created(
         task_id,
         run_id,
         agent_session.id,
-        cm_session.id,
+        cm_session.id if cm_session else None,
+    )
+
+    # A direct-room message for an operator-mode connector runs on the owner's
+    # machine and never touches the Room's repository: no task branch, no
+    # skill files, and no reason to wake the Room's workspace for either.
+    needs_workspace = not (
+        direct_connector
+        and str((agent.llm_config or {}).get("connector_mode") or "operator") == "operator"
     )
 
     # Create the task branch in the workspace (non-blocking). internal design notes
     # Stage 1: branched off `dev` or the goal branch, not off whatever HEAD is —
     # `main` never receives agent work.
     try:
-        from app.core.room_git_flow import ensure_task_branch
-        branch_name = await ensure_task_branch(str(room_id), task, db)
-        await db.flush()
-        logger.info("proxy_session: task branch %s ready for task %s", branch_name, task_id)
+        if needs_workspace:
+            from app.core.room_git_flow import ensure_task_branch
+            branch_name = await ensure_task_branch(str(room_id), task, db)
+            await db.flush()
+            logger.info("proxy_session: task branch %s ready for task %s", branch_name, task_id)
     except Exception as _exc:
         logger.warning(
             "proxy_session: could not prepare task branch for task %s: %s",
@@ -7015,7 +7053,7 @@ async def handle_task_created(
 
     # Materialize the dispatched agent's bundled skill files onto the workspace
     # volume (internal design notes Stage 3), non-blocking.
-    if agent is not None:
+    if agent is not None and needs_workspace:
         try:
             from app.core.skill_materialize import materialize_agent_skills
 
@@ -7164,6 +7202,10 @@ async def handle_task_created(
     from app.core.task_runtime import finalize_run
 
     await finalize_run(task.id, run_id, db, task=task)
+    # finalize_run only flushes; a room without a workspace row (a direct room
+    # with a connector agent) has no later commit, and the task would read as
+    # still running.
+    await db.commit()
 
     # Only now, with this generation settled, hand the task to its successor.
     if pending_dispatch:

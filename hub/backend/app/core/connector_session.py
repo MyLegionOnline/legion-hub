@@ -165,6 +165,15 @@ _OPERATOR_PREAMBLE = (
 )
 
 
+_DIRECT_PREAMBLE = (
+    "[Mode: operator, direct chat. The owner of this machine is talking to you "
+    "from the Legion chat; there is no ChatMaster and no review. Answer the "
+    "message below; if it asks for work, do it here on your own machine. Your "
+    "final summary is shown in the chat as your reply, so write it for the "
+    "owner. If something failed, say so plainly and finish with success=false.]"
+)
+
+
 def _worker_archive_max_bytes() -> int:
     try:
         return int(os.getenv("CONNECTOR_WORKER_ARCHIVE_MAX_BYTES", str(5_000_000)))
@@ -196,7 +205,20 @@ async def _build_dispatch_context(
     wrapped_task_data_text = task_data_text
     task_branch: Optional[str] = None
     workspace_archive_b64: Optional[str] = None
-    if mode == "operator":
+    from app.models.task import TASK_ORIGIN_DIRECT_CONNECTOR
+
+    if mode == "operator" and getattr(task, "origin", None) == TASK_ORIGIN_DIRECT_CONNECTOR:
+        # The connector reads only task_data_text, so the earlier chat travels
+        # inside it (core/connector_direct.py).
+        from app.core.connector_direct import conversation_context
+
+        earlier = await conversation_context(task, db)
+        parts = [_DIRECT_PREAMBLE]
+        if earlier:
+            parts.append(f"Earlier in this chat:\n\n{earlier}")
+        parts.append(f"New message from the owner:\n\n{task.description or task_data_text}")
+        wrapped_task_data_text = "\n\n".join(parts)
+    elif mode == "operator":
         # The remote CLI agent has no other way to
         # learn it must not touch the Room's repository and must end with a
         # structured report — the local loop's equivalent framing lives in
@@ -284,7 +306,7 @@ async def connector_block_reason(db: AsyncSession, agent: Agent) -> Optional[str
 
 async def _run_connector_loop(
     agent_session: Session,
-    cm_session: Session,
+    cm_session: Optional[Session],
     task: Task,
     task_data_text: str,
     room_id: UUID,
@@ -297,7 +319,8 @@ async def _run_connector_loop(
 
     Same call signature on purpose: the caller settles the run via the
     shared ``finalize_run``/rework-redispatch code after this returns or is
-    cancelled exactly as it would after the local loop.
+    cancelled exactly as it would after the local loop. ``cm_session`` is
+    None for a direct room's message (core/connector_direct.py).
     """
     agent = (
         await db.execute(select(Agent).where(Agent.id == task.assigned_agent_id))
@@ -317,11 +340,12 @@ async def _run_connector_loop(
     agent_session.executor = "connector"
     agent_session.connector_id = connector_id
     agent_session.billing = "external"
-    cm_session.executor = "connector"
-    cm_session.connector_id = connector_id
-    cm_session.billing = "external"
     db.add(agent_session)
-    db.add(cm_session)
+    if cm_session is not None:
+        cm_session.executor = "connector"
+        cm_session.connector_id = connector_id
+        cm_session.billing = "external"
+        db.add(cm_session)
     await db.flush()
 
     block_reason = await connector_block_reason(db, agent)

@@ -236,6 +236,10 @@ async def handle_inbound_frame(
         await _handle_status(agent_session, payload)
     elif frame_type == "reasoning":
         await _handle_reasoning(db, agent_session, payload)
+    elif frame_type == "ask_cm" and cm_session is None and task is not None:
+        # No ChatMaster in a direct room (core/connector_direct.py): the
+        # question goes to the human, as the same card ask_user gets.
+        await _handle_ask_user(agent_session, room_id, connector_id, run_id, payload)
     elif frame_type == "ask_cm":
         await _handle_ask_cm(db, agent_session, cm_session, task, room_id, connector_id, run_id, payload)
     elif frame_type == "ask_user":
@@ -506,10 +510,13 @@ async def _handle_result(
     payload: dict[str, Any],
     connector_id: UUID,
 ) -> None:
-    if task is None or cm_session is None:
+    if task is None:
         logger.warning(
-            "connector_reverse: result with no task/CM peer for session=%s", agent_session.id
+            "connector_reverse: result with no task for session=%s", agent_session.id
         )
+        return
+    if cm_session is None:
+        await _handle_direct_result(db, agent_session, task, room_id, run_id, payload, connector_id)
         return
 
     # Room-visible audit trail: the result frame arrived, tagged
@@ -848,6 +855,46 @@ async def _handle_result(
     if run is not None:
         _RUNS.pop(agent_session.id, None)
         run.future.set_result({"failed": is_rejected})
+
+
+async def _handle_direct_result(
+    db: AsyncSession,
+    agent_session: CmAgentProxySession,
+    task: Task,
+    room_id: UUID,
+    run_id: Optional[str],
+    payload: dict[str, Any],
+    connector_id: UUID,
+) -> None:
+    """A direct room's message is answered: the reply goes to the chat, no review."""
+    from app.core.connector_direct import deliver_result
+
+    await emit_event(
+        room_id,
+        "CONNECTOR_RESULT",
+        f"Connector reported result for task '{task.title}'.",
+        db,
+        task_id=task.id,
+        metadata={
+            "connector_id": str(connector_id),
+            "task_id": str(task.id),
+            "success": payload.get("success"),
+            "run_id": run_id,
+        },
+    )
+    summary_raw = str(payload.get("summary") or payload.get("report") or "").strip()
+    summary = _mask(summary_raw) or "[The agent finished without a reply]"
+    await deliver_result(
+        db,
+        agent_session=agent_session,
+        task=task,
+        room_id=room_id,
+        summary=summary,
+        success=payload.get("success"),
+    )
+    run = _RUNS.pop(agent_session.id, None)
+    if run is not None:
+        run.future.set_result({"failed": False})
 
 
 async def _handle_error(

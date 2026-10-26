@@ -98,6 +98,12 @@ TASK_ORIGIN_DIRECT_SESSION = "direct_session"
 # branches (the goal's plan knows nothing about the already-running tasks).
 TASK_ORIGIN_CM_QUICK = "cm_quick"
 
+# Value of Task.origin for a message the owner typed into a direct room with an
+# agent run by a connector: each message becomes one task for the connector,
+# and its result comes back to the chat as the agent's reply — there is no
+# ChatMaster to review it (core/connector_direct.py).
+TASK_ORIGIN_DIRECT_CONNECTOR = "direct_connector"
+
 
 class DispatchStatus(str, Enum):
     BLOCKED = "blocked"      # has unfinished predecessors — not dispatched yet

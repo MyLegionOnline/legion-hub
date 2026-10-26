@@ -88,6 +88,14 @@ def expire(question_id: str) -> None:
         )
 
 
+def pending_question_for_session(session_id: UUID) -> str | None:
+    """The question this session is waiting on, if any."""
+    for question_id, pq in _PENDING.items():
+        if pq.session_id == session_id:
+            return question_id
+    return None
+
+
 def is_session_waiting(session_id: UUID) -> bool:
     """True when session is paused waiting for a user answer — skip watchdog kill."""
     return session_id in _WAITING_SESSIONS

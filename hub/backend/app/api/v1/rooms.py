@@ -12,7 +12,7 @@ from uuid import UUID
 
 from app.api import deps
 from app.db.session import get_session
-from app.models.room import Room, RoomUserLink, RoomAgentLink, ROOM_TRANSITIONS
+from app.models.room import Room, RoomType, RoomUserLink, RoomAgentLink, ROOM_TRANSITIONS
 from app.models.message import Message
 from app.models.agent import Agent
 from app.models.agent_memory import AgentMemory
@@ -244,6 +244,29 @@ async def create_room(
         for a_id in room_in.agent_ids:
             db.add(RoomAgentLink(room_id=db_obj.id, agent_id=a_id))
             db.add(AgentMemory(room_id=db_obj.id, agent_id=a_id))
+
+        if room_in.room_type == RoomType.direct:
+            # The owner opening a direct room with their own connector agent
+            # is the consent: without the grant every message would fail with
+            # connector_not_granted (core/connector_direct.py).
+            from app.core.connector_pairing import grant_room
+
+            direct_agent = (await db.execute(
+                select(Agent).where(
+                    Agent.id == room_in.agent_ids[0], Agent.owner_id == current_user.id
+                )
+            )).scalars().first()
+            if (
+                direct_agent is not None
+                and direct_agent.executor == "connector"
+                and direct_agent.connector_id is not None
+            ):
+                await grant_room(
+                    db,
+                    connector_id=direct_agent.connector_id,
+                    room_id=db_obj.id,
+                    granted_by=current_user.id,
+                )
 
     # T9: `workspaced` must create the root and attach its XFS project before
     # this room is visible.  A file upload may be the first operation — it
@@ -608,6 +631,36 @@ async def get_room_members(
 
     master_agent_id = str((room.coordinator_config or {}).get("master_agent_id", ""))
 
+    # Which connector agents may take tasks here; the Members panel offers
+    # Grant/Revoke on them (only the connector's owner can change it).
+    from app.models.connector import Connector, ConnectorRoomGrant
+
+    connector_ids = [a.connector_id for a in agents if a.executor == "connector" and a.connector_id]
+    granted_connectors: set = set()
+    if connector_ids:
+        granted_connectors = set(
+            (await db.execute(
+                select(ConnectorRoomGrant.connector_id)
+                .join(Connector, Connector.id == ConnectorRoomGrant.connector_id)
+                .where(
+                    ConnectorRoomGrant.room_id == room_id,
+                    ConnectorRoomGrant.connector_id.in_(connector_ids),
+                    ConnectorRoomGrant.revoked_at.is_(None),
+                    Connector.revoked_at.is_(None),
+                )
+            )).scalars().all()
+        )
+
+    def _connector_fields(a: Agent) -> dict:
+        if a.executor != "connector" or a.connector_id is None:
+            return {}
+        return {
+            "executor": "connector",
+            "connector_id": str(a.connector_id),
+            "connector_granted": a.connector_id in granted_connectors,
+            "owned": a.owner_id == current_user.id,
+        }
+
     return {
         "has_coordinator": room.has_coordinator,
         "coordinator_config": room.coordinator_config or {},
@@ -622,6 +675,7 @@ async def get_room_members(
                 "short_description": a.short_description or "",
                 "provider": (a.llm_config or {}).get("provider"),
                 "is_master": room.has_coordinator and str(a.id) == master_agent_id,
+                **_connector_fields(a),
             }
             for a in agents
         ],

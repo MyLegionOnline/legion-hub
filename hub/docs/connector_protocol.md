@@ -40,6 +40,17 @@ Starts work for an agent. Its payload includes task content, the selected
 metadata. Room secrets are never included. The only currently supported mode
 is `operator`.
 
+The Hub sends a `dispatch` only for a room the connector has an active grant
+for (`PUT /api/v1/rooms/{room_id}/connectors/{connector_id}`); without it the
+task fails on the Hub with `connector_not_granted` and nothing is sent.
+
+In a direct room with the agent there is no ChatMaster: each message the owner
+types is one task. Its `task_data_text` starts with a direct-chat preamble,
+then the earlier messages of the chat (`User:` / `You:` lines), then the new
+message. The `result` summary is posted to the chat as the agent's reply and
+the task completes without review; an `ask_cm` frame becomes a question to the
+human, answered with an `answer` frame like `ask_user`.
+
 ### `answer`, `ask_cm`, and `stop`
 
 `answer` supplies the response to a pending human question. `ask_cm` is a

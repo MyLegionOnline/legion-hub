@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useMemo, useCallback, memo } from 'react';
-import { Square, Send, MoreVertical, Paperclip, Smile, Cpu, Trash2, CheckSquare, ArrowRightLeft, Play, Flag, Brain, File as FileIcon, ChevronDown, ChevronUp, Unlock, AlertTriangle, RotateCcw, Hourglass, Wrench, HelpCircle, ListChecks, Link2, Image as ImageIcon, ImageOff, GitMerge, GitCompare, Rocket, Pencil, ExternalLink, Download, Trash, Loader2, Lock } from 'lucide-react';
+import { Square, Send, MoreVertical, Paperclip, Smile, Cpu, Trash2, CheckSquare, CheckCircle, ArrowRightLeft, Play, Flag, Brain, File as FileIcon, ChevronDown, ChevronUp, Unlock, AlertTriangle, RotateCcw, Hourglass, Wrench, HelpCircle, ListChecks, Link2, Image as ImageIcon, ImageOff, GitMerge, GitCompare, Rocket, Pencil, ExternalLink, Download, Trash, Loader2, Lock } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkBreaks from 'remark-breaks';
@@ -889,6 +889,111 @@ function ProviderErrorCard({ msg, taskActions }) {
   );
 }
 
+/* ─── External agent without access to the room (TASK_DISPATCH_FAILED, connector_not_granted) ───
+ * The owner grants the agent's connector access to this room and the message
+ * is retried in one click (PUT /rooms/{id}/connectors/{cid} + Retry).
+ */
+function ConnectorNotGrantedCard({ msg, taskActions }) {
+  const [done, setDone] = useState(false);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState(null);
+  const { connector_id } = msg.metadata || {};
+  const taskId = msg.taskId || msg.metadata?.task_id;
+  const canAct = taskActions && taskId && connector_id && !done;
+
+  const grantAndRetry = async () => {
+    if (!canAct || pending) return;
+    setPending(true); setError(null);
+    try {
+      const res = await fetch(`/api/v1/rooms/${taskActions.roomId}/connectors/${connector_id}`, {
+        method: 'PUT',
+        headers: { Authorization: `Bearer ${taskActions.token}` },
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(typeof data.detail === 'string' ? data.detail : `HTTP ${res.status}`);
+      }
+      // Members shows the access state; let it reload like a toggle there would.
+      notifyRoomAgentsChanged(taskActions.roomId);
+      const ok = await retryTaskRequest({ roomId: taskActions.roomId, taskId, token: taskActions.token });
+      if (ok) { setDone(true); taskActions.onDone?.(); }
+      else setError('Access granted, but the task could not be restarted');
+    } catch (e) { setError(e.message); }
+    finally { setPending(false); }
+  };
+
+  return (
+    <div className="flex justify-center my-3" data-testid="connector-not-granted-card">
+      <div
+        className="flex flex-col gap-2 px-4 py-3 rounded-xl text-xs max-w-md w-full"
+        style={{ background: 'rgba(249,115,22,0.07)', border: '1px solid rgba(249,115,22,0.35)' }}
+      >
+        <div className="flex items-start gap-2.5">
+          <AlertTriangle size={14} style={{ color: '#f97316', flexShrink: 0, marginTop: 1 }} />
+          <div className="flex-1 min-w-0">
+            <span className="font-semibold" style={{ color: '#f97316' }}>No access to this room</span>
+            <p className="mt-0.5 leading-snug" style={{ color: 'var(--text-secondary)' }}>
+              The external agent&apos;s connector is not allowed to take tasks from this room.
+              Only the connector&apos;s owner can grant access.
+            </p>
+          </div>
+          <span style={{ color: 'var(--text-muted)', flexShrink: 0 }}>{msg.time}</span>
+        </div>
+        {done ? (
+          <div className="pl-6 text-[11px]" style={{ color: '#22c55e' }}>✓ Access granted, task restarted</div>
+        ) : (
+          <div className="pl-6">
+            <button
+              className="px-3 py-1.5 rounded-lg text-[11px] font-medium transition-opacity"
+              style={{
+                background: 'rgba(167,139,250,0.12)', color: '#a78bfa', border: '1px solid rgba(167,139,250,0.4)',
+                opacity: pending ? 0.6 : 1, cursor: pending ? 'wait' : 'pointer',
+              }}
+              onClick={grantAndRetry}
+              disabled={pending || !canAct}
+            >
+              Grant access and retry
+            </button>
+          </div>
+        )}
+        {error && (
+          <div className="pl-6 text-[11px]" style={{ color: '#f87171' }}>{error}</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ─── A chat turn that failed before any task existed (TURN_FAILED) ───
+ * Same wording as the provider failure card; there is no task to retry, so
+ * the way forward is to fix the key and send the message again.
+ */
+function TurnFailedCard({ msg }) {
+  const { reason, safe_error, http_status } = msg.metadata || {};
+  return (
+    <div className="flex justify-center my-3" data-testid="turn-failed-card">
+      <div
+        className="flex items-start gap-2.5 px-4 py-3 rounded-xl text-xs max-w-md w-full"
+        style={{ background: 'rgba(239,68,68,0.07)', border: '1px solid rgba(239,68,68,0.35)' }}
+      >
+        <AlertTriangle size={14} style={{ color: '#ef4444', flexShrink: 0, marginTop: 1 }} />
+        <div className="flex-1 min-w-0">
+          <span className="font-semibold" style={{ color: '#ef4444' }}>{interruptionTitle(reason)}</span>
+          <p className="mt-0.5 leading-snug" style={{ color: 'var(--text-secondary)' }}>
+            The agent could not reply:{' '}
+            {reason === 'timeout'
+              ? 'the model provider did not answer in time.'
+              : `the model provider returned an error${safe_error ? ` (${safe_error})` : ''}.`}
+            {(http_status === 401 || http_status === 403) && ' Check the provider API key in the agent settings.'}
+            {' '}Send the message again once it is fixed.
+          </p>
+        </div>
+        <span style={{ color: 'var(--text-muted)', flexShrink: 0 }}>{msg.time}</span>
+      </div>
+    </div>
+  );
+}
+
 /* ─── File Read Request Card (interactive: approve / reject) ─── */
 function FileReadRequestCard({ msg, token }) {
   const [actioned, setActioned] = useState(null); // 'approved' | 'rejected'
@@ -992,8 +1097,10 @@ function FileReadRequestCard({ msg, token }) {
 
 /* ─── Agent Question Card (interactive: choose option / free text) ─── */
 function AgentQuestionCard({ msg, token, roomId }) {
-  const { question_id, questions = [], timeout_seconds = 600 } = msg.metadata || {};
-  const [answered, setAnswered] = useState(null); // { selected_options, free_text }
+  const { question_id, questions = [], timeout_seconds = 600, answered_in_chat } = msg.metadata || {};
+  const [answered, setAnswered] = useState(
+    answered_in_chat ? { selected_options: [], free_text: null } : null,
+  ); // { selected_options, free_text }
   const [pending, setPending] = useState(false);
   const [error, setError] = useState(null);
   const [freeText, setFreeText] = useState('');
@@ -1055,6 +1162,9 @@ function AgentQuestionCard({ msg, token, roomId }) {
       });
       if (res.ok) {
         setAnswered({ selected_options: opts, free_text: ft });
+      } else if (res.status === 404) {
+        // Already answered — e.g. typed into a direct chat with an external agent.
+        setAnswered({ selected_options: [], free_text: null });
       } else {
         const data = await res.json().catch(() => ({}));
         setError(String(data.detail || `HTTP ${res.status}`));
@@ -1075,6 +1185,8 @@ function AgentQuestionCard({ msg, token, roomId }) {
       });
       if (res.ok) {
         setAnswered({ selected_options: [], free_text: freeText.trim() });
+      } else if (res.status === 404) {
+        setAnswered({ selected_options: [], free_text: null });
       } else {
         const data = await res.json().catch(() => ({}));
         setError(String(data.detail || `HTTP ${res.status}`));
@@ -2113,6 +2225,12 @@ function Message({ msg, prevMsg, tokenMap, taskActions, onPlanAccepted, onPlanEd
   if (msg.eventType === 'TASK_STALLED' && PROVIDER_FAILURE_REASONS.includes(msg.metadata?.reason)) {
     return <ProviderErrorCard msg={msg} taskActions={taskActions} />;
   }
+  if (msg.eventType === 'TASK_DISPATCH_FAILED' && msg.metadata?.reason === 'connector_not_granted' && msg.metadata?.connector_id) {
+    return <ConnectorNotGrantedCard msg={msg} taskActions={taskActions} />;
+  }
+  if (msg.eventType === 'TURN_FAILED') {
+    return <TurnFailedCard msg={msg} />;
+  }
   if (msg.eventType === 'FILE_READ_REQUESTED') {
     return <FileReadRequestCard msg={msg} token={taskActions?.token} />;
   }
@@ -3131,6 +3249,9 @@ const EVENT_ICONS = {
   // plan_session fallback: ChatMaster never called close_session, tasks were
   // created straight from the plan steps — worth a visible amber pill.
   PLAN_DECOMPOSITION_INCOMPLETE: <AlertTriangle size={11} style={{ color: '#f97316' }} />,
+  // Direct chat with an external agent (core/connector_direct.py).
+  AGENT_BUSY: <AlertTriangle size={11} style={{ color: '#f97316' }} />,
+  AGENT_QUESTION_ANSWERED: <CheckCircle size={11} style={{ color: '#22c55e' }} />,
 };
 
 function SystemEventLine({ msg }) {
@@ -3188,8 +3309,13 @@ function buildGroupedMessages(rawMsgs, currentUserId) {
   // DIVERGENCE_RESOLVED for the same task follows.
   const divergenceLatest = new Map();
   const divergenceResolutions = new Map();
+  // Questions an external agent asked that the owner answered by typing.
+  const questionsAnsweredInChat = new Set();
   for (const message of rawMsgs) {
     const eventType = message.event_type || 'MESSAGE';
+    if (eventType === 'AGENT_QUESTION_ANSWERED' && message.metadata?.question_id) {
+      questionsAnsweredInChat.add(String(message.metadata.question_id));
+    }
     if (eventType === 'CHECKPOINT_REQUEST') {
       checkpointRequests.add(checkpointKey(message.metadata, message.task_id));
     }
@@ -3219,6 +3345,12 @@ function buildGroupedMessages(rawMsgs, currentUserId) {
     // bash-sourced FILE_CHANGED exists only to refresh the Repository panel
     // (handled live on the socket); it carries no detail worth a chat pill.
     if (eventType === 'FILE_CHANGED' && m.metadata?.source === 'bash') continue;
+    if (eventType === 'AGENT_QUESTION' && questionsAnsweredInChat.has(String(m.metadata?.question_id))) {
+      const entry = toMsgEntry(m, currentUserId);
+      entry.metadata = { ...entry.metadata, answered_in_chat: true };
+      result.push(entry);
+      continue;
+    }
     if (TASK_CHANGE_EVENT_TYPES.has(eventType)) {
       const proposalId = m.metadata?.proposal_id;
       const dedupeKey = `${eventType}:${proposalId || m.id}`;

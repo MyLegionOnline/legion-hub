@@ -1443,6 +1443,36 @@ async def handle_internal_agents(content: str, room_id, db: AsyncSession):
             await manager.broadcast(err_msg, room_id)
 
 
+async def _emit_turn_failed(room_id: UUID, exc: BaseException) -> None:
+    """Show a failed reply in the room instead of leaving it only in the log.
+
+    Same reason/safe_error shape as a task's provider_error/timeout card
+    (proxy_session._classify_llm_failure), so a missing or wrong provider key
+    reads as "HTTP 401 ..., check the agent's provider key" in the chat.
+    """
+    _logger = logging.getLogger(__name__)
+    try:
+        from app.core.proxy_session import _classify_llm_failure
+
+        reason, safe_error, http_status = _classify_llm_failure(exc)
+        async with _make_session()() as db:
+            from app.core.events import emit_event
+
+            await emit_event(
+                room_id=room_id,
+                event_type="TURN_FAILED",
+                content=f"The agent could not reply: {safe_error}",
+                db=db,
+                metadata={
+                    "reason": reason,
+                    "safe_error": safe_error,
+                    "http_status": http_status,
+                },
+            )
+    except Exception:
+        _logger.exception("failed to report a failed turn in room %s", room_id)
+
+
 async def _bg_chat_master(room_id, content):
     _logger = logging.getLogger(__name__)
     try:
@@ -1488,6 +1518,15 @@ async def _bg_direct_agent(content, room_id, user_id):
             )
             agent = agent_res.scalars().first()
             if not agent:
+                return
+
+            # An agent run by a connector works on the owner's machine: the
+            # message becomes a task for the connector, with no Hub-side LLM
+            # loop and no workspace container (core/connector_direct.py).
+            from app.core import connector_direct
+
+            if connector_direct.is_direct_connector(room, agent):
+                await connector_direct.handle_direct_message(content, room, agent, session)
                 return
 
             active_task_res = await session.execute(
@@ -1548,6 +1587,7 @@ async def _bg_direct_agent(content, room_id, user_id):
             await session.commit()
     except Exception as exc:
         _logger.exception("_bg_direct_agent failed for room %s: %s", room_id, exc)
+        await _emit_turn_failed(room_id, exc)
 
 async def _bg_internal_agents(content, room_id):
     _logger = logging.getLogger(__name__)
@@ -1927,3 +1967,4 @@ async def _bg_group_flow(
             await db.commit()
     except Exception as exc:
         _logger.exception("_bg_group_flow failed for room %s: %s", room_id, exc)
+        await _emit_turn_failed(room_id, exc)

@@ -70,6 +70,53 @@ function MemberActivity({ entry }) {
   );
 }
 
+/* ── external agent: may its connector take tasks from this room? ──
+ * GET /rooms/{id}/members marks connector agents with `connector_granted`;
+ * only the connector's owner (`owned`) can change it. */
+function ConnectorAccess({ member, roomId, token }) {
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState(null);
+  const granted = !!member.connector_granted;
+
+  const toggle = async () => {
+    setPending(true); setError(null);
+    try {
+      const res = await fetch(`/api/v1/rooms/${roomId}/connectors/${member.connector_id}`, {
+        method: granted ? 'DELETE' : 'PUT',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(typeof body?.detail === 'string' ? body.detail : `HTTP ${res.status}`);
+      }
+      notifyRoomAgentsChanged(roomId);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setPending(false);
+    }
+  };
+
+  return (
+    <div className="pl-9 pt-0.5 flex items-center gap-2 text-[10px]" data-testid={`connector-access-${member.id}`}>
+      <span style={{ color: granted ? 'var(--text-muted)' : '#f97316' }}>
+        {granted ? 'Connector has access to this room' : 'No access to this room'}
+      </span>
+      {member.owned && (
+        <button
+          onClick={toggle}
+          disabled={pending}
+          className="btn-ghost px-1.5 py-0.5 rounded"
+          style={{ color: granted ? '#ef4444' : 'var(--accent-light)', opacity: pending ? 0.5 : 1 }}
+        >
+          {granted ? 'Revoke access' : 'Grant access'}
+        </button>
+      )}
+      {error && <span style={{ color: '#f87171' }}>{error}</span>}
+    </div>
+  );
+}
+
 /* ── member avatar with role badge ── */
 function MemberRow({ member, roomId, token, activity, onRemove }) {
   const isMaster = member.is_master;
@@ -130,6 +177,9 @@ function MemberRow({ member, roomId, token, activity, onRemove }) {
           </button>
         )}
       </div>
+      {isAgent && roomId && member.executor === 'connector' && (
+        <ConnectorAccess member={member} roomId={roomId} token={token} />
+      )}
       {isAgent && memoryOpen && (
         <AgentMemoryPanel roomId={roomId} agentId={member.id} token={token} />
       )}

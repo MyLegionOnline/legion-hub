@@ -80,3 +80,12 @@ class ConnectorRoomGrantOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class ConnectorRoomAccessOut(BaseModel):
+    """A Room the connector currently has access to (the agent card's list)."""
+
+    room_id: UUID
+    room_name: str
+    room_type: str
+    granted_at: datetime

@@ -34,6 +34,7 @@ from app.schemas.connector import (
     ConnectorPairingOut,
     ConnectorPairRequest,
     ConnectorPairResponse,
+    ConnectorRoomAccessOut,
     ConnectorRoomGrantOut,
     ConnectorTokenRequest,
     ConnectorTokenResponse,
@@ -215,6 +216,41 @@ async def list_connectors(
         .order_by(Connector.created_at.desc())
     )
     return result.scalars().all()
+
+
+@router.get("/{connector_id}/grants", response_model=List[ConnectorRoomAccessOut])
+async def list_connector_grants(
+    connector_id: UUID,
+    db: AsyncSession = Depends(get_session),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    """Rooms the connector can currently take tasks from, newest grant first."""
+    from app.models.connector import ConnectorRoomGrant
+    from app.models.room import Room
+
+    connector = await _get_owned_connector(connector_id, current_user.id, db)
+    rows = (
+        await db.execute(
+            select(ConnectorRoomGrant, Room)
+            .join(Room, Room.id == ConnectorRoomGrant.room_id)
+            .where(
+                ConnectorRoomGrant.connector_id == connector.id,
+                ConnectorRoomGrant.revoked_at.is_(None),
+            )
+            .order_by(ConnectorRoomGrant.granted_at.desc())
+        )
+    ).all()
+    if connector.revoked_at is not None:
+        return []
+    return [
+        ConnectorRoomAccessOut(
+            room_id=room.id,
+            room_name=room.name,
+            room_type=getattr(room.room_type, "value", str(room.room_type)),
+            granted_at=grant.granted_at,
+        )
+        for grant, room in rows
+    ]
 
 
 @router.delete("/{connector_id}", status_code=204)

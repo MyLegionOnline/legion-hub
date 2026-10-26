@@ -76,6 +76,15 @@ class PersistedEventType(str, Enum):
     PLAN_REQUESTED = "PLAN_REQUESTED"
     FILE_READ_REQUESTED = "FILE_READ_REQUESTED"
     AGENT_QUESTION = "AGENT_QUESTION"
+    # The owner answered a connector agent's question by typing in a direct
+    # room instead of clicking the card (core/connector_direct.py).
+    AGENT_QUESTION_ANSWERED = "AGENT_QUESTION_ANSWERED"
+    # A direct-room message arrived while the connector agent is still on the
+    # previous one.
+    AGENT_BUSY = "AGENT_BUSY"
+    # A direct/group chat turn failed before any task existed (e.g. HTTP 401
+    # from the model provider); shown instead of a log-only failure.
+    TURN_FAILED = "TURN_FAILED"
     TASK_UPDATED = "TASK_UPDATED"
     # internal design notes Stage 5: user-visible warnings for blocked
     # empty-content overwrites (see workspace_fs.fs_write_file, git_sync.sync_branch,

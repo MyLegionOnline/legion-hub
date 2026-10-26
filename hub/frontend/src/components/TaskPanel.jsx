@@ -119,7 +119,10 @@ export const CLOSE_REASON_LABELS = {
 
 function formatElapsed(fromIso, now) {
   if (!fromIso) return null;
-  const secs = Math.max(0, Math.round((now - new Date(fromIso).getTime()) / 1000));
+  // The backend sends naive UTC timestamps; without a zone the browser would
+  // read them as local time and a fresh run would show the UTC offset (e.g. "4h").
+  const normalized = /[Zz]|[+-]\d{2}:?\d{2}$/.test(fromIso) ? fromIso : `${fromIso}Z`;
+  const secs = Math.max(0, Math.round((now - new Date(normalized).getTime()) / 1000));
   if (secs < 60) return `${secs}s`;
   const mins = Math.floor(secs / 60);
   if (mins < 60) return `${mins}m ${secs % 60}s`;

@@ -667,7 +667,7 @@ class TestHandlePlanCreated:
             if len(turns) == 1:
                 return (None, {"summary": "1. do X  2. do Y"}, 90, 40, "m")
             return (None, {"tasks_create": [{"title": "X", "assigned_agent_id": str(agent_id)},
-                                            {"title": "Y"}]}, 70, 30, "m")
+                                            {"title": "Y", "assignee": "@Coder"}]}, 70, 30, "m")
 
         with (
             patch("app.core.plan_session.SessionRepository") as MockRepo,
@@ -897,7 +897,7 @@ class TestHandlePlanCreated:
             patch("app.core.plan_session.uses_cumulative_limit", return_value=False),
             patch("app.core.plan_session.check_token_budget", new_callable=AsyncMock) as budget_guard,
             patch("app.core.plan_session._call_llm_single_turn", new_callable=AsyncMock,
-                  return_value=(None, {"tasks_create": [{"title": "X"}], "summary": "ok"}, 20, 10, "test-model")) as mock_llm,
+                  return_value=(None, {"tasks_create": [{"title": "X", "assignee": "@a"}], "summary": "ok"}, 20, 10, "test-model")) as mock_llm,
             patch("app.core.plan_session.track_llm_usage"),
             patch("app.core.plan_session.apply_close_actions", new_callable=AsyncMock),
             patch("app.core.plan_session.emit_event", new_callable=AsyncMock),
@@ -984,7 +984,9 @@ class TestPlanSessionAlwaysCloses:
         ):
             yield
 
-    _TOOL_INPUT = {"tasks_create": [{"title": "T", "description": "d"}]}
+    _TOOL_INPUT = {"tasks_create": [
+        {"title": "T", "description": "d", "assigned_agent_id": str(uuid.uuid4())},
+    ]}
     _MODEL = "claude-haiku-4-5-20251001"
 
     @pytest.mark.asyncio
@@ -1244,3 +1246,90 @@ class TestDispatchPlanEvent:
         mock_create_task.assert_called_once()
         task_name = mock_create_task.call_args.kwargs.get("name", "")
         assert "plan_session_" in task_name
+
+
+class TestUnassignedTaskNudge:
+    """A task the planner leaves without an agent never starts: nudge for it."""
+
+    @pytest.fixture(autouse=True)
+    def _planner_llm_config(self):
+        agent = MagicMock(nickname="cm", owner_id=uuid.uuid4(), id=uuid.uuid4())
+        with patch(
+            "app.core.plan_session.resolve_planner_llm_config",
+            new_callable=AsyncMock,
+            return_value=(agent, {"provider": "anthropic", "model": "claude-haiku-4-5-20251001"}),
+        ), patch(
+            "app.core.plan_session.resolve_agent_secret", new_callable=AsyncMock, return_value=None,
+        ):
+            yield
+
+    async def _run(self, replies):
+        room_id, goal_id, cm_agent_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+        room = _make_room(room_id=room_id, master_agent_id=cm_agent_id)
+        session = _make_session()
+        session.room_id, session.goal_id = room_id, goal_id
+        db = _make_db()
+        room_result = MagicMock()
+        room_result.scalars.return_value.first.return_value = room
+        agent_result = MagicMock()
+        agent_result.scalars.return_value.first.return_value = MagicMock(llm_config={})
+        db.execute = AsyncMock(side_effect=_queue(room_result, agent_result))
+
+        turns: list[str] = []
+
+        async def _fake_turn(cfg, sysp, msg, **kw):
+            turns.append(msg)
+            return (None, replies[min(len(turns), len(replies)) - 1], 10, 5, "m")
+
+        with (
+            patch("app.core.plan_session.SessionRepository") as MockRepo,
+            patch("app.core.plan_session.build_memory_layer", new_callable=AsyncMock, return_value={}),
+            patch("app.core.plan_session.build_system_prompt", return_value="SYS"),
+            patch("app.core.plan_session.check_token_budget", new_callable=AsyncMock, return_value=True),
+            patch("app.core.plan_session._call_llm_single_turn", side_effect=_fake_turn),
+            patch("app.core.plan_session.track_llm_usage"),
+            patch("app.core.plan_session.apply_close_actions", new_callable=AsyncMock) as mock_apply,
+            patch("app.core.plan_session.emit_event", new_callable=AsyncMock),
+        ):
+            repo_instance = AsyncMock()
+            repo_instance.create = AsyncMock(return_value=session)
+            MockRepo.return_value = repo_instance
+            await handle_plan_created(room_id, goal_id, uuid.uuid4(), "plan text", db)
+        mock_apply.assert_awaited_once()
+        return turns, mock_apply.await_args.args[1].tasks_create
+
+    @pytest.mark.asyncio
+    async def test_missing_assignee_is_nudged(self):
+        agent_id = str(uuid.uuid4())
+        turns, tasks = await self._run([
+            {"tasks_create": [{"title": "Build CI"},
+                              {"title": "Review", "assigned_agent_id": agent_id}]},
+            {"tasks_create": [{"title": "Build CI", "assigned_agent_id": agent_id},
+                              {"title": "Review", "assigned_agent_id": agent_id}]},
+        ])
+        assert len(turns) == 2
+        assert "NO assigned_agent_id" in turns[1]
+        assert "- Build CI" in turns[1]
+        assert all(str(t.assigned_agent_id) == agent_id for t in tasks)
+
+    @pytest.mark.asyncio
+    async def test_persistent_gap_keeps_the_best_attempt(self):
+        agent_id = str(uuid.uuid4())
+        turns, tasks = await self._run([
+            {"tasks_create": [{"title": "A"}, {"title": "B"}]},
+            {"tasks_create": [{"title": "A", "assigned_agent_id": agent_id}, {"title": "B"}]},
+            {"summary": "nothing"},
+        ])
+        assert len(turns) == 3
+        assert [str(t.assigned_agent_id) if t.assigned_agent_id else None for t in tasks] == [
+            agent_id, None,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_nickname_and_checkpoint_are_not_nudged(self):
+        turns, tasks = await self._run([
+            {"tasks_create": [{"title": "Build", "assigned_agent_id": "@Coder"},
+                              {"title": "Approve", "checkpoint_kind": "confirm"}]},
+        ])
+        assert len(turns) == 1
+        assert tasks[0].assignee_hint == "@Coder"

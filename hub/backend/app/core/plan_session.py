@@ -165,6 +165,49 @@ async def _augment_plan_text_with_dialogue(
     return _DIALOGUE_DIGEST_BLOCK.format(digest=digest.strip()) + plan_text
 
 
+_UNASSIGNED_NUDGE = (
+    "\n\n---\n"
+    "You called close_session, but some tasks have NO assigned_agent_id. A task "
+    "without an agent never starts. Every task except a checkpoint MUST carry "
+    "assigned_agent_id — the UUID of an agent from the agents list above; the plan "
+    "step's \"agent: @nickname\" tells which one. Call close_session again with the "
+    "COMPLETE tasks_create (all tasks, not only these). Tasks without an agent:"
+)
+
+
+def _unassigned_task_titles(tool_input: dict[str, Any]) -> list[str]:
+    """Titles of non-checkpoint tasks in a raw payload that name no assignee.
+
+    A nickname counts as named: apply_close_actions resolves it against the
+    room's agents. Entries that do not even parse are left to the close flow.
+    """
+    from pydantic import ValidationError
+
+    from app.core.session_close import TaskCreate
+
+    raw_tasks: list[Any] = []
+    for key in _TASK_LIST_KEYS:
+        val = tool_input.get(key)
+        if isinstance(val, list) and val:
+            raw_tasks = val
+            break
+    titles: list[str] = []
+    for raw in raw_tasks:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            spec = TaskCreate.model_validate(dict(raw))
+        except ValidationError:
+            continue
+        if (
+            spec.assigned_agent_id is None
+            and spec.assignee_hint is None
+            and spec.checkpoint_kind is None
+        ):
+            titles.append(spec.title)
+    return titles
+
+
 def _tool_input_task_count(tool_input: dict[str, Any] | None) -> int:
     """How many task entries a raw close_session payload carries (any alias)."""
     if not isinstance(tool_input, dict):
@@ -635,6 +678,21 @@ async def _run_close_flow(
             metadata={"session_id": str(session.id), "error": str(exc)},
         )
         actions = SessionCloseActions()
+    else:
+        # The parsed actions drop whatever the model got wrong (a nickname for
+        # an assignee, an unknown key); the raw payload is the only record of
+        # it. Root logging sits at WARNING, so a suspect payload is logged there.
+        suspect = any(
+            t.assigned_agent_id is None and t.checkpoint_kind is None
+            for t in actions.tasks_create
+        )
+        logger.log(
+            logging.WARNING if suspect else logging.INFO,
+            "plan_session: close_session input for session %s%s: %s",
+            session.id,
+            " (task without a UUID assignee)" if suspect else "",
+            json.dumps(tool_input, default=str, ensure_ascii=False)[:8000],
+        )
 
     # apply_close_actions flushes task inserts but does not commit
     await apply_close_actions(session, actions, db)
@@ -1033,6 +1091,7 @@ async def _run_plan_turn(
         )
         try:
             turn_message = plan_text
+            best_partial: tuple[int, dict[str, Any]] | None = None
             for attempt in range(_MAX_LLM_ATTEMPTS):
                 try:
                     await release_db(db, reason="plan_session/decompose")
@@ -1050,14 +1109,28 @@ async def _run_plan_turn(
                             session.id,
                         )
                         continue
+                    if best_partial is not None:
+                        tool_input = None
+                        break
                     raise
                 await _touch_activity(session, db)
                 tokens_in += _ti
                 tokens_out += _to
-                if tool_input is not None and _tool_input_task_count(tool_input) > 0:
-                    break
                 last = attempt >= _MAX_LLM_ATTEMPTS - 1
-                if tool_input is None:
+                if tool_input is not None and _tool_input_task_count(tool_input) > 0:
+                    unassigned = _unassigned_task_titles(tool_input)
+                    if not unassigned:
+                        break
+                    # A task without an agent never starts. Keep the payload
+                    # with the fewest gaps in case the retries do no better.
+                    if best_partial is None or len(unassigned) < best_partial[0]:
+                        best_partial = (len(unassigned), tool_input)
+                    tool_input = None
+                    if last:
+                        break
+                    reason = f"left {len(unassigned)} task(s) without assigned_agent_id"
+                    nudge = _UNASSIGNED_NUDGE + "".join(f"\n- {t}" for t in unassigned)
+                elif tool_input is None:
                     reason, nudge = "answered in prose", _PROSE_NUDGE
                 else:
                     # close_session called but tasks_create empty — weak models
@@ -1075,6 +1148,9 @@ async def _run_plan_turn(
                     session.id, reason, attempt + 1, _MAX_LLM_ATTEMPTS,
                 )
                 turn_message = plan_text + nudge
+
+            if tool_input is None and best_partial is not None:
+                tool_input = best_partial[1]
 
             # Tool-use gave nothing usable. Many open models (measured: qwen3-27b
             # on OpenRouter) return `{}` to a forced tool_choice but produce a

@@ -93,6 +93,13 @@ class GoalCreate(BaseModel):
     description: str = ""
 
 
+# Field names models use for a task's assignee instead of assigned_agent_id.
+_TASK_ASSIGNEE_ALIASES: tuple[str, ...] = (
+    "assignee", "assignee_id", "assigned_agent", "assigned_to",
+    "agent", "agent_id", "agent_nickname",
+)
+
+
 class TaskCreate(BaseModel):
     ref: Optional[str] = None          # short name within the batch, e.g. "build-api"
     title: str
@@ -112,6 +119,10 @@ class TaskCreate(BaseModel):
     # optional — an empty list just leaves those requirements uncovered
     # (Stage 6's soft gate), it never blocks task creation.
     covers: list[str] = Field(default_factory=list)
+    # What the model put in the assignee slot when it was not a UUID — usually
+    # a nickname ("@Coder"). apply_close_actions resolves it against the room's
+    # agents; the raw value is kept so an unresolved one can be reported.
+    assignee_hint: Optional[str] = None
 
     model_config = {"coerce_numbers_to_str": False}
 
@@ -120,6 +131,21 @@ class TaskCreate(BaseModel):
     def _coerce_uuids(cls, values: Any) -> Any:
         if not isinstance(values, dict):
             return values
+        # Weaker models name the assignee slot differently; the first alias
+        # present fills an empty canonical field, the rest are discarded.
+        for alias in _TASK_ASSIGNEE_ALIASES:
+            if alias not in values:
+                continue
+            v = values.pop(alias)
+            if values.get("assigned_agent_id") in (None, "") and v not in (None, ""):
+                values["assigned_agent_id"] = v
+        assignee = values.get("assigned_agent_id")
+        if isinstance(assignee, str) and assignee.strip():
+            try:
+                UUID(assignee.strip())
+            except ValueError:
+                values["assignee_hint"] = assignee.strip()
+                values["assigned_agent_id"] = None
         for key in ("goal_id", "assigned_agent_id"):
             v = values.get(key)
             if isinstance(v, str) and v.strip():
@@ -142,8 +168,9 @@ class TaskCreate(BaseModel):
         # A checkpoint task is a human-decision gate, not agent work — drop a
         # stray assigned_agent_id rather than silently creating an agent-bound
         # task that the dispatcher would skip via _NON_DISPATCHABLE_STATES.
-        if self.checkpoint_kind is not None and self.assigned_agent_id is not None:
+        if self.checkpoint_kind is not None:
             self.assigned_agent_id = None
+            self.assignee_hint = None
         return self
 
 
@@ -805,6 +832,28 @@ def _advisory_key(resource_id: UUID) -> int:
     return key
 
 
+def _nickname_key(value: str) -> str:
+    """Normalise an assignee reference for nickname matching ("@Coder " → "coder")."""
+    return value.strip().lstrip("@").strip().casefold()
+
+
+async def _room_agents_by_nickname(room_id: UUID, db: AsyncSession) -> dict[str, UUID]:
+    """Map normalised nickname → agent id for the agents linked to *room_id*."""
+    from sqlalchemy import select
+
+    from app.models.agent import Agent
+    from app.models.room import RoomAgentLink
+
+    rows = (
+        await db.execute(
+            select(Agent.id, Agent.nickname)
+            .join(RoomAgentLink, Agent.id == RoomAgentLink.agent_id)
+            .where(RoomAgentLink.room_id == room_id)
+        )
+    ).all()
+    return {_nickname_key(nick): agent_id for agent_id, nick in rows if nick}
+
+
 async def resource_lock(db: AsyncSession, resource_id: UUID) -> None:
     """Acquire a Postgres transaction-scoped advisory lock for *resource_id*.
 
@@ -991,7 +1040,24 @@ async def _do_apply(
         fallback_goal_id = session_goal_id if session_goal_id in valid_goal_ids else None
         _reopened_in_apply: set[UUID] = set()  # avoid duplicate reopen per goal
         _task_triples: list[tuple[str | None, list[str], Task]] = []
+        # Only a nickname-style assignee needs the room roster; a UUID or an
+        # empty slot is taken as is.
+        _agents_by_nick: dict[str, UUID] = (
+            await _room_agents_by_nickname(session.room_id, db)
+            if any(s.assignee_hint for s in actions.tasks_create)
+            else {}
+        )
         for spec in actions.tasks_create:
+            if spec.assignee_hint and spec.assigned_agent_id is None:
+                spec.assigned_agent_id = _agents_by_nick.get(
+                    _nickname_key(spec.assignee_hint)
+                )
+                if spec.assigned_agent_id is None:
+                    logger.warning(
+                        "apply_close_actions: task %r names assignee %r, which is "
+                        "not an agent of room %s — left unassigned",
+                        spec.title, spec.assignee_hint, session.room_id,
+                    )
             goal_id = spec.goal_id
             if goal_id not in valid_goal_ids:
                 if goal_id is not None:
@@ -1203,12 +1269,13 @@ async def _do_apply(
             ).first()
             if _plan_row:
                 _plan_by_goal[_gid] = _plan_row[0]
-        for _t in _new_tasks:
+        for _spec, _t in zip(actions.tasks_create, _new_tasks):
             outcome["created_tasks"].append({
                 "task_id": _t.id,
                 "title": _t.title,
                 "goal_id": _t.goal_id,
                 "assigned_agent_id": _t.assigned_agent_id,
+                "assignee_hint": _spec.assignee_hint,
                 "plan_id": _plan_by_goal.get(_t.goal_id) if _t.goal_id else None,
                 "dispatch_status": _t.dispatch_status,
                 "checkpoint_kind": _t.checkpoint_kind,
@@ -1408,6 +1475,37 @@ async def apply_close_actions(
                         await emit_checkpoint_request(
                             room_id, _cp_task, db, session_id=session_id,
                         )
+
+            # A non-checkpoint task without an agent is never dispatched, yet
+            # its card reads "Assigned" — say so in the room instead of letting
+            # it wait forever.
+            _unassigned = [
+                _tc for _tc in outcome["created_tasks"]
+                if not _tc["assigned_agent_id"] and not _tc.get("checkpoint_kind")
+            ]
+            if _unassigned:
+                await emit_event(
+                    room_id=room_id,
+                    event_type="TASKS_UNASSIGNED",
+                    content=(
+                        f"{len(_unassigned)} new task(s) have no assigned agent and "
+                        "will not start. Assign an agent on the task board."
+                    ),
+                    db=db,
+                    metadata={
+                        "session_id": str(session_id),
+                        "kind": kind,
+                        "level": "warning",
+                        "tasks": [
+                            {
+                                "task_id": str(_tc["task_id"]),
+                                "title": _tc["title"],
+                                "assignee_hint": _tc.get("assignee_hint"),
+                            }
+                            for _tc in _unassigned
+                        ],
+                    },
+                )
 
             if outcome["touched_goal_ids"]:
                 from app.core.goal_progress import maybe_complete_goal

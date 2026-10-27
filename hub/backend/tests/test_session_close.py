@@ -1425,3 +1425,128 @@ class TestApplyCloseActionsStage4DB:
         ).scalars().all()
         assert len(msgs) == 1
         assert str(fixtures["goal_id"]) in msgs[0].event_metadata.get("goal_id", "")
+
+
+# ---------------------------------------------------------------------------
+# Assignee given as a nickname / under another key, and unassigned tasks
+# ---------------------------------------------------------------------------
+
+
+class TestTaskAssigneeParsing:
+    def test_nickname_becomes_hint(self):
+        spec = TaskCreate(title="T", assigned_agent_id="@Coder")
+        assert spec.assigned_agent_id is None
+        assert spec.assignee_hint == "@Coder"
+
+    def test_alias_key_with_uuid(self):
+        agent_id = uuid.uuid4()
+        spec = TaskCreate(title="T", assignee=str(agent_id))
+        assert spec.assigned_agent_id == agent_id
+        assert spec.assignee_hint is None
+
+    def test_alias_key_with_nickname(self):
+        spec = TaskCreate.model_validate({"title": "T", "agent": "Coder"})
+        assert spec.assigned_agent_id is None
+        assert spec.assignee_hint == "Coder"
+
+    def test_canonical_field_wins_over_alias(self):
+        agent_id = uuid.uuid4()
+        spec = TaskCreate.model_validate(
+            {"title": "T", "assigned_agent_id": str(agent_id), "assignee": "@Other"}
+        )
+        assert spec.assigned_agent_id == agent_id
+        assert spec.assignee_hint is None
+
+    def test_checkpoint_drops_hint(self):
+        spec = TaskCreate(title="T", checkpoint_kind="confirm", assignee="@Coder")
+        assert spec.assigned_agent_id is None
+        assert spec.assignee_hint is None
+
+
+class TestUnassignedTasksWarning:
+    @staticmethod
+    def _outcome(tasks):
+        return {
+            "file_changes": [],
+            "touched_goal_ids": set(),
+            "created_tasks": tasks,
+            "reopened_goals": {},
+        }
+
+    async def _emitted(self, tasks):
+        session = _make_session("cm_self_plan")
+        actions = SessionCloseActions()
+        emitted: list[tuple[str, dict]] = []
+
+        async def fake_emit(room_id, event_type, content, db, **kw):
+            emitted.append((event_type, kw.get("metadata") or {}))
+
+        with (
+            patch("app.core.session_close._do_apply", new_callable=AsyncMock,
+                  return_value=self._outcome(tasks)),
+            patch("app.core.session_close.filter_by_kind", return_value=(actions, [])),
+            patch("app.core.events.emit_event", side_effect=fake_emit),
+            patch("app.core.proxy_session.request_task_dispatch", new_callable=AsyncMock),
+            patch("app.core.task_deps.emit_checkpoint_request", new_callable=AsyncMock),
+        ):
+            await apply_close_actions(session, actions, AsyncMock())
+        return emitted
+
+    @pytest.mark.asyncio
+    async def test_warns_about_task_without_agent(self):
+        task_id = uuid.uuid4()
+        emitted = await self._emitted([
+            {"task_id": task_id, "title": "Lost", "goal_id": None,
+             "assigned_agent_id": None, "assignee_hint": "@Ghost",
+             "dispatch_status": "ready", "checkpoint_kind": None},
+            {"task_id": uuid.uuid4(), "title": "Gate", "goal_id": None,
+             "assigned_agent_id": None, "dispatch_status": "ready",
+             "checkpoint_kind": "confirm"},
+        ])
+        warnings = [m for t, m in emitted if t == "TASKS_UNASSIGNED"]
+        assert len(warnings) == 1
+        assert warnings[0]["tasks"] == [
+            {"task_id": str(task_id), "title": "Lost", "assignee_hint": "@Ghost"}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_no_warning_when_all_assigned(self):
+        emitted = await self._emitted([
+            {"task_id": uuid.uuid4(), "title": "Ok", "goal_id": None,
+             "assigned_agent_id": uuid.uuid4(), "dispatch_status": "blocked",
+             "checkpoint_kind": None},
+        ])
+        assert "TASKS_UNASSIGNED" not in [t for t, _ in emitted]
+
+
+@pytest.mark.db
+@pytestmark_db
+@pytest.mark.asyncio
+class TestAssigneeNicknameDB:
+    async def test_nickname_resolves_to_room_agent(self, db_session):
+        from sqlalchemy import select
+        from app.models.task import Task
+
+        helper = TestApplyCloseActionsDB()
+        fixtures = await helper._setup(db_session)
+        session = await helper._make_db_session(
+            "cm_self_plan", fixtures=fixtures, db=db_session
+        )
+        room_id, agent_id = fixtures["room_id"], fixtures["agent_id"]
+
+        actions = SessionCloseActions(tasks_create=[
+            TaskCreate.model_validate({"title": "Known", "assignee": "@A"}),
+            TaskCreate.model_validate({"title": "Unknown", "assignee": "@Nobody"}),
+        ])
+        with patch("app.core.proxy_session.request_task_dispatch", new_callable=AsyncMock):
+            await apply_close_actions(session, actions, db_session)
+
+        rows = {
+            t.title: t.assigned_agent_id
+            for t in (
+                await db_session.execute(
+                select(Task).where(Task.room_id == room_id, Task.title.in_(["Known", "Unknown"]))
+            )
+            ).scalars().all()
+        }
+        assert rows == {"Known": agent_id, "Unknown": None}

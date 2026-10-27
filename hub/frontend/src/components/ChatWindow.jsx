@@ -3249,6 +3249,8 @@ const EVENT_ICONS = {
   // plan_session fallback: ChatMaster never called close_session, tasks were
   // created straight from the plan steps — worth a visible amber pill.
   PLAN_DECOMPOSITION_INCOMPLETE: <AlertTriangle size={11} style={{ color: '#f97316' }} />,
+  // session_close: new tasks without an agent never start.
+  TASKS_UNASSIGNED: <AlertTriangle size={11} style={{ color: '#f97316' }} />,
   // Direct chat with an external agent (core/connector_direct.py).
   AGENT_BUSY: <AlertTriangle size={11} style={{ color: '#f97316' }} />,
   AGENT_QUESTION_ANSWERED: <CheckCircle size={11} style={{ color: '#22c55e' }} />,
@@ -3260,7 +3262,7 @@ function SystemEventLine({ msg }) {
   const isRetried = msg.eventType === 'TASK_RETRIED';
   const isDispatchFailed = msg.eventType === 'TASK_DISPATCH_FAILED';
   const isImageFailed = msg.eventType === 'IMAGE_GENERATION_FAILED';
-  const isWarn = msg.eventType === 'PLAN_DECOMPOSITION_INCOMPLETE';
+  const isWarn = ['PLAN_DECOMPOSITION_INCOMPLETE', 'TASKS_UNASSIGNED'].includes(msg.eventType);
   const isCicdError = ['CI_FAILED', 'GIT_CONFLICT'].includes(msg.eventType);
   const isCicdOk = ['PROMOTED_TO_MAIN', 'CI_PASSED', 'TASK_AUTO_MERGED', 'GOAL_PROMOTED_TO_DEV'].includes(msg.eventType);
   const borderColor = isStalled ? 'rgba(249,115,22,0.4)'

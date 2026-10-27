@@ -6,6 +6,25 @@ from typing import Any
 from app.core.tools.registry import REGISTRY, Tool, ToolContext
 
 
+def main_protected_error(path: str, task_id: Any) -> str:
+    """Tool result for a write that ``workspaced`` would not commit on ``main``.
+
+    The file is already on disk; only the auto-commit was refused.  The agent
+    can recover by itself once it knows which branch to go back to.
+    """
+    if task_id:
+        from app.core.room_git_flow import task_branch_name
+
+        switch = f"run `git checkout {task_branch_name(task_id)}` (the change carries over)"
+    else:
+        switch = "check out your working branch (`dev` or your task branch; the change carries over)"
+    return (
+        f"Error: {path} was written to disk but not committed: the workspace is on "
+        f"`main`, and agents never commit to main. To recover, {switch}, then "
+        "repeat this call so it is committed there. Do not commit to main with git either."
+    )
+
+
 class WriteFileTool(Tool):
     name = "write_file"
     description = (
@@ -56,9 +75,12 @@ class WriteFileTool(Tool):
                 return f"Error: {refusal}"
         task_ref = f" (task/{ctx.task_id})" if ctx.task_id else ""
         commit_msg = f"session:{ctx.session_id}: write {boundary_path}{task_ref}"
-        write_result = await wsd.write_workspace_file(
-            str(ctx.room_id), boundary_path, content, commit_message=commit_msg
-        )
+        try:
+            await wsd.write_workspace_file(
+                str(ctx.room_id), boundary_path, content, commit_message=commit_msg
+            )
+        except wsd.WorkspaceMainProtectedError:
+            return main_protected_error(path, ctx.task_id)
         try:
             from app.core.context_observations import invalidate_path
             await invalidate_path(ctx.db, ctx.room_id, path)

@@ -997,6 +997,40 @@ async def git_adopt(
     )
 
 
+class ReleaseTagBody(BaseModel):
+    tag: str
+    ref: Optional[str] = None
+    message: Optional[str] = None
+
+
+@router.get("/rooms/{room_id}/release-tags")
+async def release_tag_suggestions(room_id: UUID, db: AsyncSession = Depends(get_session),
+                                  current_user: User = Depends(deps.get_current_user)) -> Any:
+    await _verify_membership(room_id, current_user, db)
+    try:
+        result = await wsd.git_release_tags_workspace(str(room_id))
+    except httpx.HTTPError:
+        raise HTTPException(status_code=502, detail={"code": "tag_failed", "message": "Could not read release tags"}) from None
+    if not result.get("ok"):
+        raise HTTPException(status_code=502, detail={"code": result.get("code", "tag_failed"),
+                                                     "message": result.get("error", "Could not read release tags")})
+    return {key: result[key] for key in ("latest", "patch", "minor")}
+
+
+@router.post("/rooms/{room_id}/release-tags")
+async def create_release_tag(room_id: UUID, body: ReleaseTagBody,
+                             db: AsyncSession = Depends(get_session),
+                             current_user: User = Depends(deps.get_current_user)) -> Any:
+    await _verify_membership(room_id, current_user, db)
+    from app.core import deploy_publish
+    try:
+        plan = await deploy_publish.check_release_tag(db, room_id, body.tag, ref=body.ref or "main")
+        await deploy_publish.publish_release_tag(db, room_id, plan, message=body.message or "")
+    except deploy_publish.DeployPublishError as exc:
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)}) from None
+    return {"tag": plan.tag, "sha": plan.sha}
+
+
 # ── POST /rooms/{room_id}/git/push ───────────────────────────────────────────
 
 class GitPushResponse(BaseModel):

@@ -302,6 +302,26 @@ class GitOpResponse(BaseModel):
     userfiles_tracked_details: list[dict] = Field(default_factory=list)
 
 
+class GitMainBypassRequest(BaseModel):
+    # Commits the forge already has (its ``main`` head); unknown ones are ignored.
+    exclude: list[str] = []
+    limit: int = 20
+
+
+class GitReleaseTagRequest(BaseModel):
+    tag: str
+    ref: str = "main"
+    message: str = ""
+    # False: validate only (before a person is asked); True: create the tag.
+    create: bool = False
+
+
+class GitPushTagRequest(BaseModel):
+    remote_url: str
+    tag: str
+    token: Optional[str] = None
+
+
 class GitPushRequest(BaseModel):
     remote_url: str
     branch: str = "main"

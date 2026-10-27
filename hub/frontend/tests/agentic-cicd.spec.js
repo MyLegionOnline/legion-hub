@@ -144,7 +144,7 @@ async function installHarness(page, {
   const state = {
     resolveBodies: [], reverts: 0, promotionsOpened: 0, promotionCi,
     goalPublished: 0, goalResolveBodies: [], returnedToReview: [], mergedReviewed: [], goalMergedDirect: 0,
-    divergenceReviewsRequested: [], divergenceResolveBodies: [],
+    divergenceReviewsRequested: [], divergenceResolveBodies: [], releaseTagBodies: [], releaseTagError: null,
   };
 
   await page.addInitScript(() => {
@@ -172,6 +172,13 @@ async function installHarness(page, {
     if (method === 'GET' && path === `/api/v1/rooms/${ROOM_ID}/tasks`) return route.fulfill({ json: tasks });
     if (method === 'GET' && path === `/api/v1/rooms/${ROOM_ID}/goals`) return route.fulfill({ json: goals });
     if (method === 'GET' && path === `/api/v1/rooms/${ROOM_ID}/goals/${GOAL_ID}/plan`) return route.fulfill({ status: 404, json: { detail: 'no plan' } });
+
+    if (path === `/api/v1/rooms/${ROOM_ID}/release-tags`) {
+      if (method === 'GET') return route.fulfill({ json: { latest: 'v1.2.3', patch: 'v1.2.4', minor: 'v1.3.0' } });
+      state.releaseTagBodies.push(JSON.parse(request.postData() || '{}'));
+      if (state.releaseTagError) return route.fulfill({ status: 409, json: { detail: { code: state.releaseTagError, message: 'error' } } });
+      return route.fulfill({ json: { tag: 'v1.3.0', sha: 'a'.repeat(40) } });
+    }
 
     // git/state — single source of truth for GitPanel / GitFlowReviewCard
     if (method === 'GET' && path === `/api/v1/rooms/${ROOM_ID}/git/state`) {
@@ -554,4 +561,34 @@ test('a fresh DIVERGENCE_REVIEW after an old DIVERGENCE_RESOLVED still shows act
   await expect(page.getByText('Divergence review')).toBeVisible();
   await expect(page.getByText('Divergence resolved')).toHaveCount(0);
   await expect(page.getByRole('button', { name: /Delete the branch/ })).toBeVisible();
+});
+
+
+test('main release tag form suggests versions and handles publication errors', async ({ page }) => {
+  const state = await installHarness(page);
+  await openRoom(page);
+  await page.getByTestId('git-release-tag').click();
+  const form = page.getByTestId('release-tag-form');
+  await expect(form).toBeInViewport({ ratio: 1 });
+  await expect(page.getByTestId('release-tag-version')).toHaveValue('v1.2.4');
+  await form.getByRole('button', { name: /Next minor/ }).click();
+  await expect(page.getByTestId('release-tag-version')).toHaveValue('v1.3.0');
+  state.releaseTagError = 'tag_commit_not_published';
+  await form.getByRole('button', { name: 'Create release tag' }).click();
+  await expect(form.getByRole('alert')).toHaveText('Publish main first.');
+  state.releaseTagError = 'tag_exists';
+  await form.getByRole('button', { name: 'Create release tag' }).click();
+  await expect(form.getByRole('alert')).toContainText('tags are never moved');
+  state.releaseTagError = null;
+  await form.getByRole('button', { name: 'Create release tag' }).click();
+  await expect(page.getByTestId('release-tag-success')).toContainText('v1.3.0');
+  expect(state.releaseTagBodies.at(-1).tag).toBe('v1.3.0');
+});
+
+test('successful promotion opens release tag form', async ({ page }) => {
+  const gate = { id: PROMOTION_ID, kind: 'promotion', title: 'Promote dev to main', ci_status: 'passed' };
+  await installHarness(page, { gitState: makeGitState({ gates: [gate] }) });
+  await openRoom(page);
+  await page.getByTestId('git-gate-queue').getByRole('button', { name: 'Confirm' }).click();
+  await expect(page.getByTestId('release-tag-form')).toBeVisible();
 });

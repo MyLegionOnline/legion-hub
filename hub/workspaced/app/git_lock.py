@@ -91,8 +91,12 @@ def _ensure_lock_ignored(room_id: str) -> None:
     ``git_ops._write_local_excludes`` — not duplicated here.
     """
     from app.git_ops import _write_local_excludes
+    from app.release_guard import ensure_ref_guard
 
     _write_local_excludes(_workspace_root(room_id))
+    # Same safety net for the guard hooks: a repo cloned or initialised
+    # outside ``git_init`` gets them before its next git operation.
+    ensure_ref_guard(_workspace_root(room_id))
 
 
 def _lock_age(path: Path) -> float | None:

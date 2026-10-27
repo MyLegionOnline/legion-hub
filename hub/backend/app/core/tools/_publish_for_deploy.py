@@ -56,7 +56,7 @@ class PublishForDeployTool(Tool):
             "them, they are not in this commit."
         )
 
-        async def _publish(allow_unmerged: bool):
+        async def _publish(allow_unmerged: bool, allow_main_bypass: bool = False):
             await release_tool_db(ctx, reason="publish_for_deploy")
             return await deploy_publish.ensure_published(
                 ctx.db,
@@ -64,30 +64,44 @@ class PublishForDeployTool(Tool):
                 branch=branch,
                 request_id=ctx.session_id,
                 allow_unmerged=allow_unmerged,
+                allow_main_bypass=allow_main_bypass,
             )
 
         try:
             try:
                 published = await _publish(False)
             except deploy_publish.DeployPublishError as exc:
-                if exc.code != "deploy_needs_approval":
-                    raise
-                approved = await deploy_publish.confirm_unmerged_deploy(
-                    ctx.db,
-                    room_id=ctx.room_id,
-                    session_id=ctx.session_id,
-                    ref=branch or "",
-                    publication_branch=await _publication_branch(ctx),
-                    commits=exc.commits,
-                )
-                if not approved:
-                    return (
-                        f"Error: [deploy_needs_approval] '{branch}' is not part of the Room's "
-                        "publication branch and the person did not approve publishing it for a "
-                        "deploy. Do not retry: deploy the publication branch instead, or ask the "
-                        "person to merge this work through the Room's promotion gate"
+                if exc.code == "main_needs_approval":
+                    approved = await deploy_publish.confirm_main_bypass_publish(
+                        ctx.db, room_id=ctx.room_id, session_id=ctx.session_id, commits=exc.commits
                     )
-                published = await _publish(True)
+                    if not approved:
+                        return (
+                            f"Error: [main_needs_approval] {exc}, and the person did not approve "
+                            "publishing them. Do not retry and do not commit to main yourself: put "
+                            "the change on your task branch so it reaches main through dev and "
+                            "the promotion"
+                        )
+                    published = await _publish(False, allow_main_bypass=True)
+                elif exc.code == "deploy_needs_approval":
+                    approved = await deploy_publish.confirm_unmerged_deploy(
+                        ctx.db,
+                        room_id=ctx.room_id,
+                        session_id=ctx.session_id,
+                        ref=branch or "",
+                        publication_branch=await _publication_branch(ctx),
+                        commits=exc.commits,
+                    )
+                    if not approved:
+                        return (
+                            f"Error: [deploy_needs_approval] '{branch}' is not part of the Room's "
+                            "publication branch and the person did not approve publishing it for a "
+                            "deploy. Do not retry: deploy the publication branch instead, or ask the "
+                            "person to merge this work through the Room's promotion gate"
+                        )
+                    published = await _publish(True)
+                else:
+                    raise
         except deploy_publish.DeployPublishError as exc:
             return f"Error: [{exc.code}] {exc}"
 

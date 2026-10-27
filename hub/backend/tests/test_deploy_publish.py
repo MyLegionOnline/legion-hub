@@ -100,6 +100,8 @@ class _World:
         self.local = {}  # workspace: branch -> sha
         self.ahead = []  # commits local has over the forge
         self.unmerged = []
+        self.bypass = []  # main commits that skipped the promotion
+        self.bypass_excluded = []
         self.pushed = []
         self.push_errors = []
         self.token = "tok"
@@ -122,6 +124,10 @@ class _World:
         async def unmerged(room_id, branch, base):
             return self.unmerged if branch != base else []
 
+        async def main_bypass(room_id, remote_sha):
+            self.bypass_excluded.append(remote_sha)
+            return self.bypass
+
         async def push(room_id, git_config, access_token=None, mode="push", branch=None):
             self.pushed.append(branch)
             if self.push_errors:
@@ -136,6 +142,7 @@ class _World:
         monkeypatch.setattr(deploy_publish, "local_head", local_head)
         monkeypatch.setattr(deploy_publish, "_unpublished", unpublished)
         monkeypatch.setattr(deploy_publish, "unmerged_commits", unmerged)
+        monkeypatch.setattr(deploy_publish, "main_bypass_commits", main_bypass)
         monkeypatch.setattr("app.core.git_sync.push_workspace_to_git", push)
         monkeypatch.setattr("app.db.release.release_db", _noop)
 

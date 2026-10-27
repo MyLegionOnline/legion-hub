@@ -2,7 +2,7 @@
 name: skill-vps-deploy
 display_name: Deploy to a VPS
 description: Deploy and operate a site or service on one of the Room's own servers over SSH — survey what is already running, generate config, validate it before it goes live, move it into place, reload, and check the result. Use this whenever a task involves a real server the Room owns, an nginx site, a subdomain, a systemd unit, or a docker compose project on a VPS.
-version: 1.3.0
+version: 1.5.0
 ---
 
 # Deploy to a VPS
@@ -141,6 +141,19 @@ repository at all — in one call.
      publication branch). It pushes the branch to the repository, confirms the
      repository now has it, and returns the **sha** to deploy. Note the sha
      `vps_repo_status` reported *before* you deploy — that is your rollback.
+     Never commit to, merge into or push `main` with git yourself: `main` moves
+     only through the dev → main promotion, and the Room refuses it. A release
+     build that starts from a tag gets it from `release_tag` (the user approves
+     it), never from `git tag` + `git push`. The user can also create the tag
+     with **Release tag** in the Git panel when promoting. Do not propose a tag
+     unless the user asks for one. When a release is requested, call
+     `publish_for_deploy` first, then `release_tag`: the latter returns
+     `tag_commit_not_published` until the commit is on GitHub.
+     For a tag-based deploy, run `git fetch --tags` on the server, then
+     `git checkout <tag>` or checkout the sha returned by `release_tag`.
+     `tag_exists` means choose a new version; `tag_commit_not_published` means
+     call `publish_for_deploy` first; `tag_needs_approval` means do not repeat
+     the request.
    - `credential: "ssh"` or `"https"` and `remote_reachable: true` → the server
      can read the repository. No checkout yet (`checkout: false`) → clone it
      once into the `project_dir` the tool named:

@@ -65,11 +65,14 @@ from app.schemas import (
     GitIsTrackedResponse,
     GitLogResponse,
     GitLsTreeResponse,
+    GitMainBypassRequest,
     GitMergeRequest,
     GitOpResponse,
     GitListBranchesRequest,
     GitListBranchesResponse,
     GitPushRequest,
+    GitPushTagRequest,
+    GitReleaseTagRequest,
     GitRevertCommitRequest,
     GitRevertRequest,
     ImportRequest,
@@ -983,6 +986,47 @@ async def git_merge_branch_workspace(room_id: str, req: GitMergeRequest):
 async def git_push_workspace(room_id: str, req: GitPushRequest):
     from app.git_ops import git_push
     result = git_push(room_id, req.remote_url, branch=req.branch, token=req.token, mode=req.mode)
+    return GitOpResponse(**result)
+
+
+@app.post(
+    "/workspaces/{room_id}/git/main-bypass",
+    dependencies=[Depends(verify_token)],
+)
+async def git_main_bypass_workspace(room_id: str, req: GitMainBypassRequest):
+    """Non-merge commits on ``main`` that neither ``dev`` nor the forge has —
+    work that skipped the ``dev -> main`` promotion. Pure read."""
+    from app.release_guard import main_bypass_commits
+    return main_bypass_commits(room_id, req.exclude, req.limit)
+
+
+@app.get("/workspaces/{room_id}/git/release-tags", dependencies=[Depends(verify_token)])
+async def git_release_tags_workspace(room_id: str):
+    from app.release_guard import latest_release_tag
+    return latest_release_tag(room_id)
+
+
+@app.post(
+    "/workspaces/{room_id}/git/release-tag",
+    dependencies=[Depends(verify_token)],
+)
+async def git_release_tag_workspace(room_id: str, req: GitReleaseTagRequest):
+    """Check (``create=false``) or create an annotated release tag on ``main``."""
+    from app.release_guard import check_release_tag, create_release_tag
+    if req.create:
+        return create_release_tag(room_id, req.tag, req.ref, req.message)
+    return check_release_tag(room_id, req.tag, req.ref)
+
+
+@app.post(
+    "/workspaces/{room_id}/git/push-tag",
+    response_model=GitOpResponse,
+    dependencies=[Depends(verify_token)],
+)
+async def git_push_tag_workspace(room_id: str, req: GitPushTagRequest):
+    """Push one release tag (``refs/tags/<tag>``, never forced)."""
+    from app.release_guard import push_release_tag
+    result = push_release_tag(room_id, req.remote_url, req.tag, token=req.token)
     return GitOpResponse(**result)
 
 

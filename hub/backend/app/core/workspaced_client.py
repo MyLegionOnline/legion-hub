@@ -49,6 +49,29 @@ def _raise_if_busy(r: httpx.Response) -> None:
         )
 
 
+class WorkspaceMainProtectedError(httpx.HTTPStatusError):
+    """``workspaced`` refused to commit a file write because HEAD is ``main``.
+
+    internal design notes §0.1: agents and auto commits never write
+    to ``main``; ``workspaced`` answers 409 for that.  It happens when an agent
+    runs ``git checkout main`` in bash and then edits a file.  A subclass of
+    ``HTTPStatusError`` so callers that map statuses keep working.
+    """
+
+
+def _raise_if_main_protected(r: httpx.Response) -> None:
+    """Turn the file endpoints' 409 (protected ``main``) into a typed error."""
+    if r.status_code != 409:
+        return
+    try:
+        detail = str(r.json().get("detail") or "")
+    except (ValueError, AttributeError):
+        detail = r.text
+    raise WorkspaceMainProtectedError(
+        detail or "commits to main are not allowed", request=r.request, response=r
+    )
+
+
 @dataclass
 class ServiceRelayStream:
     """Open streaming response from the internal, service-bound relay."""
@@ -417,6 +440,7 @@ async def write_workspace_file(
             json=body,
         )
         _raise_if_busy(r)
+        _raise_if_main_protected(r)
         r.raise_for_status()
         return r.json()
 
@@ -433,6 +457,7 @@ async def delete_workspace_file(
     async with _client() as c:
         r = await c.delete(f"/workspaces/{room_id}/file", params=params)
         _raise_if_busy(r)
+        _raise_if_main_protected(r)
         r.raise_for_status()
         return r.json().get("ok", False)
 
@@ -453,6 +478,7 @@ async def import_to_workspace(
     async with _client() as c:
         r = await c.post(f"/workspaces/{room_id}/import", json=body)
         _raise_if_busy(r)
+        _raise_if_main_protected(r)
         r.raise_for_status()
         return r.json()
 
@@ -772,6 +798,58 @@ async def git_push_workspace(
         body["mode"] = mode
     async with _client() as c:
         r = await c.post(f"/workspaces/{room_id}/git/push", json=body)
+        _raise_if_busy(r)
+        r.raise_for_status()
+        return r.json()
+
+
+async def git_main_bypass_workspace(
+    room_id: str, exclude: Optional[list[str]] = None, limit: int = 20
+) -> dict[str, Any]:
+    """Non-merge commits on ``main`` that neither ``dev`` nor ``exclude`` (the
+    forge's ``main`` head) has — work that skipped the promotion. Pure read."""
+    async with _client() as c:
+        r = await c.post(
+            f"/workspaces/{room_id}/git/main-bypass",
+            json={"exclude": list(exclude or []), "limit": limit},
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+async def git_release_tags_workspace(room_id: str) -> dict[str, Any]:
+    """Read the latest final release tag reachable from main and suggestions."""
+    async with _client() as c:
+        r = await c.get(f"/workspaces/{room_id}/git/release-tags")
+        r.raise_for_status()
+        return r.json()
+
+
+async def git_release_tag_workspace(
+    room_id: str, tag: str, ref: str = "main", message: str = "", create: bool = False
+) -> dict[str, Any]:
+    """Check (``create=False``) or create an annotated release tag on ``main``.
+
+    Returns ``{ok, tag, sha, exists}`` or ``{ok: False, code, error}``.
+    """
+    async with _client() as c:
+        r = await c.post(
+            f"/workspaces/{room_id}/git/release-tag",
+            json={"tag": tag, "ref": ref, "message": message, "create": create},
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+async def git_push_tag_workspace(
+    room_id: str, remote_url: str, tag: str, token: Optional[str] = None
+) -> dict[str, Any]:
+    """Push exactly ``refs/tags/<tag>`` (never forced)."""
+    body: dict[str, Any] = {"remote_url": remote_url, "tag": tag}
+    if token:
+        body["token"] = token
+    async with _client() as c:
+        r = await c.post(f"/workspaces/{room_id}/git/push-tag", json=body)
         _raise_if_busy(r)
         r.raise_for_status()
         return r.json()

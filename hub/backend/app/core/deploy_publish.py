@@ -51,6 +51,9 @@ class DeployPublishError(Exception):
                                    branch — a person has to say yes.
     ``deploy_publication_unverified``  the forge could not be asked; nothing is
                                    assumed in either direction.
+    ``main_needs_approval``        ``main`` carries commits that skipped the
+                                   ``dev -> main`` promotion — a person has to say yes.
+    ``tag_*``                      a release tag that must not be created or pushed.
     """
 
     def __init__(self, code: str, message: str, *, commits: Optional[list[dict[str, Any]]] = None):
@@ -202,6 +205,30 @@ async def unmerged_commits(room_id: UUID, branch: str, base: str) -> list[dict[s
     return list(report.get("branch_commits") or [])
 
 
+#: The branch only the promotion moves (workspaced ``RELEASE_BRANCH``).
+RELEASE_BRANCH = "main"
+
+
+async def main_bypass_commits(room_id: UUID, remote_sha: Optional[str]) -> list[dict[str, Any]]:
+    """Commits a push of ``main`` would carry that did not come through the promotion.
+
+    Non-merge commits on ``main`` that neither ``dev`` nor the forge
+    (``remote_sha``) has: an agent got round the room's guard hooks, or a
+    person restored a file on ``main`` from the Git tab. Best effort (``[]``
+    when workspaced cannot tell) — the hooks are the first line.
+    """
+    from app.core import workspaced_client as wsd
+
+    try:
+        report = await wsd.git_main_bypass_workspace(
+            str(room_id), exclude=[remote_sha] if remote_sha else []
+        )
+    except Exception:
+        logger.warning("deploy_publish: main bypass check failed for %s", room_id, exc_info=True)
+        return []
+    return list(report.get("commits") or []) if report.get("ok") else []
+
+
 # ── context ─────────────────────────────────────────────────────────────────
 
 
@@ -318,6 +345,7 @@ async def ensure_published(
     branch: Optional[str] = None,
     request_id: Optional[UUID] = None,
     allow_unmerged: bool = False,
+    allow_main_bypass: bool = False,
 ) -> PublishedCommit:
     """Make ``branch`` (default: the Room's publication branch) exist on the forge as-is.
 
@@ -325,6 +353,8 @@ async def ensure_published(
     of the publication branch raises ``deploy_needs_approval`` (with the
     commits) unless the caller has already got a person's yes — pushing it is
     harmless, but it is the first step of putting unreviewed work on a server.
+    ``main`` carrying commits that skipped the ``dev -> main`` promotion raises
+    ``main_needs_approval`` the same way (``allow_main_bypass`` is the yes).
     """
     from app.core import git_forge, vps_deploy_key
     from app.core.git_sync import push_workspace_to_git
@@ -360,6 +390,16 @@ async def ensure_published(
     if state == "found" and remote == local:
         return PublishedCommit(local, branch, pushed=False, publication_branch=publication)
 
+    if branch == RELEASE_BRANCH and not allow_main_bypass:
+        bypass = await main_bypass_commits(room_id, remote if state == "found" else None)
+        if bypass:
+            raise DeployPublishError(
+                "main_needs_approval",
+                f"'{branch}' carries {len(bypass)} commit(s) that did not come through the "
+                "dev -> main promotion",
+                commits=bypass,
+            )
+
     await release_db(db, reason="deploy_publish/push")
     result = await push_workspace_to_git(
         room_id=room_id, git_config=dict(git_config), access_token=token, mode="push", branch=branch,
@@ -387,49 +427,32 @@ async def ensure_published(
 # ── the card ────────────────────────────────────────────────────────────────
 
 
-async def confirm_unmerged_deploy(
+async def _ask_person(
     db: Any,
     *,
     room_id: UUID,
     session_id: UUID,
-    ref: str,
-    publication_branch: str,
-    commits: Sequence[dict[str, Any]],
+    header: str,
+    lines: Sequence[str],
+    allow: str,
+    deny: str,
 ) -> bool:
-    """Ask a person whether work outside the publication branch may be deployed.
+    """Show the ask-user card the MCP confirmations use; True only on "Allow".
 
-    Same ask-user card the other MCP confirmations use. "Allow" is for this one
-    deploy; nothing is remembered.
+    The answer is for this one action; nothing is remembered. No answer before
+    the timeout is a no.
     """
     from app.core import ask_user_registry as _reg
     from app.core.events import emit_event
 
-    shown = [f"- {str(c.get('sha', ''))[:8]} {str(c.get('message', ''))[:90]}" for c in list(commits)[:8]]
-    more = len(commits) - len(shown)
-    lines = [
-        f"A deploy to a server is about to use '{ref}', which is not part of "
-        f"'{publication_branch}' — the branch this Room publishes.",
-    ]
-    if shown:
-        lines.append(f"Commits that '{publication_branch}' does not have ({len(commits)}):")
-        lines.extend(shown)
-        if more > 0:
-            lines.append(f"…and {more} more")
-    lines.append("Those changes have not been through the Room's promotion gate.")
     question_text = "\n".join(lines)
     questions = [
         {
             "question": question_text,
-            "header": "Deploy unmerged",
+            "header": header,
             "options": [
-                {
-                    "label": "Allow",
-                    "description": "Deploy this exact commit now. The permission is not saved.",
-                },
-                {
-                    "label": "Deny",
-                    "description": "Do not deploy. The agent is told to deploy a published, merged commit instead.",
-                },
+                {"label": "Allow", "description": allow},
+                {"label": "Deny", "description": deny},
             ],
         }
     ]
@@ -449,7 +472,7 @@ async def confirm_unmerged_deploy(
             },
         )
     except Exception:
-        logger.exception("deploy_publish: failed to emit the unmerged-deploy card (room=%s)", room_id)
+        logger.exception("deploy_publish: failed to emit the %r card (room=%s)", header, room_id)
         return False
 
     pq = _reg.register(question_id, session_id, room_id, {"questions": questions})
@@ -462,14 +485,201 @@ async def confirm_unmerged_deploy(
     return "Allow" in ((pq.answer or {}).get("selected_options") or [])
 
 
+def _commit_lines(commits: Sequence[dict[str, Any]]) -> list[str]:
+    shown = [f"- {str(c.get('sha', ''))[:8]} {str(c.get('message', ''))[:90]}" for c in list(commits)[:8]]
+    more = len(commits) - len(shown)
+    return shown + ([f"…and {more} more"] if more > 0 else [])
+
+
+async def confirm_unmerged_deploy(
+    db: Any,
+    *,
+    room_id: UUID,
+    session_id: UUID,
+    ref: str,
+    publication_branch: str,
+    commits: Sequence[dict[str, Any]],
+) -> bool:
+    """Ask a person whether work outside the publication branch may be deployed."""
+    lines = [
+        f"A deploy to a server is about to use '{ref}', which is not part of "
+        f"'{publication_branch}' — the branch this Room publishes.",
+    ]
+    if commits:
+        lines.append(f"Commits that '{publication_branch}' does not have ({len(commits)}):")
+        lines.extend(_commit_lines(commits))
+    lines.append("Those changes have not been through the Room's promotion gate.")
+    return await _ask_person(
+        db,
+        room_id=room_id,
+        session_id=session_id,
+        header="Deploy unmerged",
+        lines=lines,
+        allow="Deploy this exact commit now. The permission is not saved.",
+        deny="Do not deploy. The agent is told to deploy a published, merged commit instead.",
+    )
+
+
+async def confirm_main_bypass_publish(
+    db: Any, *, room_id: UUID, session_id: UUID, commits: Sequence[dict[str, Any]]
+) -> bool:
+    """Ask a person whether ``main`` may be published with commits that skipped the promotion."""
+    lines = [
+        f"An agent is about to publish '{RELEASE_BRANCH}' to the Room's repository, and "
+        f"'{RELEASE_BRANCH}' has {len(commits)} commit(s) that did not come through the "
+        "dev -> main promotion:",
+        *_commit_lines(commits),
+        "They were made on main directly — by an agent going round the rule, or by a restore "
+        "from the Git tab.",
+    ]
+    return await _ask_person(
+        db,
+        room_id=room_id,
+        session_id=session_id,
+        header="Publish main",
+        lines=lines,
+        allow="Publish main with these commits. The permission is not saved.",
+        deny="Do not publish. The agent is told to bring the work in through dev and the promotion.",
+    )
+
+
+async def confirm_release_tag(
+    db: Any,
+    *,
+    room_id: UUID,
+    session_id: UUID,
+    tag: str,
+    sha: str,
+    subject: str,
+    message: str,
+) -> bool:
+    """Ask a person whether a release tag may be created and pushed."""
+    lines = [
+        f"An agent wants to tag {sha[:10]} on '{RELEASE_BRANCH}' as release '{tag}' and push the "
+        "tag to the Room's repository.",
+    ]
+    if subject:
+        lines.append(f"Commit: {subject[:120]}")
+    if message.strip():
+        lines.append(f"Tag message: {message.strip()[:300]}")
+    lines.append(
+        "A pushed release tag usually starts the release build, and it is never moved afterwards."
+    )
+    return await _ask_person(
+        db,
+        room_id=room_id,
+        session_id=session_id,
+        header="Release tag",
+        lines=lines,
+        allow=f"Create and push '{tag}' now.",
+        deny="Do not tag. Nothing is created or pushed.",
+    )
+
+
+# ── release tags ────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class ReleaseTagPlan:
+    tag: str
+    sha: str
+    exists: bool  # already in the workspace, on this same commit
+    publication_branch: str = RELEASE_BRANCH
+
+
+def _tag_error(result: dict[str, Any]) -> DeployPublishError:
+    if result.get("busy"):
+        return DeployPublishError(
+            "tag_failed", "the workspace's git tree is busy with another operation; try again shortly"
+        )
+    code = str(result.get("code") or "failed")
+    error = str(result.get("error") or result.get("stderr") or "the tag could not be prepared")
+    return DeployPublishError(code if code.startswith("tag_") else f"tag_{code}", error[:300])
+
+
+async def check_release_tag(
+    db: Any, room_id: UUID, tag: str, *, ref: str = RELEASE_BRANCH, request_id: Optional[UUID] = None
+) -> ReleaseTagPlan:
+    """Everything that must hold before a person is asked about ``tag``.
+
+    The commit is on the workspace's ``main``, the tag is new (or already on
+    that very commit), and the forge's publication branch already has the
+    commit — pushing a tag would otherwise publish unreviewed commits with it.
+    """
+    from app.core import git_forge, vps_deploy_key
+    from app.core import workspaced_client as wsd
+
+    checked = await wsd.git_release_tag_workspace(str(room_id), tag, ref=ref)
+    if not checked.get("ok"):
+        raise _tag_error(checked)
+    sha = str(checked["sha"])
+    try:
+        _room, target, token = await _target(db, room_id, request_id)
+    except vps_deploy_key.DeployKeyError as exc:
+        raise DeployPublishError(
+            "repo_not_configured",
+            f"{exc} Do not retry: ask the person to connect a repository on the Room's Git tab",
+        ) from None
+    publication = target.branch
+    relation, _full = await git_forge.commit_relation(target.git_config, token, sha, publication)
+    if relation == "unknown":
+        raise _unverified(f"that {sha[:10]} is published")
+    if relation in ("missing", "outside_branch"):
+        raise DeployPublishError(
+            "tag_commit_not_published",
+            f"{sha[:10]} is not on the repository's '{publication}' yet. Publish it first with "
+            "publish_for_deploy, then tag the commit it returns",
+        )
+    return ReleaseTagPlan(tag, sha, bool(checked.get("exists")), publication)
+
+
+async def publish_release_tag(
+    db: Any,
+    room_id: UUID,
+    plan: ReleaseTagPlan,
+    *,
+    message: str = "",
+    request_id: Optional[UUID] = None,
+) -> None:
+    """Create the annotated tag in the workspace and push exactly that tag."""
+    from app.core import workspaced_client as wsd
+    from app.core.git_sync import push_tag_to_git
+    from app.db.release import release_db
+
+    made = await wsd.git_release_tag_workspace(
+        str(room_id), plan.tag, ref=plan.sha, message=message, create=True
+    )
+    if not made.get("ok"):
+        raise _tag_error(made)
+    _room, target, token = await _target(db, room_id, request_id)
+    await release_db(db, reason="deploy_publish/push_tag")
+    result = await push_tag_to_git(room_id, dict(target.git_config), plan.tag, access_token=token)
+    errors = result.get("errors") or []
+    if errors:
+        text = str(errors[0])
+        if "already exists" in text:
+            raise DeployPublishError(
+                "tag_exists",
+                f"the repository already has a tag '{plan.tag}' on another commit; release tags "
+                "are never moved. Use a new version number",
+            )
+        raise DeployPublishError("tag_not_published", f"pushing tag '{plan.tag}' failed: {text[:300]}")
+
+
 __all__ = [
     "DeployCheck",
     "DeployIntent",
     "DeployPublishError",
     "PublishedCommit",
+    "ReleaseTagPlan",
     "check_intent",
+    "check_release_tag",
+    "confirm_main_bypass_publish",
+    "confirm_release_tag",
     "confirm_unmerged_deploy",
     "ensure_published",
+    "main_bypass_commits",
+    "publish_release_tag",
     "local_head",
     "parse_deploy_intent",
     "sha_matches",

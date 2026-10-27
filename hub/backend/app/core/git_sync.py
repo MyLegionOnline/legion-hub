@@ -169,6 +169,35 @@ async def push_workspace_to_git(
     return {"pushed": 0, "errors": [result.get("stderr", "push failed")[:500]]}
 
 
+async def push_tag_to_git(
+    room_id: UUID,
+    git_config: Dict[str, Any],
+    tag: str,
+    access_token: str | None = None,
+) -> Dict[str, Any]:
+    """Push one release tag of the workspace to the remote (``release_tag``).
+
+    Same transport as :func:`push_workspace_to_git`; only ``refs/tags/<tag>``
+    goes, never forced, so a forge that already has the tag on another commit
+    refuses it. Returns ``{pushed, errors}``.
+    """
+    from app.core import workspaced_client as wsd
+
+    repo_url = _clone_url(git_config.get("repo_url", ""))
+    token = access_token or ""
+    await sync_from_token(room_id, git_config, token)
+    try:
+        result = await wsd.git_push_tag_workspace(
+            str(room_id), remote_url=repo_url, tag=tag, token=token or None
+        )
+    except Exception as exc:
+        logger.warning("push_tag_to_git failed for room %s: %s", room_id, exc)
+        return {"pushed": 0, "errors": [str(exc)]}
+    if result.get("ok"):
+        return {"pushed": 1, "errors": []}
+    return {"pushed": 0, "errors": [result.get("stderr", "push failed")[:500]]}
+
+
 async def fetch_workspace_from_git(
     room_id: UUID,
     git_config: Dict[str, Any],

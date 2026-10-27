@@ -133,9 +133,16 @@ class EditFileTool(Tool):
         new_content = content.replace(old_string, new_string) if replace_all else content.replace(old_string, new_string, 1)
         task_ref = f" (task/{ctx.task_id})" if ctx.task_id else ""
         commit_msg = f"session:{ctx.session_id}: edit {path}{task_ref}"
-        write_result = await wsd.write_workspace_file(
-            str(ctx.room_id), boundary_path, new_content, commit_message=commit_msg
-        )
+        try:
+            write_result = await wsd.write_workspace_file(
+                str(ctx.room_id), boundary_path, new_content, commit_message=commit_msg
+            )
+        except wsd.WorkspaceMainProtectedError:
+            from app.core.tools._write_file import main_protected_error
+
+            # The edit is on disk; only the commit was refused.
+            mark_read(str(ctx.session_id), path, fingerprint(new_content))
+            return main_protected_error(path, ctx.task_id)
         mark_read(str(ctx.session_id), path, fingerprint(new_content))
         try:
             from app.core.context_observations import invalidate_path

@@ -1,4 +1,4 @@
-import { useState, useCallback, createContext, useContext } from 'react';
+import { useState, useEffect, useRef, useCallback, createContext, useContext } from 'react';
 import {
   GitBranch, GitMerge, GitCommit, Settings, Link2, Download, Upload,
   MoreHorizontal, CheckCircle2, XCircle, Loader2, AlertTriangle, Rocket,
@@ -9,6 +9,7 @@ import { useGitState, useGateActions } from '../context/GitStateContext';
 import { CiBadge, RiskBadge } from './GitFlowCards';
 import { GitLinkModal } from './RepoPanel';
 import { ModalPortal } from './shared';
+import { releaseTagMessages } from '../lib/releaseTagI18n';
 
 /* internal design notes Stage 4 (header / gate queue / operations)
  *                  Stage 5 (BranchTree + expand modal) */
@@ -192,7 +193,7 @@ const TreeCtx = createContext(null);
 function BranchRow({ node, depth }) {
   const {
     expanded, toggleExpand, showMerged, onShowDiff, pending, errors, act, reviewDivergence,
-    releaseBranch, workingBranch, dense, pushState, pushBranch, pullBranch, deleteState, deleteBranch,
+    releaseBranch, workingBranch, dense, pushState, pushBranch, pullBranch, deleteState, deleteBranch, onRelease,
   } = useContext(TreeCtx);
 
   const isLive = node.kind === 'session' && node.entity?.state === 'live';
@@ -308,6 +309,13 @@ function BranchRow({ node, depth }) {
             → {releaseBranch}
           </button>
         )}
+        {node.name === 'main' && onRelease && (
+          <button data-testid="git-release-tag" onClick={e => { e.stopPropagation(); onRelease(); }}
+            className="text-[8px] px-1.5 py-0.5 rounded-lg flex-shrink-0"
+            style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}>
+            {releaseTagMessages().open}
+          </button>
+        )}
         {/* Pull this branch from the remote — for when the same-named branch
             was edited there (e.g. someone fixed `dev` straight on GitHub). */}
         <button
@@ -410,7 +418,7 @@ function BranchRow({ node, depth }) {
 
 /* ── BranchTree ───────────────────────────────────────────────────────────── */
 
-export function BranchTree({ dense = true, onShowDiff, roomId, token }) {
+export function BranchTree({ dense = true, onShowDiff, roomId, token, onRelease }) {
   const { state, invalidate, bumpWorkspace } = useGitState();
   const nodes = state?.branches ?? [];
   const releaseBranch = state?.flow?.release_branch ?? 'main';
@@ -634,7 +642,7 @@ export function BranchTree({ dense = true, onShowDiff, roomId, token }) {
 
   const ctx = {
     expanded, toggleExpand, showMerged, onShowDiff, pending, errors, act, reviewDivergence,
-    releaseBranch, workingBranch, dense, pushState, pushBranch, pullBranch, deleteState, deleteBranch,
+    releaseBranch, workingBranch, dense, pushState, pushBranch, pullBranch, deleteState, deleteBranch, onRelease,
   };
 
   if (nodes.length === 0) {
@@ -664,7 +672,7 @@ export function BranchTree({ dense = true, onShowDiff, roomId, token }) {
 
 /* ── BranchTreeModal (⛶ expand view) ─────────────────────────────────────── */
 
-function BranchTreeModal({ roomId, token, onShowDiff, onClose }) {
+function BranchTreeModal({ roomId, token, onShowDiff, onClose, onRelease }) {
   const handleShowDiff = (branch, base) => {
     onClose();
     onShowDiff?.(branch, base);
@@ -690,7 +698,7 @@ function BranchTreeModal({ roomId, token, onShowDiff, onClose }) {
             <button onClick={onClose} className="btn-ghost p-1"><X size={14} /></button>
           </div>
           <div className="overflow-y-auto px-3 py-3 flex-1">
-            <BranchTree
+            <BranchTree onRelease={onRelease}
               key={`modal-${roomId}`}
               dense={false}
               onShowDiff={handleShowDiff}
@@ -704,12 +712,80 @@ function BranchTreeModal({ roomId, token, onShowDiff, onClose }) {
   );
 }
 
+function ReleaseTagModal({ roomId, token, onClose }) {
+  const t = releaseTagMessages();
+  const [suggestions, setSuggestions] = useState(null);
+  const [tag, setTag] = useState('');
+  const [message, setMessage] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState('');
+  const [result, setResult] = useState(null);
+  useEffect(() => {
+    let active = true;
+    fetch(`${API}/api/v1/rooms/${roomId}/release-tags`, { headers: { Authorization: `Bearer ${token}` } })
+      .then(async res => { if (!res.ok) throw new Error(); return res.json(); })
+      .then(data => { if (active) { setSuggestions(data); setTag(data.patch); } })
+      .catch(() => { if (active) setError(t.suggestions); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [roomId, token, t.suggestions]);
+  const submit = async e => {
+    e.preventDefault();
+    if (pending) return;
+    setPending(true); setError('');
+    try {
+      const res = await fetch(`${API}/api/v1/rooms/${roomId}/release-tags`, {
+        method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tag: tag.trim(), message: message.trim() }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail = data.detail || {};
+        setError(detail.code === 'tag_exists' ? t.exists : detail.code === 'tag_commit_not_published' ? t.unpublished : detail.message || t.failure);
+      } else setResult(data);
+    } catch { setError(t.failure); }
+    finally { setPending(false); }
+  };
+  return (
+    <ModalPortal onClose={onClose}>
+      <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(0,0,0,0.55)' }}
+        onClick={e => { if (e.target === e.currentTarget && !pending) onClose(); }}>
+      <form onSubmit={submit} data-testid="release-tag-form" className="flex flex-col gap-3 p-4 rounded-xl w-[min(90vw,400px)]"
+        style={{ background: 'var(--bg-panel)', color: 'var(--text-primary)', border: '1px solid var(--border)' }}>
+        <h2 className="font-medium">{t.title}</h2>
+        {result ? <p data-testid="release-tag-success">{t.success}: {result.tag} ({result.sha.slice(0, 10)})</p> : <>
+          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>{t.hint}</p>
+          {loading && <p className="text-xs">{t.loading}</p>}
+          <label className="flex flex-col gap-1 text-xs">{t.version}
+            <input data-testid="release-tag-version" required value={tag} onChange={e => setTag(e.target.value)}
+              className="rounded p-2" style={{ background: 'var(--bg-hover)' }} />
+          </label>
+          {suggestions && <div className="flex gap-2 text-xs">
+            <button type="button" onClick={() => setTag(suggestions.patch)}>{t.patch}: {suggestions.patch}</button>
+            <button type="button" onClick={() => setTag(suggestions.minor)}>{t.minor}: {suggestions.minor}</button>
+          </div>}
+          <label className="flex flex-col gap-1 text-xs">{t.message}
+            <input value={message} onChange={e => setMessage(e.target.value)} className="rounded p-2" style={{ background: 'var(--bg-hover)' }} />
+          </label>
+          {error && <p role="alert" className="text-xs" style={{ color: '#f87171' }}>{error}</p>}
+          <button type="submit" disabled={pending || loading || !tag.trim()} className="rounded p-2 text-sm" style={{ background: 'var(--accent)', color: 'white' }}>{t.submit}</button>
+        </>}
+        <button type="button" onClick={onClose} className="text-xs">{t.cancel}</button>
+      </form>
+      </div>
+    </ModalPortal>
+  );
+}
+
 /* ── GitPanel ─────────────────────────────────────────────────────────────── */
 
 export function GitPanel({ roomId, token, onShowDiff }) {
-  const { state, invalidate, bumpWorkspace } = useGitState();
+  const { state, invalidate, bumpWorkspace, promotionTick } = useGitState();
+  const lastPromotionTick = useRef(promotionTick);
   const [gitModal, setGitModal] = useState(false);
   const [treeModal, setTreeModal] = useState(false);
+  const [releaseModal, setReleaseModal] = useState(false);
   const [showOverflow, setShowOverflow] = useState(false);
   const [opStatus, setOpStatus] = useState(null);
   const [pulling, setPulling] = useState(false);
@@ -717,6 +793,10 @@ export function GitPanel({ roomId, token, onShowDiff }) {
   const [forcePush, setForcePush] = useState(false);
   const [promoting, setPromoting] = useState(false);
   const [promoStatus, setPromoStatus] = useState(null);
+  useEffect(() => {
+    if (promotionTick !== lastPromotionTick.current) setReleaseModal(true);
+    lastPromotionTick.current = promotionTick;
+  }, [promotionTick]);
 
   const conn = state?.connection;
   const hasRepo = Boolean(conn?.repo_url);
@@ -890,6 +970,7 @@ export function GitPanel({ roomId, token, onShowDiff }) {
           <BranchTree
             key={`sidebar-${roomId}`}
             dense={true}
+            onRelease={() => setReleaseModal(true)}
             onShowDiff={onShowDiff}
             roomId={roomId}
             token={token}
@@ -964,6 +1045,8 @@ export function GitPanel({ roomId, token, onShowDiff }) {
         </div>
       )}
 
+      {releaseModal && <ReleaseTagModal key={roomId} roomId={roomId} token={token} onClose={() => setReleaseModal(false)} />}
+
       {/* ── Modals ────────────────────────────────────────────────────────── */}
       {gitModal && (
         <GitLinkModal
@@ -981,6 +1064,7 @@ export function GitPanel({ roomId, token, onShowDiff }) {
           token={token}
           onShowDiff={onShowDiff}
           onClose={() => setTreeModal(false)}
+          onRelease={() => { setTreeModal(false); setReleaseModal(true); }}
         />
       )}
     </div>

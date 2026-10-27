@@ -87,6 +87,9 @@ _GIT_ENV = {
     "GIT_COMMITTER_NAME": LEGION_GIT_NAME,
     "GIT_COMMITTER_EMAIL": LEGION_GIT_EMAIL,
     "GIT_TERMINAL_PROMPT": "0",  # never prompt for credentials
+    # workspaced is the one party allowed to move ``main`` and tags; the
+    # room's guard hooks (app/release_guard.py) let this git through.
+    "LEGION_GIT_TRUSTED": "1",
 }
 
 # The person a room's commits are made for. Stored in the repo's own
@@ -280,7 +283,11 @@ def backfill_local_excludes(room_id: str) -> dict:
             result["userfiles_created"] = True
         return result
 
+    from app.release_guard import ensure_ref_guard
+
     updated = _write_local_excludes(root)
+    if ensure_ref_guard(root):
+        chown_workspace_tree(room_id)
     if updated:
         # The exclude file was written as root — keep it readable by the
         # container user, same as every other git-object mutation here.
@@ -377,8 +384,11 @@ def git_init(room_id: str) -> None:
     root.mkdir(parents=True, exist_ok=True)
     ensure_userfiles_dir(room_id, root=root)
 
+    from app.release_guard import ensure_ref_guard
+
     if (root / ".git").is_dir():
         _write_local_excludes(root)
+        ensure_ref_guard(root)
         return
 
     _run(["init"], cwd=root)
@@ -386,6 +396,7 @@ def git_init(room_id: str) -> None:
     _run(["config", "user.email", LEGION_GIT_EMAIL], cwd=root)
 
     _write_local_excludes(root)
+    ensure_ref_guard(root)
 
     _run(["commit", "--allow-empty", "-m", "init: Legion Hub workspace"], cwd=root)
 

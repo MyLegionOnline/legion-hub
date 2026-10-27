@@ -1232,6 +1232,32 @@ def _is_retryable_llm_error(exc: BaseException) -> bool:
     return False
 
 
+async def _execute_registry_tool(tool_name: str, ctx: Any, tool_input: dict[str, Any]) -> str:
+    """Run one workspace-registry tool and turn its failure into a tool result.
+
+    A tool that raises (a workspaced 409/5xx, a bug in the tool) must not end
+    the session: unhandled, the exception reached the turn's outer handler and
+    was shown as a model-provider error with the tool's HTTP status, and Retry
+    hit it again.  The agent gets the error text instead, the way
+    ``workspace_tools.execute_workspace_tool`` already does.  The run's own
+    control-flow exceptions still propagate.
+    """
+    from app.core.tools import REGISTRY as _REGISTRY
+    from app.core.tools.registry import safe_tool_error_text
+
+    try:
+        return await _REGISTRY.get(tool_name).execute(ctx, tool_input)
+    except (RunStopped, ToolLimitReached, McpCapabilityCircuitOpen, LLMCallRestarted):
+        raise
+    except Exception as exc:
+        logger.warning(
+            "proxy_session: tool %s failed (session=%s): %s",
+            tool_name, getattr(ctx, "session_id", None), exc, exc_info=True,
+        )
+        detail = safe_tool_error_text(str(exc))
+        return f"Error: {detail}" if detail else f"Error: {type(exc).__name__}"
+
+
 def _classify_llm_failure(exc: BaseException) -> tuple[str, str, int | None]:
     """Map an LLM call failure that survived the retry budget to
     ``(reason, safe_error, http_status)`` for the user-facing interruption card.
@@ -2416,7 +2442,7 @@ async def _call_llm_with_tools(
                         subtask_activity=call_subtask_activity,
                         run_id=run_id,
                     )
-                    result_text = await _REGISTRY.get(tool_name).execute(_ctx, tool_input_data)
+                    result_text = await _execute_registry_tool(tool_name, _ctx, tool_input_data)
                     await _touch_run_boundary()
                     _roll_up_subtask_usage(tool_name, result_text)
                     error_repeats = tool_error_guard.observe(
@@ -2964,7 +2990,7 @@ async def _call_llm_with_tools(
                     subtask_activity=call_subtask_activity,
                     run_id=run_id,
                 )
-                result_text = await _REGISTRY.get(tc.function.name).execute(_ctx, tool_args)
+                result_text = await _execute_registry_tool(tc.function.name, _ctx, tool_args)
                 await _touch_run_boundary()
                 _roll_up_subtask_usage(tc.function.name, result_text)
                 error_repeats = tool_error_guard.observe(

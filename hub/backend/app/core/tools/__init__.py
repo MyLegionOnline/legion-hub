@@ -62,6 +62,7 @@ from app.core.tools import _room_config  # noqa: F401
 
 # internal design notes Stage 15: publish a branch and name the commit to deploy.
 from app.core.tools import _publish_for_deploy  # noqa: F401
+from app.core.tools import _release_tag  # noqa: F401
 
 # Service-origin screenshot capture; runs in the Hub backend, not in the
 # workspace container.

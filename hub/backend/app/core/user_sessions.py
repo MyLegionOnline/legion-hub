@@ -4575,6 +4575,11 @@ async def _process_user_turn(
                     session.room_id,
                     exc_info=True,
                 )
+            from app.core.vision_dispatch import with_vision_override_tools
+
+            mcp_ant_tools, mcp_oai_tools, mcp_bindings = with_vision_override_tools(
+                llm_config, mcp_ant_tools, mcp_oai_tools, mcp_bindings
+            )
             # This guard remains present even when the snapshot is unavailable:
             # the model must not replace a missing capability with raw HTTP or
             # credential guessing.

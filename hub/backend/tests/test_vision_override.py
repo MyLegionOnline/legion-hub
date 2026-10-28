@@ -694,3 +694,62 @@ async def test_byok_does_not_overwrite_agent_supplied_design_system():
     getter.assert_not_awaited()
     sent_prompt = client.post.await_args.kwargs["json"]["messages"][0]["content"][0]["text"]
     assert "--brand" in sent_prompt
+
+
+_OVERRIDE_CONFIG = {
+    "provider": "openai",
+    "model": "chat-model",
+    "vision": {"enabled": True, "provider": "openai", "model": "vision-model"},
+}
+
+
+def test_override_adds_vision_tools_when_no_market_mcp_is_installed():
+    """Self-hosted Hub without Market: the override must expose the tools itself."""
+
+    from app.core.vision_dispatch import with_vision_override_tools
+
+    ant, oai, bindings = with_vision_override_tools(_OVERRIDE_CONFIG, [], [], {})
+
+    names = {"mcp__mcp-vision__describe_image", "mcp__mcp-vision__extract_design_spec", "mcp__mcp-vision__critique_design"}
+    assert set(bindings) == names
+    assert {tool["name"] for tool in ant} == names
+    assert {tool["function"]["name"] for tool in oai} == names
+    assert VISION_PUBLIC_TOOL_NAME in bindings
+    for binding in bindings.values():
+        assert should_dispatch_vision_override(_OVERRIDE_CONFIG, binding)
+        assert binding.market_item_id is None
+    describe = next(tool for tool in ant if tool["name"] == VISION_PUBLIC_TOOL_NAME)
+    assert "image_path" in describe["input_schema"]["properties"]
+    critique = next(tool for tool in ant if tool["name"] == "mcp__mcp-vision__critique_design")
+    assert {"cv_path", "diff_path"} <= set(critique["input_schema"]["properties"])
+
+
+def test_override_keeps_installed_market_vision_tool_and_does_not_mutate_inputs():
+    from app.core.vision_dispatch import with_vision_override_tools
+
+    market = McpToolBinding(uuid4(), uuid4(), "mcp-vision", "describe_image", None, None)
+    ant_in = [{"name": VISION_PUBLIC_TOOL_NAME, "description": "market", "input_schema": {"type": "object"}}]
+    bindings_in = {VISION_PUBLIC_TOOL_NAME: market}
+
+    ant, _oai, bindings = with_vision_override_tools(_OVERRIDE_CONFIG, ant_in, [], bindings_in)
+
+    assert bindings[VISION_PUBLIC_TOOL_NAME] is market
+    assert [tool["name"] for tool in ant].count(VISION_PUBLIC_TOOL_NAME) == 1
+    assert "mcp__mcp-vision__critique_design" in bindings
+    assert bindings_in == {VISION_PUBLIC_TOOL_NAME: market}
+    assert len(ant_in) == 1
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {},
+        {"vision": {"enabled": False, "provider": "openai", "model": "m"}},
+        {"vision": {"enabled": True, "provider": "openai", "model": ""}},
+        None,
+    ],
+)
+def test_no_override_adds_no_vision_tools(config):
+    from app.core.vision_dispatch import with_vision_override_tools
+
+    assert with_vision_override_tools(config, [], [], {}) == ([], [], {})

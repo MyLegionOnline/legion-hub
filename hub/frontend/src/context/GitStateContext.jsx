@@ -21,8 +21,6 @@ export function GitStateProvider({ roomId, token, gitEventTick = 0, children }) 
   const [state, setState] = useState(null);
   const [loading, setLoading] = useState(false);
   const [localTick, setLocalTick] = useState(0);
-  const [promotionTick, setPromotionTick] = useState(0);
-  const promotionApproved = useCallback(() => setPromotionTick(t => t + 1), []);
 
   const invalidate = useCallback(() => setLocalTick(t => t + 1), []);
   // Pull / connecting an external repository changes files in the working copy —
@@ -55,7 +53,7 @@ export function GitStateProvider({ roomId, token, gitEventTick = 0, children }) 
   }, [roomId, token]);
 
   return (
-    <GitStateContext.Provider value={{ state, loading, invalidate, workspaceTick, bumpWorkspace, promotionTick, promotionApproved }}>
+    <GitStateContext.Provider value={{ state, loading, invalidate, workspaceTick, bumpWorkspace }}>
       {children}
     </GitStateContext.Provider>
   );
@@ -65,7 +63,7 @@ export function GitStateProvider({ roomId, token, gitEventTick = 0, children }) 
 // eslint-disable-next-line react-refresh/only-export-components -- hook, lives next to its provider.
 export function useGitState() {
   return useContext(GitStateContext)
-    ?? { state: null, loading: false, invalidate: () => {}, workspaceTick: 0, bumpWorkspace: () => {}, promotionTick: 0, promotionApproved: () => {} };
+    ?? { state: null, loading: false, invalidate: () => {}, workspaceTick: 0, bumpWorkspace: () => {} };
 }
 
 /* ── useGateActions ─────────────────────────────────────────────────────────
@@ -82,7 +80,7 @@ export function useGitState() {
 
 // eslint-disable-next-line react-refresh/only-export-components -- hook, lives next to its provider.
 export function useGateActions(roomId, token, callbacks = {}) {
-  const { invalidate, promotionApproved } = useGitState();
+  const { invalidate } = useGitState();
   const [pending, setPending] = useState(null); // 'publish' | 'approve' | 'reject'
   const [error, setError] = useState(null);
 
@@ -133,7 +131,6 @@ export function useGateActions(roomId, token, callbacks = {}) {
         setError(String(data.detail || `HTTP ${res.status}`));
         return { ok: false, conflict: isConflict };
       }
-      if (!isGoal && decision === 'approve') promotionApproved();
       invalidate();
       cbRef.current.onDone?.();
       return { ok: true };
@@ -143,7 +140,7 @@ export function useGateActions(roomId, token, callbacks = {}) {
     } finally {
       setPending(null);
     }
-  }, [roomId, token, pending, invalidate, promotionApproved]);
+  }, [roomId, token, pending, invalidate]);
 
   return { pending, error, setError, publishBranch, resolveGate };
 }

@@ -4398,9 +4398,23 @@ async def _run_proxy_loop(
         agent_sys = f"{agent_sys}\n\n{_mcp_failure_note}"
         cm_sys = f"{cm_sys}\n\n{_mcp_failure_note}"
 
-    from app.core.vision_dispatch import agent_can_see_images, no_vision_note
+    from app.core.vision_dispatch import (
+        agent_can_see_images,
+        no_vision_note,
+        with_vision_override_tools,
+    )
 
-    if not await agent_can_see_images(agent_llm_config, _mcp_bindings):
+    # Each side gets the mcp-vision tools its own vision override can run;
+    # the shared room list is not mutated. Without an owner the BYOK key
+    # cannot be resolved, so nothing is added.
+    _agent_mcp_ant, _agent_mcp_oai, _agent_mcp_bindings = with_vision_override_tools(
+        agent_llm_config if _mcp_user_id else None, _mcp_ant_tools, _mcp_oai_tools, _mcp_bindings
+    )
+    _cm_mcp_ant, _cm_mcp_oai, _cm_mcp_bindings = with_vision_override_tools(
+        cm_llm_config if _mcp_user_id else None, _mcp_ant_tools, _mcp_oai_tools, _mcp_bindings
+    )
+
+    if not await agent_can_see_images(agent_llm_config, _agent_mcp_bindings):
         agent_sys = f"{agent_sys}\n\n{no_vision_note(task.id)}"
 
     # Per-agent tool allowlists (null = unrestricted within the role)
@@ -4537,9 +4551,9 @@ async def _run_proxy_loop(
                         db=db,
                         workspace_ant_tools=_strip_dialogue_only(_ws_registry.ant_schemas_for("agent", _agent_allowed)) if _ws_available else None,
                         workspace_oai_tools=_strip_dialogue_only(_ws_registry.oai_schemas_for("agent", _agent_allowed)) if _ws_available else None,
-                        mcp_ant_tools=_mcp_ant_tools,
-                        mcp_oai_tools=_mcp_oai_tools,
-                        mcp_bindings=_mcp_bindings,
+                        mcp_ant_tools=_agent_mcp_ant,
+                        mcp_oai_tools=_agent_mcp_oai,
+                        mcp_bindings=_agent_mcp_bindings,
                         mcp_user_id=_mcp_user_id,
                         or_session_id=str(agent_session.id),
                         max_tool_calls=_AGENT_MAX_TOOL_CALLS,
@@ -5078,9 +5092,9 @@ async def _run_proxy_loop(
                     db=db,
                     workspace_ant_tools=_strip_dialogue_only(_ws_registry.ant_schemas_for("cm", _cm_allowed)) if _ws_available else None,
                     workspace_oai_tools=_strip_dialogue_only(_ws_registry.oai_schemas_for("cm", _cm_allowed)) if _ws_available else None,
-                    mcp_ant_tools=_mcp_ant_tools,
-                    mcp_oai_tools=_mcp_oai_tools,
-                    mcp_bindings=_mcp_bindings,
+                    mcp_ant_tools=_cm_mcp_ant,
+                    mcp_oai_tools=_cm_mcp_oai,
+                    mcp_bindings=_cm_mcp_bindings,
                     mcp_user_id=_mcp_user_id,
                     or_session_id=str(cm_session.id),
                     # An answer turn inspects the workspace before it can name a

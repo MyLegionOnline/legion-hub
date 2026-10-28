@@ -19,9 +19,11 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.mcp_gateway import (
+    McpToolBinding,
     McpVisionInputError,
     VISION_ERROR_CODES,
     _resolve_json_field,
+    _vision_agent_schema,
     _VISION_TOOLS,
     resolve_vision_arguments,
 )
@@ -110,6 +112,161 @@ def has_vision_override(llm_config: Mapping[str, Any] | None) -> bool:
         and str(vision.get("provider") or "").strip()
         and str(vision.get("model") or "").strip()
     )
+
+
+#: Stable id for the Hub-local vision bindings below; there is no installed
+#: Market item behind them, and nothing on the BYOK route reads this id.
+_OVERRIDE_INSTALLED_ITEM_ID = UUID("3f0b6c1e-6d2a-5b8e-9c41-7a1d2e9f0b11")
+
+_IMAGE_INPUT_PROPERTIES: dict[str, Any] = {
+    "image_base64": {
+        "type": "string",
+        "description": "Base64-encoded PNG, JPEG, WebP, or GIF image without a data-URI prefix.",
+    },
+    "mime_type": {
+        "type": "string",
+        "enum": ["image/png", "image/jpeg", "image/webp", "image/gif"],
+        "description": "Image MIME type. When omitted, it is inferred from the image signature.",
+    },
+}
+_BOX_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {key: {"type": "number"} for key in ("x", "y", "w", "h")},
+    "required": ["x", "y", "w", "h"],
+    "additionalProperties": False,
+}
+
+#: Mirror of mcp-vision/src/types.ts (*_TOOL definitions). The Market route
+#: advertises the schemas the Node service returns; an agent with a vision
+#: override but no installed mcp-vision (a self-hosted Hub without Market,
+#: no Legion key, no credits) gets these instead. Keep the two in sync.
+_OVERRIDE_TOOL_DEFINITIONS: dict[str, tuple[str, dict[str, Any]]] = {
+    "describe_image": (
+        "Describe an image, extract visible text (OCR), and optionally answer one question about it.",
+        {
+            "type": "object",
+            "properties": {
+                **_IMAGE_INPUT_PROPERTIES,
+                "question": {
+                    "type": "string",
+                    "maxLength": 2000,
+                    "description": "Optional focused question about the image.",
+                },
+            },
+            "required": ["image_base64"],
+            "additionalProperties": False,
+        },
+    ),
+    "extract_design_spec": (
+        "Extract a normalized Design Spec (layout tree, colors, spacing, typography, text) from a UI "
+        "screenshot or mockup, for a front-end engineer to implement it against an existing codebase.",
+        {
+            "type": "object",
+            "properties": {
+                **_IMAGE_INPUT_PROPERTIES,
+                "cv": {
+                    "type": "object",
+                    "description": (
+                        "CV region/text-metrics tree produced by the ui-from-design skill's `vision.py regions` "
+                        "command. Strongly improves coordinate accuracy; omit only when unavailable."
+                    ),
+                },
+                "name": {
+                    "type": "string",
+                    "maxLength": 200,
+                    "description": 'Design name used to file the resulting spec (e.g. "dashboard").',
+                },
+                "viewport_hint": {"type": "string", "enum": ["desktop", "tablet", "mobile"]},
+                "design_system": {
+                    "type": "object",
+                    "description": (
+                        "Existing project tokens/components (colors, spacing, typography, component names) "
+                        "to reference instead of inventing new ones."
+                    ),
+                },
+                "focus": {**_BOX_SCHEMA, "description": "Restrict analysis to this pixel region of the image."},
+                "detail": {
+                    "type": "string",
+                    "enum": ["outline", "full"],
+                    "description": '"outline" skips deeply nested leaf regions and minor decorative details.',
+                },
+            },
+            "required": ["image_base64"],
+            "additionalProperties": False,
+        },
+    ),
+    "critique_design": (
+        "Score a UI design across hierarchy, typography, color, spacing, accessibility, and (with a "
+        "reference) fidelity, with concrete findings and fixes.",
+        {
+            "type": "object",
+            "properties": {
+                **_IMAGE_INPUT_PROPERTIES,
+                "cv": {
+                    "type": "object",
+                    "description": "CV region/text-metrics tree produced by the ui-from-design skill's `vision.py regions` command.",
+                },
+                "diff": {
+                    "type": "object",
+                    "description": (
+                        "Pixel-diff summary produced by the ui-from-design skill's `vision.py compare` command, "
+                        "against a reference design. Enables the `fidelity` aspect."
+                    ),
+                },
+                "design_system": {
+                    "type": "object",
+                    "description": "Existing project tokens/components to judge consistency against.",
+                },
+                "aspects": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": list(_CRITIQUE_ASPECTS)},
+                    "description": "Aspects to score and find issues for. Defaults to all six.",
+                },
+                "design_type": {"type": "string", "enum": ["web", "mobile"]},
+            },
+            "required": ["image_base64"],
+            "additionalProperties": False,
+        },
+    ),
+}
+
+
+def with_vision_override_tools(
+    llm_config: Mapping[str, Any] | None,
+    ant_tools: list[dict[str, Any]],
+    oai_tools: list[dict[str, Any]],
+    bindings: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Give an agent with a vision override the mcp-vision tools it can run.
+
+    The override used to work only by intercepting an installed Market
+    ``mcp-vision`` tool, so without one (a self-hosted Hub that never
+    installed it) the agent saw no vision tool at all and reported itself
+    blind. A tool the room already exposes is left as is — the dispatch
+    reroutes it to BYOK anyway. Returns new containers: the inputs may be
+    shared with another agent of the same task that has no override.
+    """
+
+    ant, oai, merged = list(ant_tools), list(oai_tools), dict(bindings)
+    if not has_vision_override(llm_config):
+        return ant, oai, merged
+    present = {
+        getattr(binding, "tool_name", None)
+        for binding in merged.values()
+        if getattr(binding, "market_slug", None) == _VISION_MARKET_SLUG
+    }
+    for raw_name, (description, base_schema) in _OVERRIDE_TOOL_DEFINITIONS.items():
+        spec = _VISION_TOOLS.get(raw_name)
+        name = f"mcp__{_VISION_MARKET_SLUG}__{raw_name}"
+        if spec is None or raw_name in present or name in merged:
+            continue
+        schema = _vision_agent_schema(base_schema, spec)
+        ant.append({"name": name, "description": description, "input_schema": schema})
+        oai.append({"type": "function", "function": {"name": name, "description": description, "parameters": schema}})
+        merged[name] = McpToolBinding(
+            _OVERRIDE_INSTALLED_ITEM_ID, None, _VISION_MARKET_SLUG, raw_name, None, None,
+        )
+    return ant, oai, merged
 
 
 def has_vision_mcp(mcp_bindings: Mapping[str, Any] | None) -> bool:

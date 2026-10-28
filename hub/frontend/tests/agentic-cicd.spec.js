@@ -585,10 +585,13 @@ test('main release tag form suggests versions and handles publication errors', a
   expect(state.releaseTagBodies.at(-1).tag).toBe('v1.3.0');
 });
 
-test('successful promotion opens release tag form', async ({ page }) => {
+// The tag is set by hand once the build on main has passed, so approving the
+// promotion must not pop the form up on its own.
+test('successful promotion does not open release tag form', async ({ page }) => {
   const gate = { id: PROMOTION_ID, kind: 'promotion', title: 'Promote dev to main', ci_status: 'passed' };
-  await installHarness(page, { gitState: makeGitState({ gates: [gate] }) });
+  const state = await installHarness(page, { gitState: makeGitState({ gates: [gate] }) });
   await openRoom(page);
   await page.getByTestId('git-gate-queue').getByRole('button', { name: 'Confirm' }).click();
-  await expect(page.getByTestId('release-tag-form')).toBeVisible();
+  await expect.poll(() => state.resolveBodies).toHaveLength(1);
+  await expect(page.getByTestId('release-tag-form')).toHaveCount(0);
 });

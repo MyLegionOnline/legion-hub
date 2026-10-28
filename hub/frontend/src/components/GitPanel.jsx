@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, createContext, useContext } from 'react';
+import { useState, useEffect, useCallback, createContext, useContext } from 'react';
 import {
   GitBranch, GitMerge, GitCommit, Settings, Link2, Download, Upload,
   MoreHorizontal, CheckCircle2, XCircle, Loader2, AlertTriangle, Rocket,
@@ -781,8 +781,7 @@ function ReleaseTagModal({ roomId, token, onClose }) {
 /* ── GitPanel ─────────────────────────────────────────────────────────────── */
 
 export function GitPanel({ roomId, token, onShowDiff }) {
-  const { state, invalidate, bumpWorkspace, promotionTick } = useGitState();
-  const lastPromotionTick = useRef(promotionTick);
+  const { state, invalidate, bumpWorkspace } = useGitState();
   const [gitModal, setGitModal] = useState(false);
   const [treeModal, setTreeModal] = useState(false);
   const [releaseModal, setReleaseModal] = useState(false);
@@ -793,10 +792,6 @@ export function GitPanel({ roomId, token, onShowDiff }) {
   const [forcePush, setForcePush] = useState(false);
   const [promoting, setPromoting] = useState(false);
   const [promoStatus, setPromoStatus] = useState(null);
-  useEffect(() => {
-    if (promotionTick !== lastPromotionTick.current) setReleaseModal(true);
-    lastPromotionTick.current = promotionTick;
-  }, [promotionTick]);
 
   const conn = state?.connection;
   const hasRepo = Boolean(conn?.repo_url);

@@ -382,6 +382,9 @@ class TestPhase4ProxySession:
             patch("app.core.proxy_session.SessionRepository") as MockRepo,
             patch("app.core.proxy_session._run_proxy_loop", new_callable=AsyncMock),
             patch("app.core.events.emit_event", new_callable=AsyncMock),
+            # Settling the run reads the task row again; the two sessions are
+            # what is under test here.
+            patch("app.core.task_runtime.finalize_run", new_callable=AsyncMock),
         ):
             create_calls: list[str] = []
 

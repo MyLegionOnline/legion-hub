@@ -288,6 +288,9 @@ async def test_handle_task_created_text_agent_uses_proxy_loop():
         patch("app.core.proxy_session._run_proxy_loop", new_callable=AsyncMock) as mock_text,
         patch("app.core.proxy_session.SessionRepository") as MockRepo,
         patch("app.core.proxy_session.emit_event", new_callable=AsyncMock),
+        # Settling the run reads the task row again; the routing is what is
+        # under test here.
+        patch("app.core.task_runtime.finalize_run", new_callable=AsyncMock),
     ):
         mock_session = MagicMock()
         mock_session.id = uuid.uuid4()

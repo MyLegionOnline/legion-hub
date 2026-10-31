@@ -53,7 +53,7 @@ from app.models.room import Room, RoomUserLink
 from app.models.session import CmAgentProxySession, Session
 from app.models.task import (
     DispatchStatus, Task, TaskDependency, TaskHandoff, TaskState, TASK_TRANSITIONS,
-    is_checkpoint_approval,
+    TASK_ORIGIN_DIRECT_SESSION, is_checkpoint_approval,
 )
 from app.models.user import User
 from app.schemas.task import (
@@ -805,7 +805,18 @@ async def change_task_state(
         # Let Start+Assign use the new assignee for preflight without
         # persisting anything if dispatch is impossible.
         task.assigned_agent_id = body.assigned_agent_id
-    if body.state == TaskState.IN_PROGRESS:
+    # A task recorded from a user ↔ agent dialogue is continued in a dialogue,
+    # not by the dispatcher (see waiting_reply.resume_direct_session_task).
+    in_dialogue = (
+        body.state == TaskState.IN_PROGRESS
+        and getattr(task, "origin", None) == TASK_ORIGIN_DIRECT_SESSION
+    )
+    if in_dialogue and task.assigned_agent_id is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Task cannot be started: it has no assignee to continue the dialogue",
+        )
+    if body.state == TaskState.IN_PROGRESS and not in_dialogue:
         from app.core.task_deps import refresh_blocked_dispatch_status
         from app.models.task import DispatchStatus
 
@@ -1067,7 +1078,37 @@ async def change_task_state(
     # "Back to Work" out of WAITING_REVIEW is the same kind of explicit restart:
     # the submitted generation is over and its sessions are closed, so the
     # idempotent path would find a stale DISPATCHED task and do nothing at all.
-    if body.state == TaskState.IN_PROGRESS:
+    if in_dialogue:
+        from app.models.task import DispatchStatus
+
+        await close_open_task_sessions(task.id, "retry", db)
+        # Claimed the way session_work records it, so the board cannot start
+        # a second executor on the dialogue's branch.
+        task.dispatch_status = DispatchStatus.DISPATCHED
+        task.run_id = None
+        task.runtime_state = "idle"
+        task.stop_requested_at = None
+        task.stop_reason = None
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+        import asyncio
+
+        from app.core.waiting_reply import resume_direct_session_task
+
+        asyncio.create_task(resume_direct_session_task(
+            room_id, current_user.id, task.id,
+            _REVIEW_REOPEN_FEEDBACK if returning_from_review else (
+                "The user asks to finish what was started. Bring the task to "
+                "completion and return it to review."
+            ),
+        ))
+        _logger.info(
+            "tasks: %s → in_progress for dialogue task %s — continued in a dialogue",
+            prev_state, task.id,
+        )
+    elif body.state == TaskState.IN_PROGRESS:
         assert dispatch is not None
         restart = resuming_from_pause or returning_from_review
         if restart:

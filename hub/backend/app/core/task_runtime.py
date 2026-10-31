@@ -11,7 +11,7 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -23,6 +23,25 @@ RUNTIME_STOPPED = "stopped"
 RUNTIME_FAILED = "failed"
 
 _LOCAL_PROXY_TASKS: dict[str, asyncio.Task[Any]] = {}
+
+
+def task_is_working_clause() -> Any:
+    """SQL condition: the task is work in progress.
+
+    IN_PROGRESS and RESUMING always are. PAUSING is only while its run is
+    still alive to acknowledge the pause; once the runtime has settled, a task
+    left PAUSING is a wedge, not work, and must not keep the room's container
+    or billing interval running (the watchdog settles it to PAUSED).
+    """
+    from app.models.task import Task, TaskState
+
+    return or_(
+        Task.state.in_([TaskState.IN_PROGRESS, TaskState.RESUMING]),
+        and_(
+            Task.state == TaskState.PAUSING,
+            Task.runtime_state.in_([RUNTIME_RUNNING, RUNTIME_STOP_REQUESTED]),
+        ),
+    )
 
 
 def register_local_proxy_task(task_id: Any, task: asyncio.Task[Any]) -> None:
@@ -192,9 +211,29 @@ async def finalize_run(
             .execution_options(populate_existing=True)
         )
         task = result.scalars().first()
-    if task is None or task.run_id != run_id:
+        if task is None:
+            return
+        current_run, state, runtime = task.run_id, task.state, task.runtime_state
+        dispatch = getattr(task, "dispatch_status", None)
+    else:
+        # The caller's object is the run loop's own copy, loaded when the run
+        # began. The pause that is finishing it was written by another session
+        # (the close/pause request), so that copy still reads IN_PROGRESS /
+        # running: deciding from it settled the runtime as "stopped" and left
+        # the task PAUSING for good — counted as live work, it kept the room's
+        # container and billing interval running for 19.7 h on the live stack.
+        row = (
+            await db.execute(
+                select(Task.run_id, Task.state, Task.runtime_state, Task.dispatch_status)
+                .where(Task.id == task_id)
+            )
+        ).first()
+        if row is None:
+            return
+        current_run, state, runtime, dispatch = tuple(row)
+    if current_run != run_id:
         return
-    pausing = task.runtime_state == RUNTIME_STOP_REQUESTED and task.state == TaskState.PAUSING
+    pausing = runtime == RUNTIME_STOP_REQUESTED and state == TaskState.PAUSING
     next_runtime = (
         RUNTIME_PAUSED if pausing
         else RUNTIME_FAILED if failed
@@ -210,11 +249,10 @@ async def finalize_run(
         # back to READY so Start/Resume (and any auto-resume) can redispatch —
         # otherwise request_task_dispatch short-circuits on "already active"
         # and the task is wedged IN_PROGRESS with no running loop.
-        if getattr(task, "dispatch_status", None) == DispatchStatus.DISPATCHED:
+        if dispatch == DispatchStatus.DISPATCHED:
             values["dispatch_status"] = DispatchStatus.READY
-    # The conditional update is the cross-worker fence.  Passing the current
-    # in-memory task avoids an otherwise unnecessary SELECT in the normal
-    # completion path, while a retry's new run_id makes rowcount zero.
+    # The conditional update is the cross-worker fence: a retry's new run_id
+    # makes rowcount zero.
     update_result = await db.execute(
         update(Task)
         .where(Task.id == task_id, Task.run_id == run_id)
@@ -224,7 +262,7 @@ async def finalize_run(
         return
     if pausing:
         task.state = TaskState.PAUSED
-        if getattr(task, "dispatch_status", None) == DispatchStatus.DISPATCHED:
+        if dispatch == DispatchStatus.DISPATCHED:
             task.dispatch_status = DispatchStatus.READY
     task.runtime_state = next_runtime
     task.updated_at = datetime.utcnow()

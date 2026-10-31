@@ -9,6 +9,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     ripgrep \
+    # A C toolchain: the agent has no root, so it cannot apt-get one later.
+    # Without it cargo cannot link (Rust uses cc as the linker), and native
+    # pip wheels / node-gyp builds fail — agents then burn whole sessions on
+    # workarounds such as zig-as-linker.
+    build-essential \
+    pkg-config \
     fonts-dejavu-core \
     fonts-liberation \
     && curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
@@ -37,11 +43,15 @@ ENV PIP_BREAK_SYSTEM_PACKAGES=1
 # tasks (PDF/XLSX hand-outs) reach for first. Without them an agent burns a
 # dozen tool calls on installs and font hunting — and installs outrun the
 # 120 s synchronous bash cap.
+# pytest + ruff let an agent test and lint Python even in a room without
+# network, where a runtime `pip install` is impossible.
 RUN pip3 install --no-cache-dir --break-system-packages \
     Pillow \
     numpy \
     reportlab \
-    openpyxl
+    openpyxl \
+    pytest \
+    ruff
 
 WORKDIR /workspace
 RUN chown dev:dev /workspace

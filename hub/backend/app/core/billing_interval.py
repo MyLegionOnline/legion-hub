@@ -543,8 +543,9 @@ async def open_intervals_for_working_rooms(db: AsyncSession) -> int:
         WORKSPACE_IDLE_TIMEOUT_SEC,
         _get_or_create_workspace,
     )
+    from app.core.task_runtime import task_is_working_clause
     from app.models.session.base import Session
-    from app.models.task import Task, TaskState
+    from app.models.task import Task
     from app.models.workspace import Workspace, WorkspaceUsage
 
     now = _now()
@@ -573,7 +574,7 @@ async def open_intervals_for_working_rooms(db: AsyncSession) -> int:
         await db.execute(
             select(Task.room_id, func.min(Task.updated_at))
             .where(
-                Task.state.in_([TaskState.IN_PROGRESS, TaskState.PAUSING, TaskState.RESUMING]),
+                task_is_working_clause(),
                 Task.room_id.not_in(open_ws),
             )
             .group_by(Task.room_id)

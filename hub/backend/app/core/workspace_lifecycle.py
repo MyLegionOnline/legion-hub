@@ -1447,17 +1447,16 @@ async def room_has_live_work(room_id: UUID, db: AsyncSession) -> bool:
     from sqlalchemy import func
 
     from app.core.billing_interval import NON_BILLING_SESSION_KINDS, PRESENCE_FRESH_SEC
+    from app.core.task_runtime import task_is_working_clause
     from app.models.session.base import Session
-    from app.models.task import Task, TaskState
+    from app.models.task import Task
     from app.models.workspace import Workspace
 
     now = _now()
     active_task = await db.execute(
         select(Task.id).where(
             Task.room_id == room_id,
-            Task.state.in_(
-                [TaskState.IN_PROGRESS, TaskState.PAUSING, TaskState.RESUMING]
-            ),
+            task_is_working_clause(),
         ).limit(1)
     )
     if active_task.first() is not None:
@@ -1818,7 +1817,8 @@ async def workspace_is_idle(
     background processes, so an in-flight ChatMaster conversation could be
     reaped as idle during a long provider call.
     """
-    from app.models.task import Task, TaskState
+    from app.core.task_runtime import task_is_working_clause
+    from app.models.task import Task
     from app.models.session.base import Session
     from app.models.workspace import (
         Workspace,
@@ -1833,9 +1833,7 @@ async def workspace_is_idle(
     active_tasks = await db.execute(
         select(Task.id).where(
             Task.room_id == room_id,
-            Task.state.in_(
-                [TaskState.IN_PROGRESS, TaskState.PAUSING, TaskState.RESUMING]
-            ),
+            task_is_working_clause(),
         )
     )
     if active_tasks.first() is not None:

@@ -14,7 +14,15 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from app.config import WORKSPACE_DATA_DIR, WORKSPACE_GID, WORKSPACE_UID
+from app.config import (
+    SYNC_IGNORE_ENABLED,
+    SYNC_RESPECT_GITIGNORE,
+    WORKSPACE_DATA_DIR,
+    WORKSPACE_GID,
+    WORKSPACE_UID,
+)
+from app.path_contract import USERFILES_DIR
+from app.sync_ignore import IgnoreMatcher
 
 _GENERATION_FILE = Path(".legion") / "generation.json"
 _LOCKS: dict[str, threading.Lock] = {}
@@ -31,28 +39,46 @@ def _lock(room_id: str) -> threading.Lock:
 
 
 def _tree_signature(root: Path) -> str:
-    """Hash file paths and bytes, excluding service metadata and git internals."""
+    """Hash file paths, sizes and mtimes, skipping service metadata, git
+    internals and directories the sync ignores.
+
+    Runs on every write, so it must stay cheap on rooms that hold build output
+    or a toolchain (``target/`` and ``.toolchain/`` reach gigabytes): ignored
+    directories are pruned and files are only stat'ed, never read.
+    """
     digest = hashlib.sha256()
     if not root.exists():
         return digest.hexdigest()
-    for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(root).as_posix()
-        if rel == _GENERATION_FILE.as_posix() or rel.startswith(".legion/"):
-            continue
-        if rel == ".git" or rel.startswith(".git/"):
-            continue
-        try:
-            digest.update(rel.encode("utf-8"))
-            digest.update(b"\0")
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            digest.update(b"\0")
-        except OSError:
-            # A concurrently removed file is simply absent from this sample.
-            continue
+    matcher = IgnoreMatcher(
+        root,
+        enabled=SYNC_IGNORE_ENABLED,
+        respect_gitignore=SYNC_RESPECT_GITIGNORE,
+    )
+    entries: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = Path(dirpath).relative_to(root).as_posix()
+        rel_dir = "" if rel_dir == "." else rel_dir
+        kept = []
+        for name in dirnames:
+            rel = f"{rel_dir}/{name}" if rel_dir else name
+            if rel in (".git", ".legion"):
+                continue
+            # Room-private files are always tracked, gitignored or not.
+            if rel != USERFILES_DIR and matcher.match(rel, is_dir=True).ignored:
+                continue
+            kept.append(name)
+        dirnames[:] = kept
+        for name in filenames:
+            rel = f"{rel_dir}/{name}" if rel_dir else name
+            try:
+                stat = os.stat(os.path.join(dirpath, name))
+            except OSError:
+                # A concurrently removed file is simply absent from this sample.
+                continue
+            entries.append(f"{rel}\0{stat.st_size}\0{stat.st_mtime_ns}")
+    for entry in sorted(entries):
+        digest.update(entry.encode("utf-8", "surrogateescape"))
+        digest.update(b"\n")
     return digest.hexdigest()
 
 

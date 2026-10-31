@@ -93,6 +93,37 @@ def test_stage8_generation_revision_is_monotonic_and_epoch_changes_on_replace(
     assert replaced["revision"] == 0
 
 
+def test_generation_skips_ignored_directories_but_tracks_userfiles(isolated_volume):
+    """Build output and toolchains (gigabytes in a Rust room) must not be walked
+    on every write; room-private files count even when gitignored."""
+    room_id, root = isolated_volume
+    root.mkdir(parents=True)
+    (root / ".gitignore").write_text(".toolchain/\n.userfiles/\n", encoding="utf-8")
+    base = generation.ensure_generation(room_id)
+
+    (root / "target" / "debug").mkdir(parents=True)
+    (root / "target" / "debug" / "app").write_bytes(b"\0" * 64)
+    (root / ".toolchain" / "bin").mkdir(parents=True)
+    (root / ".toolchain" / "bin" / "rustc").write_bytes(b"\0" * 64)
+    assert generation.sync_generation(room_id) == base
+
+    (root / ".userfiles").mkdir()
+    (root / ".userfiles" / "note.md").write_text("hi", encoding="utf-8")
+    assert generation.sync_generation(room_id)["revision"] == base["revision"] + 1
+
+
+def test_import_files_advances_generation_once(isolated_volume):
+    room_id, root = isolated_volume
+    base = generation.ensure_generation(room_id)
+    result = file_ops.import_files(
+        room_id,
+        [{"path": "a.txt", "content": "a"}, {"path": "b/c.txt", "content": "c"}],
+    )
+    assert result["imported"] == 2
+    assert result["generation"]["revision"] == base["revision"] + 1
+    assert (root / "b" / "c.txt").read_text(encoding="utf-8") == "c"
+
+
 def test_stage8_snapshot_retries_when_generation_changes_during_read(isolated_volume, monkeypatch):
     room_id, root = isolated_volume
     root.mkdir(parents=True)

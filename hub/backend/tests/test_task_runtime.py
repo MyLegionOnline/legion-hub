@@ -173,3 +173,66 @@ async def test_touch_on_a_stopped_run_writes_nothing():
 
     assert await touch_run_activity(uuid.uuid4(), uuid.uuid4(), "run-1", db) is False
     assert db.execute.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_pause_settles_even_when_the_loop_passes_a_stale_task():
+    """The run loop hands finalize_run its own copy of the task, loaded when
+    the run began. A pause written meanwhile by another session must still
+    settle to PAUSED — deciding from the stale copy left the task PAUSING for
+    good, and the room billed for 19.7 h."""
+    from app.models.task import DispatchStatus
+
+    stale = SimpleNamespace(
+        id=uuid.uuid4(),
+        room_id=uuid.uuid4(),
+        title="pause me",
+        run_id="run-current",
+        runtime_state=RUNTIME_RUNNING,
+        state=TaskState.IN_PROGRESS,
+        dispatch_status=DispatchStatus.DISPATCHED,
+        pause_reason="user",
+        updated_at=datetime.now(timezone.utc),
+    )
+    fresh_row = (
+        "run-current", TaskState.PAUSING, RUNTIME_STOP_REQUESTED, DispatchStatus.DISPATCHED,
+    )
+    update_result = MagicMock(rowcount=1)
+    db = AsyncMock()
+    db.execute = AsyncMock(side_effect=[_result(first=fresh_row), update_result])
+    db.add = MagicMock()
+    db.flush = AsyncMock()
+
+    with patch("app.core.events.emit_event", new_callable=AsyncMock):
+        await finalize_run(stale.id, "run-current", db, task=stale)
+
+    update_values = db.execute.await_args_list[1].args[0].compile().params
+    assert update_values["state"] == TaskState.PAUSED
+    assert update_values["runtime_state"] == RUNTIME_PAUSED
+    assert update_values["dispatch_status"] == DispatchStatus.READY
+    assert stale.state == TaskState.PAUSED
+    assert stale.runtime_state == RUNTIME_PAUSED
+
+
+@pytest.mark.asyncio
+async def test_stale_task_from_a_replaced_generation_writes_nothing():
+    stale = SimpleNamespace(id=uuid.uuid4(), run_id="run-old", state=TaskState.IN_PROGRESS)
+    db = AsyncMock()
+    db.execute = AsyncMock(return_value=_result(
+        first=("run-new", TaskState.IN_PROGRESS, RUNTIME_RUNNING, None)
+    ))
+    db.add = MagicMock()
+
+    await finalize_run(stale.id, "run-old", db, task=stale)
+
+    assert db.execute.await_count == 1
+    db.add.assert_not_called()
+
+
+def test_wedged_pausing_task_is_not_work():
+    from app.core.task_runtime import task_is_working_clause
+
+    sql = str(task_is_working_clause().compile(compile_kwargs={"literal_binds": True}))
+    assert "PAUSING" in sql
+    assert "'running'" in sql and "'stop_requested'" in sql
+    assert "'stopped'" not in sql

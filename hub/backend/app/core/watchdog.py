@@ -14,6 +14,9 @@ Three responsibilities:
     task goes to BLOCKED + persistent TASK_STALLED. User-facing sessions silent
     for USER_SESSION_IDLE_MINUTES are closed with reason='idle'
     (internal design notes stage 1.4).
+  * settle_abandoned_pausing — every cycle: PAUSING tasks with no run left to
+    acknowledge the pause are settled to PAUSED, so they stop counting as live
+    work (container reaping, billing).
   * close_stale_plan_sessions — at startup (orphaned_restart) and every cycle
     (timeout): cm_self_plan decomposition sessions silent for
     PLAN_SESSION_STALE_MINUTES (default 60) — their coroutine died with a
@@ -141,10 +144,26 @@ async def _emit_session_closed(session: Session, close_reason: str, db: AsyncSes
 async def block_stalled_task(
     task_id, reason: str, content: str, db: AsyncSession, *, extra_meta: dict | None = None
 ) -> None:
-    """Move an IN_PROGRESS task to BLOCKED and emit a persistent TASK_STALLED event."""
+    """Move an IN_PROGRESS task to BLOCKED and emit a persistent TASK_STALLED event.
+
+    A PAUSING task whose run died settles to PAUSED instead: the pause was
+    asked for and nothing is left to acknowledge it. Left PAUSING, it would
+    count as active work forever and keep its room from going idle.
+    """
     task = (
         await db.execute(select(Task).where(Task.id == task_id))
     ).scalars().first()
+    if task is not None and task.state == TaskState.PAUSING:
+        from app.core.task_runtime import RUNTIME_PAUSED
+        from app.models.task import DispatchStatus
+
+        task.state = TaskState.PAUSED
+        task.runtime_state = RUNTIME_PAUSED
+        task.dispatch_status = DispatchStatus.READY
+        task.updated_at = datetime.utcnow()
+        db.add(task)
+        await db.flush()
+        return
     if task is None or task.state != TaskState.IN_PROGRESS:
         return
     # Keep the lifecycle diagnosis and the actual runtime fence in the same
@@ -624,6 +643,51 @@ async def block_stalled_legacy_tasks(db: AsyncSession, *, now: datetime | None =
     return len(stale_ids)
 
 
+async def settle_abandoned_pausing(db: AsyncSession, *, now: datetime | None = None) -> int:
+    """Settle PAUSING tasks that no run is left to acknowledge.
+
+    PAUSING becomes PAUSED when the run being paused finishes (finalize_run).
+    If that never happens — the run settled from a stale view of the task, or
+    it died without a session left for the stall checks below to find — the
+    task stays PAUSING for good. It then counts as live work everywhere, so
+    the room's container is never reaped and its billing interval never
+    closes: 19.7 h on the live stack for a room closed by its user.
+
+    Abandoned means no open proxy session for the task and either the runtime
+    already settled (anything but running / stop_requested) or the stop request
+    went unanswered past the kill threshold.
+    """
+    from app.core.task_runtime import RUNTIME_RUNNING, RUNTIME_STOP_REQUESTED
+
+    now = now or datetime.now(timezone.utc)
+    kill_cutoff = (now - _kill_threshold()).replace(tzinfo=None)
+    open_task_ids = select(CmAgentProxySession.task_id).where(
+        CmAgentProxySession.closed_at.is_(None),
+        CmAgentProxySession.task_id.is_not(None),
+    )
+    abandoned = (
+        await db.execute(
+            select(Task.id).where(
+                Task.state == TaskState.PAUSING,
+                Task.id.not_in(open_task_ids),
+                or_(
+                    Task.runtime_state.not_in([RUNTIME_RUNNING, RUNTIME_STOP_REQUESTED]),
+                    Task.updated_at < kill_cutoff,
+                ),
+            )
+        )
+    ).scalars().all()
+    for task_id in abandoned:
+        # block_stalled_task settles a PAUSING task to PAUSED (and READY).
+        await block_stalled_task(task_id, "pause_abandoned", "", db)
+    if abandoned:
+        logger.warning(
+            "watchdog: settled %d abandoned PAUSING task(s) to PAUSED: %s",
+            len(abandoned), abandoned,
+        )
+    return len(abandoned)
+
+
 async def run_watchdog_cycle(db: AsyncSession, *, now: datetime | None = None) -> None:
     """One watchdog pass: emit session_stalled statuses, kill dead sessions."""
     now = now or datetime.now(timezone.utc)
@@ -631,6 +695,7 @@ async def run_watchdog_cycle(db: AsyncSession, *, now: datetime | None = None) -
     kill_cutoff = now - _kill_threshold()
 
     await block_stalled_legacy_tasks(db, now=now)
+    await settle_abandoned_pausing(db, now=now)
     await close_idle_user_sessions(db, now=now)
     await close_stale_plan_sessions(db, reason="timeout", now=now)
 

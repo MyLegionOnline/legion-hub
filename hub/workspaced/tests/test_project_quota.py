@@ -117,6 +117,33 @@ async def test_run_treats_stderr_as_failure_even_with_exit_zero(tmp_path, monkey
 
 
 @pytest.mark.asyncio
+async def test_run_accepts_symlink_notes_but_not_a_real_error_next_to_them(tmp_path, monkeypatch):
+    """``project -s`` over node_modules notes every symlink on stderr; that
+    alone must not fail a room start (production 2026-10-30)."""
+    manager = XfsProjectQuotaManager(mode="required", data_dir=str(tmp_path))
+    skipped = b"xfs_quota: skipping special file /data/room/node_modules/.bin/vite\n"
+    replies = iter([
+        (b"Setting up project 10042 (path /data/room)...\n", skipped * 3),
+        (b"", skipped + b"xfs_quota: cannot set project on /data/room/x: Permission denied\n"),
+    ])
+
+    class _Proc:
+        returncode = 0
+
+        async def communicate(self):
+            return next(replies)
+
+    async def _spawn(*_args, **_kwargs):
+        return _Proc()
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _spawn)
+
+    assert "Setting up project" in await manager._run("project -s -p /data/room 10042")
+    with pytest.raises(ProjectQuotaError, match="Permission denied"):
+        await manager._run("project -s -p /data/room 10042")
+
+
+@pytest.mark.asyncio
 async def test_configure_fails_when_the_limit_does_not_read_back(tmp_path):
     data_dir = tmp_path / "data"
     (data_dir / "room-a").mkdir(parents=True)

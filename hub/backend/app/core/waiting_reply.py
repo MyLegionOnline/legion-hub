@@ -381,6 +381,89 @@ async def _continue_direct_session_task(
     await process_user_turn(session, turn, db)
 
 
+async def _dialogue_owning_task(task: Task, db: AsyncSession):
+    """The open dialogue still working on *task*, if any.
+
+    Either the session that recorded the task or one that took it over
+    (rotation, an earlier resume) — both keep its id in their snapshot.
+    """
+    from app.core.session_work import SNAPSHOT_TASK_ID
+    from app.models.session import Session
+
+    rows = (
+        await db.execute(
+            select(Session).where(
+                Session.room_id == task.room_id,
+                Session.kind.in_(("user_agent_p1", "user_agent_p2")),
+                Session.closed_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    for session in rows:
+        snap = session.context_snapshot or {}
+        if session.id == task.origin_session_id or snap.get(SNAPSHOT_TASK_ID) == str(task.id):
+            return session
+    return None
+
+
+async def resume_direct_session_task(
+    room_id: UUID, user_id: UUID, task_id: UUID, feedback: str
+) -> None:
+    """The board's Start / Back to Work / Unblock on a ``direct_session`` task.
+
+    Such a task lives in the user ↔ agent dialogue, so it is continued there —
+    never through the dispatcher, which runs it as a planned task (and routes a
+    media-capable agent's task into image generation). Runs in the background
+    with its own DB session: a dialogue turn takes minutes.
+    """
+    from sqlalchemy.orm import sessionmaker
+
+    from app.db.session import engine
+    from app.repositories.session import SessionRepository
+    from app.core.user_sessions import close_user_session_gracefully, open_session_context
+
+    maker = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with maker() as db:
+        room = await db.get(Room, room_id)
+        user = await db.get(User, user_id)
+        task = await db.get(Task, task_id)
+        if room is None or user is None or task is None:
+            return
+        await clear_task_awaiting(task, db)
+
+        owner = await _dialogue_owning_task(task, db)
+        if owner is not None:
+            # The work is already running (or waiting) in that dialogue; a second
+            # executor on the same branch would fight it.
+            await _post(
+                room.id,
+                f"'{task.title}' is still in the open dialogue with "
+                f"@{await _nick(task.assigned_agent_id, db)} — write there to continue it.",
+                db, task.id,
+            )
+            await db.commit()
+            return
+
+        existing = await SessionRepository(db).find_open_user_session(room.id, user.id)
+        if existing is not None:
+            if await open_session_context(existing, db) is not None:
+                await _post(
+                    room.id,
+                    f"Could not resume '{task.title}': another dialogue is open in "
+                    "this room. Finish it, then press the button again.",
+                    db, task.id,
+                )
+                await db.commit()
+                return
+            # Stale: the next chat message would close it anyway.
+            await close_user_session_gracefully(
+                existing, db, rotation_reason="not_continuable",
+            )
+
+        await _continue_direct_session_task(room, user, task, db, feedback, "")
+        await db.commit()
+
+
 async def _nick(agent_id: UUID | None, db: AsyncSession) -> str:
     if agent_id is None:
         return "the agent"

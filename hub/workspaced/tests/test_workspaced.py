@@ -143,6 +143,21 @@ class TestDockerManager:
         assert config["HostConfig"]["PidsLimit"] == 777
 
     @pytest.mark.asyncio
+    async def test_start_sizes_thread_hints_to_cpu_quota(self, mgr):
+        container = _make_container_mock()
+        mgr._docker.containers.get = AsyncMock(side_effect=_not_found_error())
+        mgr._docker.containers.create_or_replace = AsyncMock(return_value=container)
+
+        # Half a core still gets one worker; 1.5 cores round up to two.
+        for milli, jobs in ((500, "1"), (1500, "2")):
+            await mgr.start(ROOM_ID, StartRequest(cpu_limit_milli=milli))
+            _, config = mgr._docker.containers.create_or_replace.await_args.args
+            env = dict(item.split("=", 1) for item in config["Env"])
+            assert env["OMP_NUM_THREADS"] == jobs
+            assert env["CARGO_BUILD_JOBS"] == jobs
+            assert env["GOMAXPROCS"] == jobs
+
+    @pytest.mark.asyncio
     async def test_workspace_network_isolated_and_off_switch_wins(self, mgr, monkeypatch):
         container = _make_container_mock()
         mgr._docker.containers.get = AsyncMock(side_effect=_not_found_error())

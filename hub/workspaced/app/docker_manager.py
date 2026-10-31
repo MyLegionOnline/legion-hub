@@ -110,6 +110,29 @@ def memory_from_stats(stats: Any) -> dict[str, Optional[float]]:
     }
 
 
+def cpu_quota_env(cpu_limit_milli: int) -> list[str]:
+    """Thread-count hints that match the room's CPU quota, not the host.
+
+    A container sees every host core: ``nproc`` printed 12 in a room capped
+    at half a core, so ``make -j$(nproc)``, BLAS pools and parallel builds
+    ran a dozen workers on that half core and thrashed or hit the memory
+    limit. GNU ``nproc`` honours OMP_NUM_THREADS, which also sizes the
+    OpenMP/BLAS pools; the rest pin common build tools that would otherwise
+    count host cores themselves.
+    """
+    jobs = str(max(1, -(-cpu_limit_milli // 1000)))
+    return [
+        f"OMP_NUM_THREADS={jobs}",
+        f"OPENBLAS_NUM_THREADS={jobs}",
+        f"MKL_NUM_THREADS={jobs}",
+        f"CARGO_BUILD_JOBS={jobs}",
+        f"CMAKE_BUILD_PARALLEL_LEVEL={jobs}",
+        f"GOMAXPROCS={jobs}",
+        f"PYTEST_XDIST_AUTO_NUM_WORKERS={jobs}",
+        f"UV_THREADPOOL_SIZE={max(2, int(jobs))}",
+    ]
+
+
 def _validate_secret_path(path: str) -> str:
     norm = posixpath.normpath(path)
     if norm != path or not norm.startswith(SECRETS_DIR + "/") or norm == SECRETS_DIR:
@@ -301,6 +324,7 @@ class DockerManager:
             "Cmd": ["sleep", "infinity"],
             "WorkingDir": "/workspace",
             "User": f"{WORKSPACE_UID}:{WORKSPACE_GID}",
+            "Env": cpu_quota_env(req.cpu_limit_milli),
             "HostConfig": host_config,
         }
 

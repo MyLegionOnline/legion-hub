@@ -45,7 +45,7 @@ const BOARD_STATES = [
 const RUNNING_TRANSITIONS = {
   assigned:         [{ state: 'in_progress', label: 'Start' }],
   in_progress:      [{ state: 'pausing', label: 'Pause' }, { state: 'waiting_review', label: 'Review' }, { state: 'blocked', label: 'Block' }, { state: 'cancelled', label: 'Cancel' }],
-  pausing:          [],
+  pausing:          [{ state: 'in_progress', label: 'Resume' }],
   paused:           [{ state: 'in_progress', label: 'Resume' }, { state: 'cancelled', label: 'Cancel' }],
   resuming:         [],
   waiting_review:   [{ state: 'in_progress', label: 'Rework' }, { state: 'completed', label: 'Complete' }],
@@ -223,7 +223,7 @@ function TaskCard({ task, roomId, token, agents, onRefresh, onShowDiff, liveStat
               style={{ background: 'rgba(251,191,36,0.08)', color: '#fbbf24', border: '1px solid rgba(251,191,36,0.25)' }}
             >
               <AlertCircle size={10} />
-              Stop did not complete — Retry will restart the task
+              Stop did not complete — Resume continues from the saved conversation, Retry starts over
             </div>
           )}
 

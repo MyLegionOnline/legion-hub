@@ -430,7 +430,7 @@ async def workspace_proxy(room_id: str, port: int, path: str = "", qs: str = "")
 )
 async def workspace_tree(room_id: str):
     try:
-        return get_tree(room_id)
+        return await asyncio.to_thread(get_tree, room_id)
     except Exception as e:
         logger.exception("Failed to get tree for %s", room_id)
         raise HTTPException(status_code=500, detail=str(e))
@@ -461,7 +461,8 @@ async def workspace_snapshot(
 ):
     """Return a consistent volume snapshot; RepoFile is never consulted."""
     try:
-        return get_snapshot(
+        return await asyncio.to_thread(
+            get_snapshot,
             room_id,
             preview_paths=paths,
             max_previews=max(0, min(max_previews, 100)),
@@ -530,7 +531,9 @@ async def workspace_write_file(room_id: str, path: str, req: FileWriteRequest):
     from app.git_ops import MainBranchProtectedError
     try:
         path = normalize_workspace_path(path)
-        result = _write_file(room_id, path, req.content, commit_message=req.commit_message)
+        result = await asyncio.to_thread(
+            _write_file, room_id, path, req.content, commit_message=req.commit_message
+        )
         return FileWriteResponse(**result)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -555,7 +558,9 @@ async def workspace_delete_file(
     from app.git_ops import MainBranchProtectedError
     try:
         path = normalize_workspace_path(path)
-        deleted = _delete_file(room_id, path, commit_message=commit_message)
+        deleted = await asyncio.to_thread(
+            _delete_file, room_id, path, commit_message=commit_message
+        )
     except WorkspacePathError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except MainBranchProtectedError as exc:
@@ -575,7 +580,9 @@ async def workspace_import(room_id: str, req: ImportRequest):
             {**item, "path": normalize_workspace_path(str(item.get("path") or ""))}
             for item in req.files
         ]
-        result = import_files(room_id, req.files, commit_message=req.commit_message)
+        result = await asyncio.to_thread(
+            import_files, room_id, req.files, commit_message=req.commit_message
+        )
         return ImportResponse(**result)
     except WorkspacePathError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

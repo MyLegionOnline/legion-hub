@@ -22,6 +22,14 @@ logger = logging.getLogger("workspaced.project_quota")
 
 _ACCOUNTING_ON = re.compile(r"Accounting:\s*ON", re.IGNORECASE)
 _ENFORCEMENT_ON = re.compile(r"Enforcement:\s*ON", re.IGNORECASE)
+# ``project -s`` walks the room tree and notes every symlink it cannot tag
+# (node_modules/.bin is full of them). A symlink holds no blocks of its own,
+# so the note is not a failure.
+_SKIPPED_SPECIAL = re.compile(r"^xfs_quota: skipping special file ")
+
+
+def _without_skipped(text: str) -> str:
+    return "\n".join(line for line in text.splitlines() if not _SKIPPED_SPECIAL.match(line))
 
 
 class ProjectQuotaError(RuntimeError):
@@ -54,12 +62,13 @@ class XfsProjectQuotaManager:
         except FileNotFoundError as exc:
             raise ProjectQuotaError("xfs_quota is not installed in workspaced") from exc
         stdout, stderr = await process.communicate()
-        out_text = stdout.decode("utf-8", "replace").strip()
-        err_text = stderr.decode("utf-8", "replace").strip()
+        out_text = _without_skipped(stdout.decode("utf-8", "replace")).strip()
+        err_text = _without_skipped(stderr.decode("utf-8", "replace")).strip()
         output = "\n".join(part for part in (out_text, err_text) if part)
         # ``xfs_quota -c`` exits 0 even when a command failed (missing device
         # node, bad path, ...): the only signal is a message on stderr.  A
-        # successful command prints nothing there.
+        # successful command prints nothing there, apart from the notes on
+        # symlinks that _without_skipped drops.
         failed = process.returncode != 0 or bool(err_text) or any(
             line.startswith("xfs_quota:") for line in out_text.splitlines()
         )

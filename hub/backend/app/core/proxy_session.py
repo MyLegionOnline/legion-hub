@@ -145,7 +145,7 @@ from app.models.agent import Agent
 from app.models.message import TASK_DISPATCH_FAILED, TASK_DISPATCH_STARTED, TOOL_LIMIT_REACHED
 from app.models.room import Room
 from app.models.session.base import Session
-from app.models.task import DispatchStatus, Task, TaskState
+from app.models.task import TASK_ORIGIN_DIRECT_SESSION, DispatchStatus, Task, TaskState
 from app.core import run_clock
 from app.repositories.session import SessionRepository
 from app.schemas.proxy import ProxyMessageCreate
@@ -5677,6 +5677,16 @@ async def _run_proxy_loop(
 # ---------------------------------------------------------------------------
 
 
+def _routes_to_image_generation(task: Task, agent: Agent) -> bool:
+    """A media-capable agent's task goes to the image pipeline — unless the
+    agent recorded it from a dialogue, where it did the work with its ordinary
+    tools (code, render) and an image-prompt pass has nothing to act on."""
+    media = (agent.llm_config or {}).get("media") or {}
+    if media.get("capability") != "image_generation":
+        return False
+    return getattr(task, "origin", None) != TASK_ORIGIN_DIRECT_SESSION
+
+
 async def _close_media_session(
     session: Session,
     task: Task,
@@ -6636,8 +6646,7 @@ async def prepare_task_dispatch(
         plan_row = plan_result.first()
         plan_id = plan_row[0] if plan_row else None
 
-    media = (agent.llm_config or {}).get("media") or {}
-    is_media_task = media.get("capability") == "image_generation"
+    is_media_task = _routes_to_image_generation(task, agent)
     if is_media_task:
         return TaskDispatchContext(task.goal_id, plan_id, agent, None, True)
 
@@ -6903,8 +6912,7 @@ async def handle_task_created(
     agent_result = await db.execute(select(Agent).where(Agent.id == task.assigned_agent_id))
     agent = agent_result.scalars().first()
     if agent is not None:
-        agent_media = (agent.llm_config or {}).get("media") or {}
-        if agent_media.get("capability") == "image_generation":
+        if _routes_to_image_generation(task, agent):
             await _handle_image_generation_task(task, agent, goal_id, plan_id, room_id, db)
             return
 

@@ -161,6 +161,21 @@ async def open_dialogue_task(session, db):
     return task if str(state) in _OPEN_TASK_STATES else None
 
 
+async def carry_dialogue_task(previous, successor, db) -> None:
+    """Hand the dialogue's open task over to the session that continues it.
+
+    Rotation closes an over-long dialogue and replays the turn into a fresh
+    session row. Without this the successor knows nothing of the task its
+    predecessor opened: its first write starts a ``session/<id>`` branch off
+    the working branch (the agent finds its files gone) and the next
+    finalization records a second task for the same conversation.
+    """
+    task = await open_dialogue_task(previous, db)
+    if task is None:
+        return
+    await _remember(successor, db, **{SNAPSHOT_TASK_ID: str(task.id)})
+
+
 # ── the just-in-time pin ─────────────────────────────────────────────────────
 
 def _is_dialogue_session(session) -> bool:
@@ -317,6 +332,19 @@ def _strip_mention(text: str) -> str:
     return tail.strip() if tail.strip() else head.strip()
 
 
+# ``user_sessions._carryover_prefix`` opens the first message of a rotated
+# session with a bridge to its predecessor. It is context for the model, not
+# what the user asked, so it must not become a task's title or request.
+CARRYOVER_MARKER = "[Conversation continued:"
+
+
+def _strip_carryover(text: str) -> str:
+    if not text.lstrip().startswith(CARRYOVER_MARKER):
+        return text
+    _, sep, rest = text.rpartition("]\n\n")
+    return rest if sep else ""
+
+
 def derive_task_title(user_request: str | None) -> str:
     """A board title out of the request that started the burst — no LLM call.
 
@@ -324,7 +352,7 @@ def derive_task_title(user_request: str | None) -> str:
     reader, so its first line is already a serviceable title; anything cleverer
     would cost a model round-trip for a label.
     """
-    text = " ".join(_strip_mention(str(user_request or "")).split())
+    text = " ".join(_strip_mention(_strip_carryover(str(user_request or ""))).split())
     if not text:
         return _FALLBACK_TITLE
 
@@ -349,7 +377,7 @@ def derive_task_description(user_request: str | None, agent_reply: str | None) -
     This is the whole "spec": no ChatMaster pass, no approval. It is also what
     a re-dispatch would feed the agent, so the previous result belongs in it.
     """
-    request = str(user_request or "").strip()[:_MAX_REQUEST_IN_DESCRIPTION]
+    request = _strip_carryover(str(user_request or "")).strip()[:_MAX_REQUEST_IN_DESCRIPTION]
     reply = str(agent_reply or "").strip()[:_MAX_REPLY_IN_DESCRIPTION]
     parts = [request or _FALLBACK_TITLE]
     if reply:

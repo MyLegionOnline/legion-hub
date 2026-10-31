@@ -35,11 +35,13 @@ _RUNNING_WORKSPACE_STATES = ("starting", "running", "draining")
 
 
 def _live_task_states() -> list:
-    # PAUSING is already on its way to a stop; BLOCKED is paused along with
-    # these by pause_workspace_tasks but is not by itself work in progress.
+    # PAUSING is included: pause_workspace_tasks re-fences a live run and
+    # settles one whose run is gone to PAUSED. Skipping it left a wedged
+    # PAUSING task alive through every Close press. BLOCKED is paused along
+    # with these by pause_workspace_tasks but is not by itself work in progress.
     from app.models.task import TaskState
 
-    return [TaskState.IN_PROGRESS, TaskState.RESUMING]
+    return [TaskState.IN_PROGRESS, TaskState.PAUSING, TaskState.RESUMING]
 
 
 async def close_room(

@@ -26,6 +26,7 @@ from app.core.watchdog import (
     cleanup_orphaned_sessions,
     close_stale_plan_sessions,
     run_watchdog_cycle,
+    settle_abandoned_pausing,
 )
 from app.models.task import TaskState
 
@@ -117,6 +118,12 @@ def _no_memory_flush():
         # close_stale_plan_sessions tests at the bottom of this file.
         patch(
             "app.core.watchdog.close_stale_plan_sessions",
+            new_callable=AsyncMock,
+            return_value=0,
+        ),
+        # Likewise the abandoned-PAUSING sweep (tests near the bottom).
+        patch(
+            "app.core.watchdog.settle_abandoned_pausing",
             new_callable=AsyncMock,
             return_value=0,
         ),
@@ -561,6 +568,31 @@ async def test_orphan_cleanup_closes_sessions_and_blocks_tasks(_no_memory_flush)
 
 
 @pytest.mark.asyncio
+async def test_orphan_cleanup_settles_a_pausing_task_to_paused(_no_memory_flush):
+    """A room stopped mid-task, then a restart: the run that would have
+    acknowledged the pause is gone (production 2026-10-30)."""
+    task = _make_task(TaskState.PAUSING)
+    task.dispatch_status = "dispatched"
+    session = _make_proxy_session(last_activity_minutes_ago=1)
+    session.task_id = task.id
+
+    db = _make_db([
+        _result(all_rows=[session]),  # open proxy sessions
+        _result(first_row=task),      # task lookup
+        _result(all_rows=[]),         # open user-facing sessions — none
+    ])
+
+    with patch("app.core.watchdog.emit_event", new_callable=AsyncMock) as mock_event:
+        await cleanup_orphaned_sessions(db, now=NOW)
+
+    assert task.state == TaskState.PAUSED
+    assert task.runtime_state == "paused"
+    assert task.dispatch_status == "ready"
+    event_types = [c.kwargs["event_type"] for c in mock_event.await_args_list]
+    assert "TASK_STALLED" not in event_types
+
+
+@pytest.mark.asyncio
 async def test_orphan_cleanup_noop_when_no_open_sessions():
     db = _make_db([
         _result(all_rows=[]),  # open proxy sessions — none
@@ -645,3 +677,47 @@ async def test_orphan_cleanup_sweeps_stale_plan_sessions():
 
     assert closed == 3
     sweep.assert_awaited_once_with(db, reason="orphaned_restart", now=NOW)
+
+
+# ---------------------------------------------------------------------------
+# settle_abandoned_pausing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_abandoned_pausing_task_settles_to_paused():
+    """Production 2026-10-30: the run settled its runtime as "stopped" from a
+    stale view, the task stayed PAUSING, and the room billed for 19.7 h."""
+    task = _make_task(TaskState.PAUSING, run_id="run-1")
+    task.runtime_state = "stopped"
+    task.dispatch_status = "dispatched"
+
+    db = _make_db([
+        _result(all_rows=[task.id]),  # abandoned PAUSING scan
+        _result(first_row=task),      # block_stalled_task's own lookup
+    ])
+
+    with patch("app.core.watchdog.emit_event", new_callable=AsyncMock) as mock_event:
+        settled = await settle_abandoned_pausing(db, now=NOW)
+
+    assert settled == 1
+    assert task.state == TaskState.PAUSED
+    assert task.runtime_state == "paused"
+    assert task.dispatch_status == "ready"
+    mock_event.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_abandoned_pausing_scan_spares_a_live_run():
+    db = _make_db([_result(all_rows=[])])
+
+    settled = await settle_abandoned_pausing(db, now=NOW)
+
+    assert settled == 0
+    sql = str(db.execute.await_args_list[0].args[0].compile(
+        compile_kwargs={"literal_binds": True}
+    ))
+    # A run still alive (open proxy session, or a runtime not yet settled and
+    # inside the kill window) is left to acknowledge the pause itself.
+    assert "cm_agent_proxy_session" in sql
+    assert "'running'" in sql and "'stop_requested'" in sql

@@ -348,7 +348,7 @@ const USER_TRANSITIONS = {
   approved:         [{ state: 'assigned', label: 'Assign' }, { state: 'in_progress', label: 'Start' }],
   assigned:         [{ state: 'in_progress', label: 'Start' }],
   in_progress:      [{ state: 'pausing', label: 'Pause' }, { state: 'waiting_review', label: 'Send for Review' }, { state: 'blocked', label: 'Mark Blocked' }, { state: 'cancelled', label: 'Cancel' }],
-  pausing:          [],
+  pausing:          [{ state: 'in_progress', label: 'Resume' }],
   paused:           [{ state: 'in_progress', label: 'Resume' }, { state: 'cancelled', label: 'Cancel' }],
   resuming:         [],
   waiting_review:   [{ state: 'in_progress', label: 'Back to Work' }, { state: 'completed', label: 'Complete' }],
@@ -659,7 +659,7 @@ function TaskRow({ task, roomId, token, agents, onRefresh, liveStatus }) {
               style={{ background: 'rgba(251,191,36,0.08)', color: '#fbbf24', border: '1px solid rgba(251,191,36,0.25)' }}
             >
               <AlertCircle size={11} />
-              Stop did not complete — Retry will restart the task
+              Stop did not complete — Resume continues from the saved conversation, Retry starts over
             </div>
           )}
 

@@ -2427,7 +2427,8 @@ def _carryover_prefix(previous: Session) -> str:
     """Bridge text prepended to the first user message of a successor session.
 
     The successor gets memory-layer bricks plus this summary — never the raw
-    transcript of the session it replaced (§6.3 of the plan).
+    transcript of the session it replaced (§6.3 of the plan). The opening
+    words are ``session_work.CARRYOVER_MARKER`` — task titles skip the bridge.
     """
     summary = (previous.summary or "").strip()[:_CARRYOVER_SUMMARY_MAX_CHARS]
     if not summary:
@@ -2611,6 +2612,18 @@ async def _rotate_user_session(
         await db.flush()
 
     await close_user_session_gracefully(session, db, rotation_reason=reason)
+
+    # After the close: its Gate 1 may have just recorded the task, or merged
+    # it — only a task still open is carried over.
+    try:
+        from app.core.session_work import carry_dialogue_task
+
+        await carry_dialogue_task(session, successor, db)
+    except Exception as exc:
+        logger.warning(
+            "user_sessions: could not carry the dialogue task from %s to %s: %s",
+            session.id, successor.id, exc,
+        )
 
     await emit_event(
         room_id=session.room_id,

@@ -452,8 +452,25 @@ def write_file(
     """Write content to the workspace volume. Returns {path, size, commit_sha}."""
     from app.git_ops import git_commit, git_init, is_git_repo
 
-    root = _workspace_root(room_id)
     ensure_generation(room_id)
+    result = _write_volume_file(room_id, path, content)
+
+    # Room-private files live on the volume only; they are never committed, so
+    # an upload cannot also sweep unrelated pending changes into a "user:" commit.
+    if commit_message and not _is_userfiles_path(result["path"]):
+        if not is_git_repo(room_id):
+            git_init(room_id)
+        sha = git_commit(room_id, commit_message)
+        result["commit_sha"] = sha
+
+    result["generation"] = sync_generation(room_id)
+
+    return result
+
+
+def _write_volume_file(room_id: str, path: str, content: str) -> dict[str, Any]:
+    """Write one file without touching git or the generation; callers own both."""
+    root = _workspace_root(room_id)
     full = _safe_full_path(root, path)
     full.parent.mkdir(parents=True, exist_ok=True)
 
@@ -479,24 +496,12 @@ def write_file(
             max_file_bytes=config.SYNC_MAX_FILE_BYTES,
         ).match(relative, size_bytes=stat.st_size)
     )
-    result: dict[str, Any] = {
+    return {
         "path": "/" + relative,
         "size": stat.st_size,
         "sync_ignored": decision.ignored,
         "sync_ignore_source": decision.source,
     }
-
-    # Room-private files live on the volume only; they are never committed, so
-    # an upload cannot also sweep unrelated pending changes into a "user:" commit.
-    if commit_message and not _is_userfiles_path(relative):
-        if not is_git_repo(room_id):
-            git_init(room_id)
-        sha = git_commit(room_id, commit_message)
-        result["commit_sha"] = sha
-
-    result["generation"] = sync_generation(room_id)
-
-    return result
 
 
 def delete_file(
@@ -537,10 +542,11 @@ def import_files(
 
     imported = 0
     errors: list[dict[str, str]] = []
+    # One generation pass for the whole batch, not two per file.
     ensure_generation(room_id)
     for f in files:
         try:
-            write_file(room_id, f["path"], f["content"])
+            _write_volume_file(room_id, f["path"], f["content"])
             imported += 1
         except Exception as exc:
             errors.append({"path": f["path"], "error": str(exc)})

@@ -543,6 +543,23 @@ async def _emit_resolved(rid: UUID, task: Task, decision: str, detail: str, db: 
     )
 
 
+async def _maybe_complete_goal(rid: UUID, task: Task, db: AsyncSession) -> None:
+    """The resolved task may be the last one its goal was waiting for.
+
+    Without this the goal stayed ACTIVE with every task done: its
+    ``goal → dev`` review gate never opened, so nothing in the UI could merge
+    the goal branch (production, 2026-10-31).
+    """
+    if not task.goal_id:
+        return
+    from app.core.goal_progress import maybe_complete_goal
+
+    try:
+        await maybe_complete_goal(task.goal_id, rid, db)
+    except Exception as exc:  # noqa: BLE001 - the merge itself already happened
+        logger.warning("divergence: goal %s completion check failed: %s", task.goal_id, exc)
+
+
 async def resolve_divergence(
     room_id: "UUID | str",
     task: Task,
@@ -604,6 +621,7 @@ async def resolve_divergence(
             metadata={"task_id": str(task.id), "branch": branch, "target": base,
                       "merge_commit": task.merge_commit, "via": "divergence_take_branch"},
         )
+        await _maybe_complete_goal(rid, task, db)
         await db.commit()
         return {"ok": True, "decision": decision, "detail": "merged", "merge_commit": task.merge_commit}
 
@@ -626,6 +644,7 @@ async def resolve_divergence(
             f"Branch {branch} deleted (backup: {res.get('backup_ref')}). The task was cancelled.",
             db, branch=branch, backup_ref=res.get("backup_ref"),
         )
+        await _maybe_complete_goal(rid, task, db)
         await db.commit()
         return {"ok": True, "decision": decision, "detail": "deleted",
                 "backup_ref": res.get("backup_ref")}

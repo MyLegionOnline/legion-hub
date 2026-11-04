@@ -121,14 +121,14 @@ export function NavSidebar({ tab, onTab, onMarketplace, accountUrl, legalUrls, u
 
       {/* Mobile: bottom nav bar */}
       <nav
-        className="md:hidden fixed bottom-0 left-0 right-0 z-50 flex items-center justify-around px-4 py-2 border-t"
+        className="md:hidden fixed bottom-0 left-0 right-0 z-50 flex items-center justify-around px-1 py-2 border-t"
         style={{ background: 'var(--bg-panel)', borderColor: 'var(--border)', height: 60 }}
       >
         {NAV_ITEMS.map(({ id, icon: Icon, label }) => (
           <Spot key={id} active={guided(id)} hint={guide?.text} placement="top-end">
             <button
               onClick={() => onTab(id)}
-              className="flex flex-col items-center gap-0.5 px-4 py-1 rounded-xl transition-all"
+              className="flex flex-col items-center gap-0.5 px-1.5 py-1 rounded-xl transition-all"
               style={{ color: tab === id ? 'var(--accent-light)' : 'var(--text-secondary)' }}
             >
               <Icon size={22} />
@@ -137,7 +137,7 @@ export function NavSidebar({ tab, onTab, onMarketplace, accountUrl, legalUrls, u
           </Spot>
         ))}
         {onMarketplace && (
-          <button onClick={onMarketplace} className="flex flex-col items-center gap-0.5 px-4 py-1 rounded-xl transition-all" style={{ color: 'var(--text-secondary)' }}><Store size={22} /><span className="text-[10px] font-medium">Market</span></button>
+          <button onClick={onMarketplace} className="flex flex-col items-center gap-0.5 px-1.5 py-1 rounded-xl transition-all" style={{ color: 'var(--text-secondary)' }}><Store size={22} /><span className="text-[10px] font-medium">Market</span></button>
         )}
       </nav>
     </>

@@ -201,12 +201,49 @@ async def unassign_room_mcp_server(
     await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
+ROOM_LIMIT_REACHED = "room_limit_reached"
+
+
+async def _require_room_slot(user_id: UUID, db: AsyncSession) -> None:
+    """A new room needs a free slot under the plan's ``max_rooms`` (None: no
+    cap). Frozen rooms count too: freezing is how a shrunken plan keeps the
+    rooms it already had, not a way to hold more."""
+    from app.core.workspace_quota import get_effective_limits
+
+    limits = await get_effective_limits(user_id, db)
+    cap = limits.get("max_rooms")
+    if isinstance(cap, bool) or not isinstance(cap, (int, float)):
+        return
+    owned = (await db.execute(
+        select(func.count(Room.id)).where(
+            Room.creator_id == user_id, Room.deletion_started_at.is_(None)
+        )
+    )).scalar_one()
+    if owned < int(cap):
+        return
+    tier = limits.get("plan_tier") or ""
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "code": ROOM_LIMIT_REACHED,
+            "max_rooms": int(cap),
+            "rooms": owned,
+            "plan_tier": tier,
+            "message": (
+                f"Your '{tier}' plan allows up to {int(cap)} rooms, and you have {owned}. "
+                "Delete a room you no longer need to create a new one, or upgrade the plan."
+            ),
+        },
+    )
+
+
 @router.post("/", response_model=RoomOut)
 async def create_room(
     room_in: RoomCreate,
     db: AsyncSession = Depends(get_session),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
+    await _require_room_slot(current_user.id, db)
     db_obj = Room(
         name=room_in.name,
         type=room_in.type,

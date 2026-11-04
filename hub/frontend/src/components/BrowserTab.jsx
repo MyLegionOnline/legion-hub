@@ -159,6 +159,27 @@ export function BrowserTab({ room, token, serviceEventVersion = 0, fileEventVers
     }
   }, [request, roomId]);
 
+  // The iframe has already redeemed the ticket in browserUrl, and the gateway
+  // answers a reused ticket with 404. A new tab needs a ticket of its own; the
+  // window is opened synchronously in the click so it is not blocked as a popup.
+  const openInNewTab = useCallback(async () => {
+    if (!selected || selected.kind === 'worker') return;
+    const tab = window.open('about:blank', '_blank');
+    if (!tab) return;
+    tab.opener = null;
+    try {
+      const ticket = await request(`/api/v1/rooms/${roomId}/workspace/services/${selected.slug}/open-ticket`, { method: 'POST' });
+      const issued = new URL(ticket.browser_url);
+      const destination = new URL(normalizedPath(path, selected.default_path), issued.origin);
+      const previewTicket = issued.searchParams.get('ticket');
+      if (previewTicket) destination.searchParams.set('ticket', previewTicket);
+      tab.location.replace(destination.toString());
+    } catch (error) {
+      tab.close();
+      setActionError(error.message || 'Could not open the preview');
+    }
+  }, [request, roomId, selected, path]);
+
   useEffect(() => {
     if (!pendingOpen || !selected || selected.slug !== pendingOpen.slug || selected.runtime_state !== 'ready') return;
     const intent = pendingOpen;
@@ -343,7 +364,7 @@ export function BrowserTab({ room, token, serviceEventVersion = 0, fileEventVers
         <div className="flex items-center rounded-xl overflow-hidden" style={{ border: '1px solid var(--border)' }}>
           {[{ id: 'desktop', icon: <Monitor size={13} />, title: 'Desktop' }, { id: 'mobile', icon: <Smartphone size={13} />, title: 'Mobile (375×812)' }].map(mode => <button key={mode.id} onClick={() => setViewMode(mode.id)} title={mode.title} className="p-1.5" style={{ background: viewMode === mode.id ? 'var(--accent-dim)' : 'transparent', color: viewMode === mode.id ? 'var(--accent-light)' : 'var(--text-muted)' }}>{mode.icon}</button>)}
         </div>
-        <button onClick={() => browserUrl && window.open(browserUrl, '_blank', 'noopener')} disabled={!browserUrl} className="btn-ghost p-1.5" title="Open in a new tab" style={{ opacity: browserUrl ? 1 : 0.4 }}><ExternalLink size={13} style={{ color: 'var(--text-muted)' }} /></button>
+        <button onClick={() => browserUrl && openInNewTab()} disabled={!browserUrl} className="btn-ghost p-1.5" title="Open in a new tab" style={{ opacity: browserUrl ? 1 : 0.4 }}><ExternalLink size={13} style={{ color: 'var(--text-muted)' }} /></button>
       </div>
 
       <div className="flex-1 min-h-0 flex overflow-hidden" style={{ background: 'var(--bg-base)' }}>

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import json
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
@@ -11,10 +12,10 @@ from uuid import UUID, uuid4
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-from app import account_keys, config, oauth_client, oauth_probe, server_terms, urlguard
+from app import account_keys, config, metrics, oauth_client, oauth_probe, server_terms, urlguard
 from app.account_keys import Caller
 from app.cache import CatalogCache
 from app.market_client import MarketClient
@@ -70,6 +71,23 @@ async def request_validation_error(_: Request, __: RequestValidationError) -> JS
     """Never echo invalid request values; they may contain a submitted secret."""
 
     return JSONResponse(status_code=422, content={"detail": "Invalid Gateway request"})
+
+
+@app.middleware("http")
+async def count_requests(request: Request, call_next):
+    """Count every request by route template, never by raw URL (``metrics``)."""
+
+    started = time.monotonic()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        route = request.scope.get("route")
+        path = getattr(route, "path", None) or "unmatched"
+        if path != "/metrics":
+            metrics.observe(path, status, time.monotonic() - started)
 
 
 #: The SSRF perimeter lives in ``urlguard`` so the OAuth metadata probe
@@ -167,6 +185,13 @@ def _effective_isolation(item: dict[str, Any], requested: str | None, *, custom:
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/metrics", include_in_schema=False)
+async def prometheus_metrics() -> PlainTextResponse:
+    """Prometheus metrics; not forwarded by the edge nginx."""
+
+    return PlainTextResponse(metrics.render(), media_type="text/plain; version=0.0.4")
 
 
 def _catalog_token(item: dict[str, Any]) -> str | None:

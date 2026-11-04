@@ -97,7 +97,8 @@ function CreateRoomModal({ agents, token, onCreated, onClose }) {
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail || `HTTP ${res.status}`);
+        const detail = err.detail;
+        throw new Error((typeof detail === 'string' ? detail : detail?.message) || `HTTP ${res.status}`);
       }
       const room = await res.json();
       onCreated({ ...room, lastMessage: '', lastTime: '', unread: 0 });
@@ -303,6 +304,11 @@ export function ChatList({ rooms, agents, selectedId, onSelect, onCloseRoom, tok
 // beyond the meter: a start error — always, transitional states — when
 // the meter is not running.
 const BILLING_DOT = { color: 'var(--success)', title: 'The room is in use — hours are being counted' };
+// The container is stopped but the meter is still open: right after a stop or
+// a switch the interval stays open until the room's work and presence run out
+// (a few minutes, closed by the reconciler). Yellow, so a confirmed stop
+// visibly took effect instead of looking like it was ignored.
+const BILLING_STOPPED_DOT = { color: '#fbbf24', title: 'The room is stopped — hours are counted until its work ends' };
 const RUNTIME_DOT = {
   starting: { color: '#fbbf24', title: 'The room is starting' },
   stopping: { color: '#fbbf24', title: 'The room is stopping' },
@@ -312,7 +318,7 @@ const RUNTIME_DOT = {
 
 function pickRoomDot(billingActive, runtimeStatus) {
   if (runtimeStatus === 'error') return RUNTIME_DOT.error;
-  if (billingActive) return BILLING_DOT;
+  if (billingActive) return runtimeStatus === 'stopped' ? BILLING_STOPPED_DOT : BILLING_DOT;
   return RUNTIME_DOT[runtimeStatus] || null;
 }
 

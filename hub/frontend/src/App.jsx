@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Hash, MoreVertical, Trash2, PauseCircle } from 'lucide-react';
+import { Hash, MoreVertical, Trash2, PauseCircle, ChevronLeft, PanelRight, Square, X } from 'lucide-react';
 import { NavSidebar } from './components/NavSidebar';
 import { ChatList } from './components/ChatList';
 import { ChatWindow } from './components/ChatWindow';
@@ -21,6 +21,7 @@ import { BrowserTab } from './components/BrowserTab';
 import { RoomSecretsPanel } from './components/RoomSecretsPanel';
 import { useAgentStatuses } from './hooks/useAgentStatuses';
 import { useUserEvents } from './hooks/useUserEvents';
+import { useIsMobile } from './hooks/useIsMobile';
 import { AgentDirectoryProvider } from './lib/AgentAvatar';
 import { OnboardingProvider } from './lib/onboarding';
 import { GitStateProvider } from './context/GitStateContext';
@@ -84,6 +85,18 @@ function App() {
   const [roomMenuOpen, setRoomMenuOpen] = useState(false);
   const [pausingAgents, setPausingAgents] = useState(false);
   const roomMenuRef = useRef(null);
+  // Phone layout: one pane at a time. The list (rooms or agents) shows when
+  // nothing is open or when the user asks for it from the bottom nav / back
+  // button; the room panel (goals, git, MCP, memory…) opens from ⋮ over the chat.
+  const isMobile = useIsMobile();
+  const [mobileList, setMobileList] = useState(false);
+  const [roomPanelOpen, setRoomPanelOpen] = useState(false);
+  useEffect(() => { setMobileList(false); setRoomPanelOpen(false); }, [selectedRoom?.id, selectedAgent?.id]);
+  const selectTab = (id) => {
+    if (id === 'chats' || id === 'agents') setMobileList(true);
+    setRoomPanelOpen(false);
+    setTab(id);
+  };
 
   // Ephemeral agent statuses for the selected room (chat upgrade stage 6).
   // ChatWindow feeds WS "agent_status" frames in via `ingest`; the maps flow
@@ -643,6 +656,17 @@ function App() {
         const roomEntry = { ...room, lastMessage: '', lastTime: '', unread: 0 };
         setRooms(prev => [...prev, roomEntry]);
         setSelectedRoom(roomEntry);
+      } else {
+        // The plan's room limit (api/v1/rooms.py, room_limit_reached) and other refusals.
+        const data = await res.json().catch(() => ({}));
+        const detail = data.detail;
+        await showNotice(
+          `Could not open a chat with "${agent.nickname}".
+
+` +
+          ((typeof detail === 'string' ? detail : detail?.message) || `The server responded with error ${res.status}.`)
+        );
+        return;
       }
     } catch {
       // fallback: virtual DM (no sidebar calls will work but chat may work via WS)
@@ -689,7 +713,7 @@ function App() {
         <AgentsList
           agents={agents}
           selectedId={selectedAgent?.id}
-          onSelect={setSelectedAgent}
+          onSelect={(agent) => { setMobileList(false); setSelectedAgent(agent); }}
           onChat={handleAgentChat}
           onCreated={handleAgentCreated}
           token={token}
@@ -701,7 +725,7 @@ function App() {
         rooms={rooms}
         agents={agents.filter(a => !a.system_role)}
         selectedId={selectedRoom?.id}
-        onSelect={handleRoomSelect}
+        onSelect={(room) => { setMobileList(false); handleRoomSelect(room); }}
         onCloseRoom={closeRoom}
         token={token}
         onRoomCreated={(room) => setRooms(prev => [...prev, room])}
@@ -775,15 +799,18 @@ function App() {
       <div className="flex flex-col h-full overflow-hidden">
         {/* Room header — shared across all tabs */}
         <div
-          className="flex items-center justify-between gap-3 px-5 py-3 flex-shrink-0 border-b"
+          className="flex items-center justify-between gap-2 md:gap-3 px-3 md:px-5 py-3 flex-shrink-0 border-b"
           style={{ background: 'var(--bg-panel)', borderColor: 'var(--border)' }}
         >
-          <div className="flex items-center gap-3 flex-1 min-w-0">
-            <div className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0" style={{ background: 'var(--accent-dim)' }}>
+          <div className="flex items-center gap-2 md:gap-3 flex-1 min-w-0">
+            <button className="md:hidden btn-ghost p-1.5 -ml-1 flex-shrink-0" onClick={() => setMobileList(true)} aria-label="Back to rooms">
+              <ChevronLeft size={20} />
+            </button>
+            <div className="hidden md:flex w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0" style={{ background: 'var(--accent-dim)' }}>
               <Hash size={18} style={{ color: 'var(--accent-light)' }} />
             </div>
-            <div>
-              <p className="font-semibold text-sm" style={{ color: 'var(--text-primary)' }}># {selectedRoom.name}</p>
+            <div className="min-w-0">
+              <p className="font-semibold text-sm truncate" style={{ color: 'var(--text-primary)' }}># {selectedRoom.name}</p>
               <p className="text-xs flex items-center gap-1.5" style={{ color: roomConnected ? 'var(--success)' : '#f87171' }}>
                 <span className={`conn-dot ${roomConnected ? 'online' : 'offline'}`} />
                 {/* This is the state of THIS TAB'S SOCKET, not of the room. It used to
@@ -827,7 +854,7 @@ function App() {
             </div>
           </div>
           <div className="relative" ref={roomMenuRef}>
-            <button className="btn-ghost p-2" onClick={() => setRoomMenuOpen(v => !v)}>
+            <button className="btn-ghost p-2" onClick={() => setRoomMenuOpen(v => !v)} aria-label="Room menu">
               <MoreVertical size={18} />
             </button>
             {roomMenuOpen && (
@@ -835,6 +862,26 @@ function App() {
                 className="absolute right-0 top-full mt-1 rounded-xl py-1 z-50 min-w-[160px]"
                 style={{ background: 'var(--bg-panel)', border: '1px solid var(--border)', boxShadow: '0 4px 24px rgba(0,0,0,0.3)' }}
               >
+                {isMobile && (
+                  <button
+                    onClick={() => { setRoomPanelOpen(true); setRoomMenuOpen(false); }}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-xs text-left transition-colors hover:bg-[var(--bg-hover)]"
+                    style={{ color: 'var(--text-primary)' }}
+                  >
+                    <PanelRight size={13} />
+                    Room panel
+                  </button>
+                )}
+                {selectedRoom.billing_active && (
+                  <button
+                    onClick={() => { setRoomMenuOpen(false); closeRoom(selectedRoom); }}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-xs text-left transition-colors hover:bg-[var(--bg-hover)]"
+                    style={{ color: '#fbbf24' }}
+                  >
+                    <Square size={13} />
+                    Stop room
+                  </button>
+                )}
                 <button
                   onClick={pauseAllAgents}
                   disabled={pausingAgents}
@@ -858,14 +905,14 @@ function App() {
         </div>
         {/* Tab bar */}
         <div
-          className="flex-shrink-0 flex border-b"
-          style={{ borderColor: 'var(--border)', background: 'var(--bg-panel)' }}
+          className="flex-shrink-0 flex border-b overflow-x-auto"
+          style={{ borderColor: 'var(--border)', background: 'var(--bg-panel)', scrollbarWidth: 'none' }}
         >
           {[{ id: 'chat', label: 'Chat' }, { id: 'sessions', label: 'Sessions' }, { id: 'board', label: 'Board' }, { id: 'workspace', label: 'Workspace' }, { id: 'browser', label: 'Browser' }, { id: 'secrets', label: 'Secrets and variables' }].map(t => (
             <button
               key={t.id}
               onClick={() => setRoomTab(t.id)}
-              className="px-5 py-2.5 text-sm font-medium transition-colors relative"
+              className="px-3 md:px-5 py-2.5 text-sm font-medium transition-colors relative whitespace-nowrap flex-shrink-0"
               style={{
                 color: roomTab === t.id ? 'var(--accent)' : 'var(--text-secondary)',
                 borderBottom: roomTab === t.id ? '2px solid var(--accent)' : '2px solid transparent',
@@ -951,6 +998,12 @@ function App() {
     );
   };
 
+  const hasListPane = tab !== 'settings' && tab !== 'skills' && tab !== 'connections';
+  const listHiddenOnMobile = !mobileList && ((tab === 'chats' && selectedRoom) || (tab === 'agents' && selectedAgent));
+  const roomSidebar = selectedRoom && (
+    <RoomSidebar room={selectedRoom} token={token} user={user} width={isMobile ? '100%' : 256} taskRefreshKey={taskRefreshKey} goalRefreshKey={goalRefreshKey} repoRefreshKey={repoRefreshKey} agentStatuses={agentStatuses} taskStatuses={taskStatuses} onShowDiff={(branch, baseRef) => { setRoomPanelOpen(false); setWorkspaceDiffBranch(branch); setWorkspaceDiffBase(baseRef || null); setRoomTab('workspace'); }} />
+  );
+
   return (
     // The agent directory is published once here so every avatar in the app —
     // chat bubbles, the chat list, room members, Settings — can resolve an
@@ -958,27 +1011,38 @@ function App() {
     // picture instead of initials (hub/AGENT_AVATARS_REFERENCE.md §7).
     <AgentDirectoryProvider agents={agents} token={token}>
     <OnboardingProvider token={token} userId={user?.id} agents={agents} refreshAgents={refreshAgents}>
-    <div className="flex h-screen overflow-hidden" style={{ background: 'var(--bg-base)' }}>
-      <NavSidebar tab={tab} onTab={setTab} onMarketplace={marketplaceOpener} accountUrl={legionAccountUrl} legalUrls={legionLegalUrls} user={user} onLogout={handleLogout} theme={theme} onThemeToggle={toggleTheme} />
+    {/* On phones the fixed bottom nav (60px) would cover the composer, so the
+        layout stops above it; 100dvh follows the browser's collapsing URL bar. */}
+    <div className="flex h-[100dvh] pb-[60px] md:pb-0 overflow-hidden" style={{ background: 'var(--bg-base)' }}>
+      <NavSidebar tab={tab} onTab={selectTab} onMarketplace={marketplaceOpener} accountUrl={legionAccountUrl} legalUrls={legionLegalUrls} user={user} onLogout={handleLogout} theme={theme} onThemeToggle={toggleTheme} />
 
-      {tab !== 'settings' && tab !== 'skills' && tab !== 'connections' && (
+      {hasListPane && (
         <div
-          className={`flex-shrink-0 flex flex-col border-r
-            ${(tab === 'chats' && selectedRoom) || (tab === 'agents' && selectedAgent) ? 'hidden md:flex' : 'flex'}
+          className={`flex-shrink-0 flex-col border-r w-full md:w-[264px]
+            ${listHiddenOnMobile ? 'hidden md:flex' : 'flex'}
           `}
-          style={{ width: 264, borderColor: 'var(--border)', background: 'var(--bg-panel)' }}
+          style={{ borderColor: 'var(--border)', background: 'var(--bg-panel)' }}
         >
           {renderList()}
         </div>
       )}
 
       <GitStateProvider roomId={selectedRoom?.id} token={token} gitEventTick={gitFlowTick}>
-      <main className="flex-1 flex min-w-0 overflow-hidden">
+      <main className={`flex-1 min-w-0 overflow-hidden ${hasListPane && !listHiddenOnMobile ? 'hidden md:flex' : 'flex'}`}>
         <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
           {renderMain()}
         </div>
-        {tab === 'chats' && selectedRoom && (
-          <RoomSidebar room={selectedRoom} token={token} user={user} taskRefreshKey={taskRefreshKey} goalRefreshKey={goalRefreshKey} repoRefreshKey={repoRefreshKey} agentStatuses={agentStatuses} taskStatuses={taskStatuses} onShowDiff={(branch, baseRef) => { setWorkspaceDiffBranch(branch); setWorkspaceDiffBase(baseRef || null); setRoomTab('workspace'); }} />
+        {tab === 'chats' && selectedRoom && !isMobile && roomSidebar}
+        {tab === 'chats' && selectedRoom && isMobile && roomPanelOpen && (
+          <div className="fixed inset-0 z-[60] flex justify-end" style={{ background: 'rgba(0,0,0,0.5)' }} onClick={() => setRoomPanelOpen(false)}>
+            <div className="h-full flex flex-col" style={{ width: 'min(320px, 88vw)', background: 'var(--bg-panel)' }} onClick={e => e.stopPropagation()}>
+              <div className="flex items-center justify-between px-4 py-3 border-b flex-shrink-0" style={{ borderColor: 'var(--border)' }}>
+                <p className="font-semibold text-sm" style={{ color: 'var(--text-primary)' }}>Room panel</p>
+                <button className="btn-ghost p-1.5" onClick={() => setRoomPanelOpen(false)} aria-label="Close room panel"><X size={18} /></button>
+              </div>
+              <div className="flex-1 min-h-0 flex">{roomSidebar}</div>
+            </div>
+          </div>
         )}
       </main>
       </GitStateProvider>

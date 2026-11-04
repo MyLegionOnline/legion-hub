@@ -160,15 +160,22 @@ async def test_resolve_executor_connector_vs_local():
 
 
 @pytest.mark.asyncio
-async def test_dispatch_claims_task_and_enqueues_frame_with_connector_billing():
+async def test_dispatch_claims_task_and_enqueues_frame_with_connector_billing(monkeypatch):
     from app.core.proxy_session import handle_task_created
     from app.core.task_runtime import RUNTIME_RUNNING
     from app.db.session import get_session
     from app.models.connector import ConnectorOutbox
+    from app.models.message import Message
     from app.models.session.cm_agent_proxy import CmAgentProxySession
     from app.models.task import DispatchStatus, Task
+    from app.websockets.manager import manager
     from sqlalchemy import select
 
+    async def _online(message, connector_id):
+        return True
+
+    # A live socket: the frame goes out now and the room is not told "offline".
+    monkeypatch.setattr(manager, "send_to_connector", _online)
     await _fresh_db()
     _set_timeouts(timeout_minutes="5", poll_seconds="0.05")
     try:
@@ -219,6 +226,13 @@ async def test_dispatch_claims_task_and_enqueues_frame_with_connector_billing():
                 assert frames[0].run_id == run_id
                 assert frames[0].payload["task_id"] == str(task_id)
                 assert frames[0].payload["mode"] == "operator"
+
+                offline = (
+                    await db.execute(
+                        select(Message).where(Message.event_type == "CONNECTOR_OFFLINE")
+                    )
+                ).scalars().all()
+                assert offline == []
                 break
         finally:
             runtime_task.cancel()
@@ -395,6 +409,22 @@ async def test_connector_offline_timeout_fails_dispatch_and_resets_to_ready():
             for session in sessions:
                 assert session.closed_at is not None
                 assert session.close_reason == "connector_offline"
+
+            # No socket was open, so the room was told the server is offline
+            # right at dispatch, not only when the wait ran out.
+            from app.models.message import Message
+
+            offline = (
+                await db.execute(
+                    select(Message).where(
+                        Message.room_id == room_id,
+                        Message.event_type == "CONNECTOR_OFFLINE",
+                    )
+                )
+            ).scalars().all()
+            assert len(offline) == 1
+            assert "offline" in offline[0].content
+            assert offline[0].task_id == task_id
             break
     finally:
         _clear_timeouts()

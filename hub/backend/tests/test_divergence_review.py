@@ -76,6 +76,27 @@ async def test_take_branch_folds_and_completes():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["take_branch", "delete_branch"])
+async def test_resolution_checks_whether_the_goal_is_done(decision):
+    """The resolved task may be the goal's last one: its goal → dev gate must open."""
+    task = _task()
+    task.goal_id = uuid4()
+    db = _db()
+    with patch("app.core.room_git_flow._task_base_branch", new_callable=AsyncMock, return_value="dev"), \
+         patch("app.core.workspaced_client.git_divergence_workspace", new_callable=AsyncMock, return_value=_OK_REPORT), \
+         patch("app.core.workspaced_client.merge_workspace_branch", new_callable=AsyncMock,
+               return_value={"ok": True, "sha": "cafe1234", "conflict": False}), \
+         patch("app.core.workspaced_client.git_discard_branch_workspace", new_callable=AsyncMock,
+               return_value={"ok": True, "deleted": True, "backup_ref": "refs/legion/trash/task-abc@x"}), \
+         patch("app.core.divergence_review.emit_event", new_callable=AsyncMock), \
+         patch("app.core.goal_progress.maybe_complete_goal", new_callable=AsyncMock) as complete:
+        res = await dr.resolve_divergence(task.room_id, task, db, decision)
+
+    assert res["ok"] is True
+    complete.assert_awaited_once_with(task.goal_id, task.room_id, db)
+
+
+@pytest.mark.asyncio
 async def test_take_branch_conflict_leaves_task_untouched():
     task = _task()
     db = _db()

@@ -658,7 +658,7 @@ function RemoveAgentError({ error, onClose }) {
 }
 
 /* ── main sidebar ── */
-export function RoomSidebar({ room, token, user, taskRefreshKey = 0, goalRefreshKey = 0, repoRefreshKey = 0, agentStatuses = {}, taskStatuses = {}, onShowDiff }) {
+export function RoomSidebar({ room, token, user, taskRefreshKey = 0, goalRefreshKey = 0, repoRefreshKey = 0, agentStatuses = {}, taskStatuses = {}, onShowDiff, width = 256 }) {
   const isVirtualDm = !room?.id || String(room.id).startsWith('dm-');
   const realRoomId = isVirtualDm ? null : room.id;
 
@@ -732,7 +732,7 @@ export function RoomSidebar({ room, token, user, taskRefreshKey = 0, goalRefresh
   return (
     <div
       className="flex flex-col h-full border-l overflow-y-auto context-panel"
-      style={{ width: 256, borderColor: 'var(--border)', flexShrink: 0 }}
+      style={{ width, borderColor: 'var(--border)', flexShrink: 0 }}
     >
       <div className="flex flex-col gap-4 px-4 py-4">
 

@@ -38,7 +38,9 @@ from app.core.workspace_services import (
     reconcile_service_runtime as _reconcile_service_runtime,
     services_enabled,
 )
-from app.core.preview_gateway import issue_ticket, preview_enabled, service_origin, ticket_ttl_sec
+from app.core.preview_gateway import (
+    issue_ticket, preview_enabled, service_origin, ticket_retry_after, ticket_ttl_sec,
+)
 from app.core.room_git_flow import get_flow_config
 from app.db.session import get_session
 from app.models.room import Room, RoomUserLink
@@ -1255,6 +1257,12 @@ async def open_declared_workspace_service_ticket(
     _require_services_enabled()
     if not preview_enabled():
         raise HTTPException(status_code=404, detail="Workspace preview gateway is disabled")
+    wait = ticket_retry_after(current_user.id)
+    if wait:
+        raise HTTPException(
+            status_code=429, detail="Too many preview tickets, slow down",
+            headers={"Retry-After": str(max(1, int(wait) + 1))},
+        )
     await _get_room(room_id, db)
     await _verify_membership(room_id, current_user, db)
     workspace = await _get_or_create_workspace(room_id, db)

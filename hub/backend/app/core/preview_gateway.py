@@ -106,6 +106,11 @@ _SERVICE_BUCKETS = _TokenBuckets()
 # is checked before the database lookup, so probing random service ids cannot
 # turn every request into a query.
 _FAILURE_BUCKETS = _TokenBuckets()
+# Ticket issuance (open-ticket): one bucket per user.  Every ticket first
+# reconciles the service runtime with workspaced, so a looping client would
+# hammer workspaced; opening, reloading and the debounced auto-refresh of the
+# Browser stay far below the sustained rate.
+_TICKET_BUCKETS = _TokenBuckets()
 
 
 def _service_rate() -> tuple[float, float]:
@@ -191,6 +196,18 @@ def _note_failure(client: str) -> None:
         _FAILURE_BUCKETS.take(client, rate=rate, burst=burst)
 
 
+def ticket_retry_after(user_id: UUID) -> float:
+    """Spend one ticket from the user's bucket; seconds to wait if empty."""
+    rate = _float_env("WORKSPACE_PREVIEW_TICKET_RATE_PER_SEC", 1.0, low=0.0, high=10_000.0)
+    burst = max(_float_env("WORKSPACE_PREVIEW_TICKET_BURST", 20.0, low=1.0, high=1_000_000.0), 1.0)
+    if rate <= 0:
+        return 0.0
+    wait = _TICKET_BUCKETS.take(str(user_id), rate=rate, burst=burst)
+    if wait:
+        _record_rate_limited()
+    return wait
+
+
 def _too_many_requests(wait: float) -> Response:
     return Response(
         "Too many requests to this preview, slow down.", status_code=429,
@@ -265,6 +282,18 @@ def preview_cookie_policy() -> tuple[bool, str]:
 
 def service_origin(service_id: UUID | str) -> str:
     return f"{_scheme()}://svc-{service_id}.{_domain()}{_port_suffix()}"
+
+
+def service_runtime_env(service_id: UUID | str) -> dict[str, str]:
+    """Environment that lets dev servers answer their own preview origin.
+
+    The gateway forwards the origin's Host unchanged, so absolute URLs the
+    service builds stay right.  Vite (5.4.12+, 6.0.9+) rejects any Host but
+    localhost with 403 "Blocked request"; ``*.localhost`` passes, which is why
+    only a real preview domain shows it.  This variable is Vite's documented
+    way to allow one extra host.
+    """
+    return {"__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS": f"svc-{service_id}.{_domain()}"}
 
 
 def service_id_from_host(host: str) -> UUID | None:

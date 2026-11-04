@@ -1137,6 +1137,10 @@ async def get_workspace_environment_logs(
         return r.json()
 
 async def start_workspace_service(room_id: str, spec: dict[str, Any]) -> dict[str, Any]:
+    # Every start path (API, agent tool, checkpoint restore) passes here; the
+    # service's own env still wins over the defaults.
+    from app.core.preview_gateway import service_runtime_env
+    spec = {**spec, "env": {**service_runtime_env(spec["service_id"]), **(spec.get("env") or {})}}
     async with _client() as c:
         r = await c.post(f"/workspaces/{room_id}/services/start", json=spec)
         r.raise_for_status()

@@ -154,3 +154,21 @@ test('turning auto-refresh off keeps the page as it is', async ({ page }) => {
   expect(state.tickets).toBe(1);
   expect(state.pageLoads).toBe(1);
 });
+
+test('open in a new tab takes a ticket of its own', async ({ page }) => {
+  // The iframe has already redeemed its ticket; the gateway answers a reused
+  // one with 404, which is what the new tab showed on production 2026-10-31.
+  const state = await installHarness(page);
+  await page.context().route(`${PREVIEW_ORIGIN}/**`, route => route.fulfill({ status: 200, contentType: 'text/html', body: '<p>tab</p>' }));
+  await openBrowserTab(page);
+  await expect.poll(() => state.pageLoads).toBe(1);
+  expect(state.tickets).toBe(1);
+
+  const [tab] = await Promise.all([
+    page.waitForEvent('popup'),
+    page.getByRole('button', { name: 'Open in a new tab' }).click(),
+  ]);
+  await tab.waitForURL(/ticket=t2$/);
+  expect(state.tickets).toBe(2);
+  await expect(page.locator('iframe[title="Comic site"]')).toHaveAttribute('src', /ticket=t1$/);
+});

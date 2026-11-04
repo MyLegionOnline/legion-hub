@@ -61,7 +61,8 @@ function TabNav({ active, onTab }) {
   return (
     <div className="px-4 pt-5 pb-2 flex-shrink-0 border-b" style={{ borderColor: 'var(--border)' }}>
       <h2 className="text-lg font-semibold mb-4" style={{ color: 'var(--text-primary)' }}>Settings</h2>
-      <div className="flex gap-1">
+      {/* Wraps on phones: in one row the last tabs (Secrets) ran off the screen. */}
+      <div className="flex flex-wrap gap-1">
         {TABS.map(({ id, label, icon: Icon }) => (
           <Spot key={id} active={!!guide && guide.tab === id && active !== id} hint={guide?.text} placement="bottom">
             <button

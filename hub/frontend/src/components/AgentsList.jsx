@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Search, Plus, MessageSquare, Settings, Wifi, WifiOff, Clock, X, Check, Copy, AlertCircle, Loader, Cpu, Server, Trash2, Sparkles, Image, Eye, Terminal, Upload } from 'lucide-react';
+import { Search, Plus, MessageSquare, Settings, Wifi, WifiOff, Clock, X, Check, AlertCircle, Loader, Cpu, Server, Trash2, Sparkles, Image, Eye, Terminal, Upload } from 'lucide-react';
 // Avatar fetching/uploading lives in one module shared with the chat, the
 // sidebar and the room member list — see lib/agentAvatars.jsx.
 import { AgentAvatarSlot } from '../lib/AgentAvatar';
@@ -363,7 +363,6 @@ function AddAgentModal({ onClose, onCreated, token }) {
   });
   const [createdAgent, setCreatedAgent] = useState(null);
   const [errorMsg, setErrorMsg] = useState('');
-  const [copied, setCopied] = useState(false);
   // internal design notes stage 5.2: avatar is uploaded in a separate
   // multipart request AFTER the agent is created (POST /agents/ then
   // POST /agents/{id}/avatar). The file input lives in the create form;
@@ -582,7 +581,6 @@ function AddAgentModal({ onClose, onCreated, token }) {
           update_policy: form.update_policy,
           short_description: form.short_description.trim(),
           status: agentType === 'internal' ? 'online' : 'offline',
-          token: `tok_${Math.random().toString(36).slice(2)}`,
           config: {},
           llm_config: persistedConfig,
         };
@@ -594,13 +592,6 @@ function AddAgentModal({ onClose, onCreated, token }) {
         setStep('error');
       }
     }
-  };
-
-  const copyToken = () => {
-    navigator.clipboard.writeText(createdAgent?.token || '').then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2500);
-    });
   };
 
   return (
@@ -623,7 +614,7 @@ function AddAgentModal({ onClose, onCreated, token }) {
             </h3>
             <p className="text-xs mt-0.5" style={{ color: 'var(--text-secondary)' }}>
               {step === 'success'
-                ? createdAgent?.agent_type === 'internal' ? 'Internal agent is ready to use' : 'Save the token — you\'ll need it on the server'
+                ? createdAgent?.agent_type === 'internal' ? 'Internal agent is ready to use' : 'Connect it from its card to finish setup'
                 : 'Choose type and configure'}
             </p>
           </div>
@@ -813,36 +804,14 @@ function AddAgentModal({ onClose, onCreated, token }) {
               )}
 
               {createdAgent.agent_type === 'external' && (
-                <>
-                  <div className="p-4 rounded-xl" style={{ background: 'rgba(99,102,241,0.08)', border: '1px solid rgba(99,102,241,0.25)' }}>
-                    <div className="flex items-center gap-2 mb-2">
-                      <div className="w-4 h-4 rounded-full flex items-center justify-center" style={{ background: 'var(--accent)' }}>
-                        <Check size={10} color="white" />
-                      </div>
-                      <p className="text-xs font-semibold" style={{ color: 'var(--accent-light)' }}>Agent token — copy it now</p>
-                    </div>
-                    <div className="flex items-center gap-3 px-3 py-2.5 rounded-lg" style={{ background: 'var(--bg-base)', border: '1px solid var(--border)' }}>
-                      <code className="text-xs flex-1 break-all font-mono" style={{ color: '#34d399' }}>{createdAgent.token}</code>
-                      <button
-                        onClick={copyToken}
-                        className="flex-shrink-0 flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all"
-                        style={{ background: copied ? 'rgba(16,185,129,0.15)' : 'var(--bg-hover)', color: copied ? '#34d399' : 'var(--text-secondary)' }}
-                      >
-                        {copied ? <Check size={12} /> : <Copy size={12} />}
-                        {copied ? 'Copied!' : 'Copy'}
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="p-3 rounded-xl space-y-1.5" style={{ background: 'var(--bg-card)', border: '1px solid var(--border)' }}>
-                    <p className="text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>Next step: connect the agent</p>
-                    <p className="text-xs" style={{ color: 'var(--text-secondary)' }}>
-                      Open this agent's card and click <b>"Connect an external agent"</b> to get a
-                      one-time pairing code and install command for your server — it sets up the
-                      connector (systemd service included) automatically.
-                    </p>
-                  </div>
-                </>
+                <div className="p-3 rounded-xl space-y-1.5" style={{ background: 'var(--bg-card)', border: '1px solid var(--border)' }}>
+                  <p className="text-xs font-medium mb-1" style={{ color: 'var(--text-secondary)' }}>Next step: connect the agent</p>
+                  <p className="text-xs" style={{ color: 'var(--text-secondary)' }}>
+                    Open this agent's card and click <b>"Connect an external agent"</b> to get a
+                    one-time pairing code and install command for your server — it sets up the
+                    connector (systemd service included) automatically.
+                  </p>
+                </div>
               )}
 
               {createdAgent.agent_type === 'internal' && (
@@ -2457,7 +2426,6 @@ function RouterTestPanel({ token }) {
 
 /* ─── Agent Detail ─── */
 export function AgentDetail({ agent, onChat, onUpdated, onDeleted, token }) {
-  const [copied, setCopied] = useState(false);
   const [showConfigure, setShowConfigure] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const { step: guideStep, finish: finishGuide } = useOnboarding();
@@ -2483,13 +2451,6 @@ export function AgentDetail({ agent, onChat, onUpdated, onDeleted, token }) {
     } finally {
       setDeleting(false);
     }
-  };
-
-  const copyToken = () => {
-    navigator.clipboard.writeText(agent.token).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    });
   };
 
   return (
@@ -2573,21 +2534,6 @@ export function AgentDetail({ agent, onChat, onUpdated, onDeleted, token }) {
             </DetailRow>
             <DetailRow label="Update Policy">
               <span className="tag tag-accent capitalize">{agent.update_policy}</span>
-            </DetailRow>
-            <DetailRow label="Token">
-              <div className="flex items-center gap-2">
-                <code className="text-xs font-mono" style={{ color: 'var(--accent-light)' }}>
-                  {agent.token?.slice(0, 12)}…
-                </code>
-                <button
-                  onClick={copyToken}
-                  className="text-xs px-2 py-0.5 rounded-lg transition-colors flex items-center gap-1"
-                  style={{ background: 'var(--bg-card)', color: copied ? 'var(--online)' : 'var(--text-secondary)' }}
-                >
-                  {copied ? <Check size={10} /> : <Copy size={10} />}
-                  {copied ? 'Copied!' : 'Copy'}
-                </button>
-              </div>
             </DetailRow>
             <ConnectorSection agent={agent} token={token} onUpdated={(updated) => onUpdated?.(updated)} />
           </>
@@ -2768,7 +2714,7 @@ export function AgentsList({ agents: initialAgents, selectedId, onSelect, onCrea
     setAgents(prev => {
       const exists = prev.some(a => a.id === agent.id);
       return exists
-        ? prev.map(a => (a.id === agent.id ? { ...a, ...agent, token: agent.token ?? a.token } : a))
+        ? prev.map(a => (a.id === agent.id ? { ...a, ...agent } : a))
         : [...prev, agent];
     });
     onCreatedProp?.(agent);

@@ -27,6 +27,33 @@ def test_service_origin_is_exact_and_host_isolated(monkeypatch):
     assert gateway.preview_cookie_policy() == (True, "none")
 
 
+@pytest.mark.asyncio
+async def test_service_start_allows_its_preview_host_in_vite(monkeypatch):
+    """Vite answers 403 "Blocked request" to a Host other than localhost."""
+    import httpx
+    from app.core import workspaced_client as wsd
+
+    monkeypatch.setenv("WORKSPACE_PREVIEW_DOMAIN", "example.online")
+    sent: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(__import__("json").loads(request.content))
+        return httpx.Response(200, json={"state": "ready"})
+
+    monkeypatch.setattr(
+        wsd, "_client",
+        lambda read_timeout=None: httpx.AsyncClient(base_url="http://wsd", transport=httpx.MockTransport(handler)),
+    )
+    service_id = uuid4()
+    await wsd.start_workspace_service("room", {"service_id": str(service_id), "env": {"A": "1"}})
+    await wsd.start_workspace_service("room", {
+        "service_id": str(service_id), "env": {"__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS": "own.host"},
+    })
+
+    assert sent[0]["env"] == {"__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS": f"svc-{service_id}.example.online", "A": "1"}
+    assert sent[1]["env"] == {"__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS": "own.host"}
+
+
 def test_preview_response_headers_allow_iframed_service_pages():
     headers = gateway._preview_response_headers([
         (b"x-frame-options", b"DENY"),
@@ -346,15 +373,45 @@ def _fresh_rate_limits(monkeypatch):
         "WORKSPACE_PREVIEW_RATE_PER_SEC", "WORKSPACE_PREVIEW_RATE_BURST",
         "WORKSPACE_PREVIEW_FAIL_RATE_PER_SEC", "WORKSPACE_PREVIEW_FAIL_BURST",
         "WORKSPACE_PREVIEW_TRUST_PROXY_HEADERS", "WORKSPACE_PREVIEW_MAX_WEBSOCKETS",
+        "WORKSPACE_PREVIEW_TICKET_RATE_PER_SEC", "WORKSPACE_PREVIEW_TICKET_BURST",
     ):
         monkeypatch.delenv(name, raising=False)
     gateway._SERVICE_BUCKETS.clear()
     gateway._FAILURE_BUCKETS.clear()
+    gateway._TICKET_BUCKETS.clear()
     gateway._OPEN_WEBSOCKETS.clear()
     yield
     gateway._SERVICE_BUCKETS.clear()
     gateway._FAILURE_BUCKETS.clear()
+    gateway._TICKET_BUCKETS.clear()
     gateway._OPEN_WEBSOCKETS.clear()
+
+
+def test_ticket_issuance_is_limited_per_user(monkeypatch):
+    monkeypatch.setenv("WORKSPACE_PREVIEW_TICKET_RATE_PER_SEC", "0.01")
+    monkeypatch.setenv("WORKSPACE_PREVIEW_TICKET_BURST", "2")
+    first, second = uuid4(), uuid4()
+
+    assert gateway.ticket_retry_after(first) == 0.0
+    assert gateway.ticket_retry_after(first) == 0.0
+    assert gateway.ticket_retry_after(first) > 0
+    # Another user keeps a budget of their own.
+    assert gateway.ticket_retry_after(second) == 0.0
+
+
+def test_ticket_rate_zero_disables_the_limit(monkeypatch):
+    monkeypatch.setenv("WORKSPACE_PREVIEW_TICKET_RATE_PER_SEC", "0")
+    monkeypatch.setenv("WORKSPACE_PREVIEW_TICKET_BURST", "1")
+    user_id = uuid4()
+
+    assert all(gateway.ticket_retry_after(user_id) == 0.0 for _ in range(5))
+
+
+def test_default_ticket_budget_covers_a_burst_of_reloads():
+    user_id = uuid4()
+
+    assert all(gateway.ticket_retry_after(user_id) == 0.0 for _ in range(20))
+    assert gateway.ticket_retry_after(user_id) > 0
 
 
 def _preview_request(service_id, *, session="", client=("203.0.113.7", 5000)):

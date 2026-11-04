@@ -151,7 +151,6 @@ class WorkspaceLifecycleConfig:
     # and preview gateway are rolled out in later stages.
     services_enabled: bool = False
     preview_gateway_enabled: bool = False
-    service_idle_timeout_sec: int = 900
     service_port_range: tuple[int, int] = (3000, 3999)
 
     def __post_init__(self) -> None:
@@ -161,8 +160,6 @@ class WorkspaceLifecycleConfig:
             raise ValueError("polling_initial_sec cannot exceed polling_max_sec")
         if not self.active_operations:
             raise ValueError("active_operations cannot be empty")
-        if self.service_idle_timeout_sec < 1:
-            raise ValueError("service_idle_timeout_sec must be positive")
         first_port, last_port = self.service_port_range
         if not (1 <= first_port <= last_port <= 65535):
             raise ValueError("service_port_range must be a valid inclusive TCP range")
@@ -204,9 +201,6 @@ def load_workspace_lifecycle_config() -> WorkspaceLifecycleConfig:
         preview_gateway_enabled=_env_bool(
             "WORKSPACE_PREVIEW_GATEWAY_ENABLED", False
         ),
-        service_idle_timeout_sec=_env_int(
-            "WORKSPACE_SERVICE_IDLE_TIMEOUT_SEC", 900, minimum=1
-        ),
         service_port_range=_env_port_range(),
     )
 
@@ -232,7 +226,6 @@ WORKSPACE_AUTO_FORCE_STOP_STALE_RUNTIME = CONFIG.auto_force_stop_stale_runtime
 WORKSPACE_BASH_SATISFIES_READ_BEFORE_EDIT = CONFIG.bash_satisfies_read_before_edit
 WORKSPACE_SERVICES_ENABLED = CONFIG.services_enabled
 WORKSPACE_PREVIEW_GATEWAY_ENABLED = CONFIG.preview_gateway_enabled
-WORKSPACE_SERVICE_IDLE_TIMEOUT_SEC = CONFIG.service_idle_timeout_sec
 WORKSPACE_SERVICE_PORT_RANGE = CONFIG.service_port_range
 
 

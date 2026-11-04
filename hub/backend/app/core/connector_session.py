@@ -393,8 +393,9 @@ async def _run_connector_loop(
     )
     await db.commit()
 
+    delivered = False
     try:
-        await manager.send_to_connector(
+        delivered = await manager.send_to_connector(
             {
                 "type": "dispatch",
                 "seq": outbox_row.seq,
@@ -431,6 +432,19 @@ async def _run_connector_loop(
             "run_id": run_id,
         },
     )
+    if not delivered:
+        # Without this the room only shows "starting session…" while the
+        # outbox waits for the connector, with no hint that its server is down.
+        wait_minutes = max(1, round(_dispatch_timeout().total_seconds() / 60))
+        await emit_event(
+            room_id,
+            "CONNECTOR_OFFLINE",
+            f"The connector's server is offline. The task will wait up to "
+            f"{wait_minutes} minutes for it to reconnect, then fail with Retry.",
+            db,
+            task_id=task.id,
+            metadata={"connector_id": str(connector_id), "task_id": str(task.id), "run_id": run_id},
+        )
 
     deadline: Optional[datetime] = datetime.now(timezone.utc) + _dispatch_timeout()
     run_future = connector_reverse.register_run(

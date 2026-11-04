@@ -46,7 +46,6 @@ def test_defaults_document_stage_zero_policy(monkeypatch):
         "WORKSPACE_STATUS_TRANSPORT",
         "WORKSPACE_SERVICES_ENABLED",
         "WORKSPACE_PREVIEW_GATEWAY_ENABLED",
-        "WORKSPACE_SERVICE_IDLE_TIMEOUT_SEC",
         "WORKSPACE_SERVICE_PORT_RANGE",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -69,7 +68,6 @@ def test_defaults_document_stage_zero_policy(monkeypatch):
     assert cfg.bash_satisfies_read_before_edit is False
     assert cfg.services_enabled is False
     assert cfg.preview_gateway_enabled is False
-    assert cfg.service_idle_timeout_sec == 900
     assert cfg.service_port_range == (3000, 3999)
     assert cfg.counted_states == ("starting", "running", "draining", "stopping")
 
@@ -89,7 +87,6 @@ def test_environment_values_are_resolved(monkeypatch):
         WORKSPACE_STATUS_POLL_MAX_SEC=8,
         WORKSPACE_SERVICES_ENABLED="true",
         WORKSPACE_PREVIEW_GATEWAY_ENABLED="1",
-        WORKSPACE_SERVICE_IDLE_TIMEOUT_SEC=480,
         WORKSPACE_SERVICE_PORT_RANGE="4100-4199",
     )
 
@@ -106,7 +103,6 @@ def test_environment_values_are_resolved(monkeypatch):
     assert cfg.polling_max_sec == 8
     assert cfg.services_enabled is True
     assert cfg.preview_gateway_enabled is True
-    assert cfg.service_idle_timeout_sec == 480
     assert cfg.service_port_range == (4100, 4199)
     assert cfg.counted_states == ("running", "draining", "stopping")
 
@@ -116,13 +112,11 @@ def test_invalid_values_fall_back_to_safe_defaults(monkeypatch):
         monkeypatch,
         WORKSPACE_IDLE_TIMEOUT_SEC=0,
         WORKSPACE_STATUS_TRANSPORT="long-poll",
-        WORKSPACE_SERVICE_IDLE_TIMEOUT_SEC=0,
         WORKSPACE_SERVICE_PORT_RANGE="4000-3000",
     )
     cfg = module.load_workspace_lifecycle_config()
     assert cfg.idle_timeout_sec == 900
     assert cfg.status_transport == "websocket"
-    assert cfg.service_idle_timeout_sec == 900
     assert cfg.service_port_range == (3000, 3999)
 
 

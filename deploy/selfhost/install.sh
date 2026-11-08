@@ -16,6 +16,8 @@
 #
 # Run from a download of this folder or, to fetch it first:
 #   curl -fsSL https://github.com/MyLegionOnline/legion-hub/releases/latest/download/install.sh | sh
+# The same command updates an installation: it refreshes the bundle files and
+# moves LEGION_VERSION in .env to the release it downloaded.
 set -eu
 
 REPO_URL="${LEGION_REPO_URL:-https://github.com/MyLegionOnline/legion-hub}"
@@ -30,7 +32,7 @@ while [ $# -gt 0 ]; do
     --version) VERSION="${2:?--version needs a tag}"; shift 2 ;;
     --build) BUILD=1; shift ;;
     --no-start) START=0; shift ;;
-    -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown argument: $1 (see --help)" >&2; exit 1 ;;
   esac
 done
@@ -42,6 +44,7 @@ die() { printf 'error: %s\n' "$1" >&2; exit 1; }
 # Next to this script when it is a real file; otherwise (piped from curl)
 # download the bundle of the release into ~/legion.
 SCRIPT_DIR=""
+DOWNLOADED=0
 case "$0" in
   */install.sh|install.sh) SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)" ;;
 esac
@@ -59,6 +62,7 @@ if [ -z "$SCRIPT_DIR" ] || [ ! -f "$SCRIPT_DIR/docker-compose.yml" ]; then
   fi
   curl -fsSL "$BUNDLE_URL" | tar -xz -C "$TARGET"
   SCRIPT_DIR="$TARGET"
+  DOWNLOADED=1
 fi
 cd "$SCRIPT_DIR"
 
@@ -111,7 +115,15 @@ else
   done
   echo "Created .env with new secrets (it is private to you; keep a copy somewhere safe)."
 fi
-[ -z "$VERSION" ] || set_var LEGION_VERSION "$VERSION"
+# A freshly downloaded bundle names its release in .env.example; an existing
+# .env still names the old one, and pulling that would change nothing.
+if [ -z "$VERSION" ] && [ "$DOWNLOADED" = "1" ]; then
+  VERSION="$(grep '^LEGION_VERSION=' .env.example | cut -d= -f2- || true)"
+fi
+if [ -n "$VERSION" ]; then
+  set_var LEGION_VERSION "$VERSION"
+  echo "Running release $VERSION"
+fi
 if [ -n "$DOMAIN" ]; then
   set_var HUB_DOMAIN "$DOMAIN"
   set_var HUB_PUBLIC_URL "https://$DOMAIN"
@@ -157,4 +169,5 @@ echo "  Open ${PUBLIC_URL:-http://localhost:8080}"
 echo "  The first account you register becomes the owner of this Hub."
 echo ""
 echo "Manage it from this folder:"
-echo "  docker compose ps | logs -f backend | down | pull && docker compose up -d   (update)"
+echo "  docker compose ps | logs -f backend | down"
+echo "Update it by running the install command again (see docs/INSTALL.md, Updating)."

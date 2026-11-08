@@ -194,7 +194,7 @@ export default function BillingOfferDialog({ token }) {
                     ))}
                   </ul>
                 )}
-                {offer.redeem_url && <p>Have a promo code? <a href={offer.redeem_url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent-light)', textDecoration: 'underline' }}>Redeem it</a></p>}
+                {offer.redeem_url && <p>Have an activation code? <a href={offer.redeem_url} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent-light)', textDecoration: 'underline' }}>Redeem it</a></p>}
               </div>
             )}
             {offer.direct_sale !== false && offer.email_verified === false && (

@@ -919,9 +919,9 @@ export function SkillsPanel({ token, onOpenMarketplace }) {
   return (
     <div className="flex flex-col h-full overflow-hidden fade-in" style={{ background: 'var(--bg-base)' }}>
       {/* Header */}
-      <div className="flex-shrink-0 flex items-center justify-between gap-4 px-5 py-4 border-b" style={{ borderColor: 'var(--border)', background: 'var(--bg-panel)' }}>
-        <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-xl flex items-center justify-center" style={{ background: 'var(--accent-dim)' }}>
+      <div className="flex-shrink-0 flex flex-wrap items-center justify-between gap-x-4 gap-y-3 px-4 sm:px-5 py-4 border-b" style={{ borderColor: 'var(--border)', background: 'var(--bg-panel)' }}>
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="flex-shrink-0 w-9 h-9 rounded-xl flex items-center justify-center" style={{ background: 'var(--accent-dim)' }}>
             <Sparkles size={18} style={{ color: 'var(--accent-light)' }} />
           </div>
           <div>
@@ -931,7 +931,7 @@ export function SkillsPanel({ token, onOpenMarketplace }) {
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           {quota && <QuotaBar label="Storage" used={quota.skills_used_bytes} quota={quota.skills_quota_bytes} />}
           <button
             onClick={load}
@@ -940,7 +940,7 @@ export function SkillsPanel({ token, onOpenMarketplace }) {
           >
             <RefreshCw size={12} /> Refresh
           </button>
-          <button onClick={() => setShowAdd(true)} className="btn-primary flex items-center gap-1.5 text-xs">
+          <button onClick={() => setShowAdd(true)} className="btn-primary flex items-center gap-1.5 text-xs whitespace-nowrap">
             <Plus size={14} /> Add skill
           </button>
         </div>

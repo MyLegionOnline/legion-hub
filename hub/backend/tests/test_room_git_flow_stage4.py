@@ -215,6 +215,8 @@ async def test_resolve_approve_conflict(monkeypatch, _stub_common):
         "app.core.workspaced_client.merge_workspace_branch",
         AsyncMock(return_value={"ok": False, "conflict": True}),
     )
+    restore = AsyncMock()
+    monkeypatch.setattr("app.core.workspaced_client.create_workspace_branch", restore)
     promo = _promo()
     out = await room_git_flow.resolve_promotion(
         str(uuid4()), promo, _FakeDB(), decision="approve"
@@ -222,6 +224,10 @@ async def test_resolve_approve_conflict(monkeypatch, _stub_common):
     assert out["conflict"] is True and promo.state == "conflict"
     assert promo.merge_commit is None
     assert "GIT_CONFLICT" in _event_types(_stub_common)
+    # The aborted merge left HEAD on `main`, where agents cannot commit; it is
+    # put back on `dev` so the room can fold `main` in and fix the conflict.
+    restore.assert_awaited_once()
+    assert restore.await_args.args[1] == "dev"
 
 
 @pytest.mark.asyncio

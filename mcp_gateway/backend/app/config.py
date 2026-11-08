@@ -48,6 +48,11 @@ REQUEST_TIMEOUT_SEC = float(os.getenv("MCP_GATEWAY_REQUEST_TIMEOUT_SEC", "30"))
 # describe_image, so this carries more margin than the old 60s; Hub's own
 # MCP_VISION_GATEWAY_TIMEOUT_SEC must stay strictly greater than this value.
 VISION_REQUEST_TIMEOUT_SEC = float(os.getenv("MCP_VISION_REQUEST_TIMEOUT_SEC", "90"))
+# legion-vps-mcp's vps_exec/vps_service run a server command for up to the
+# call's own timeout_sec (600 s cap). The Gateway waits for that deadline plus
+# this margin (SSH connect and the reply); Hub's
+# MCP_VPS_GATEWAY_TIMEOUT_MARGIN_SEC must stay strictly greater than this.
+VPS_TIMEOUT_MARGIN_SEC = float(os.getenv("MCP_VPS_TIMEOUT_MARGIN_SEC", "30"))
 # Design Vision Toolkit plan R10 (Stage 3): raised globally from 1 MiB to
 # 8 MiB for every MCP server, not just mcp-vision — image/UI-analysis
 # artifacts need the headroom and a per-slug ceiling would just be a second

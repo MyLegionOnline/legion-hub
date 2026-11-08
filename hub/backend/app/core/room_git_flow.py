@@ -2167,6 +2167,23 @@ async def dispatch_deploy_hook(
     return result
 
 
+async def _restore_working_branch(room_id: "UUID | str", branch: str) -> None:
+    """Check ``branch`` back out after a gate merge left HEAD on ``main``.
+
+    ``create_workspace_branch`` just checks the branch out when it already
+    exists. Best-effort: a failure is logged, never raised.
+    """
+    from app.core import workspaced_client as wsd
+
+    try:
+        await wsd.create_workspace_branch(str(room_id), branch)
+    except Exception as exc:
+        logger.warning(
+            "resolve_promotion: could not restore HEAD to %s for room %s: %s",
+            branch, room_id, exc,
+        )
+
+
 async def resolve_promotion(
     room_id: "UUID | str",
     promotion,
@@ -2256,6 +2273,11 @@ async def resolve_promotion(
         )
 
         if merge.get("conflict"):
+            # The merge was aborted but the tree is still checked out on
+            # `main`, where agent commits are refused (§0.1) — so nobody in the
+            # room could fold `main` into `dev` to fix the conflict. Return
+            # HEAD to the working branch, as the success path does.
+            await _restore_working_branch(room_id, promotion.from_branch)
             promotion.state = PROMOTION_CONFLICT
             db.add(promotion)
             await db.flush()
@@ -2275,15 +2297,8 @@ async def resolve_promotion(
             return {"ok": False, "error": merge.get("stderr") or "merge failed"}
 
         # The merge left the working tree checked out on `main`, where agent /
-        # auto commits are refused (§0.1). Put HEAD back on the working branch —
-        # create_workspace_branch just checks it out when it already exists.
-        try:
-            await wsd.create_workspace_branch(str(room_id), promotion.from_branch)
-        except Exception as exc:
-            logger.warning(
-                "resolve_promotion: could not restore HEAD to %s for room %s: %s",
-                promotion.from_branch, room_id, exc,
-            )
+        # auto commits are refused (§0.1). Put HEAD back on the working branch.
+        await _restore_working_branch(room_id, promotion.from_branch)
         merge_sha = merge.get("sha")
 
     promotion.state = PROMOTION_APPROVED

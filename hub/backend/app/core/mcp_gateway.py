@@ -66,6 +66,38 @@ MCP_GATEWAY_TIMEOUT = float(os.getenv("MCP_GATEWAY_TIMEOUT_SEC", "30"))
 # (90s default) — otherwise Hub gives up and refunds the credit while the MCP
 # call is still alive upstream.
 MCP_VISION_GATEWAY_TIMEOUT = float(os.getenv("MCP_VISION_GATEWAY_TIMEOUT_SEC", "100"))
+# legion-vps-mcp runs a server command for as long as the call's own
+# ``timeout_sec`` allows (vps_exec: 60 s by default, vps_service: 120 s, both
+# capped at 600 s). A flat 30/45 s ceiling here abandoned every longer build,
+# pull or restart: the agent saw a gateway timeout while the command was still
+# running, retried, and stacked more calls on the same connection. The Hub
+# waits for the command's own deadline plus this margin, which covers the SSH
+# connect and must stay greater than the Gateway's MCP_VPS_TIMEOUT_MARGIN_SEC.
+MCP_VPS_GATEWAY_TIMEOUT_MARGIN = float(os.getenv("MCP_VPS_GATEWAY_TIMEOUT_MARGIN_SEC", "45"))
+_VPS_COMMAND_DEFAULT_TIMEOUT_SEC = {"vps_exec": 60, "vps_service": 120}
+_VPS_COMMAND_MAX_TIMEOUT_SEC = 600
+
+
+def _vps_command_timeout_sec(tool_name: str, arguments: dict[str, Any] | None) -> float | None:
+    """The server-side deadline legion-vps-mcp will apply to this call, if it runs a command."""
+    default = _VPS_COMMAND_DEFAULT_TIMEOUT_SEC.get(tool_name)
+    if default is None:
+        return None
+    raw = (arguments or {}).get("timeout_sec")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
+        return float(min(raw, _VPS_COMMAND_MAX_TIMEOUT_SEC))
+    return float(default)
+
+
+def _gateway_timeout_for(market_slug: str | None, tool_name: str, arguments: dict[str, Any] | None) -> float:
+    """How long the Hub waits for the Gateway on one ``/v1/execute``."""
+    if market_slug == "mcp-vision":
+        return MCP_VISION_GATEWAY_TIMEOUT
+    if market_slug == _VPS_MCP_MARKET_SLUG:
+        command = _vps_command_timeout_sec(tool_name, arguments)
+        if command is not None:
+            return max(MCP_GATEWAY_TIMEOUT, command + MCP_VPS_GATEWAY_TIMEOUT_MARGIN)
+    return MCP_GATEWAY_TIMEOUT
 
 #: How long a cached Market price snapshot is trusted before ``room_mcp_tools``
 #: bothers re-fetching it during discovery (internal design notes Stage 4
@@ -1060,7 +1092,7 @@ async def room_mcp_tools(
             if snapshot is None or (_utcnow() - _aware_dt(snapshot.fetched_at)) > _PRICE_SNAPSHOT_STALE_AFTER:
                 try:
                     snapshot = await mcp_credits.refresh_price_snapshot(
-                        db, market_item_id=item.market_item_id, market_slug=item.market_slug or "",
+                        market_item_id=item.market_item_id, market_slug=item.market_slug or "",
                     )
                 except Exception:
                     logger.warning(
@@ -1854,10 +1886,19 @@ async def _vps_agent_inventory(
                 "remote": server.get("deploy_remote") or repo.get("url"),
             }
             if credential == "none":
+                # `none` only means the Hub has not issued a key of its own. A
+                # server connected as is often reads the repository with the
+                # account's own key or token, and the Room's access mode
+                # (read-only / full / trusted) is what decides what an agent may
+                # do there — not this field. Telling the model "you cannot
+                # clone" here made it stop and ask for a button that a server
+                # connected as is does not even have.
                 row["repo_note"] = (
-                    "no repository credential has been issued to this server: it cannot "
-                    "clone or fetch yet. A person issues one in the Room's 'Secrets & "
-                    "variables' tab, on the server's card — you cannot do it yourself"
+                    "the Hub has not issued its own repository key to this server; that is "
+                    "not a block. The server may already read the repository with its own "
+                    "credentials — call vps_repo_status: remote_reachable=true means you can "
+                    "clone/fetch and deploy as usual. Only if it reports false, quote "
+                    "remote_error to the person and ask them to give the server read access"
                 )
         rows.append(row)
     return rows
@@ -1868,10 +1909,11 @@ async def _vps_repo_block(
 ) -> dict[str, Any] | str:
     """``_legion_repo`` for ``vps_repo_status``, or an agent-facing error string.
 
-    The two failure modes are deliberately distinct (Stage 14): no repository
-    at all (``repo_not_configured``) and a repository the *server* cannot read
-    (``repo_credential_missing``). Both are fixed by a person, in two
-    different places, and neither is worth a retry — so both say so.
+    Only one case fails here (Stage 14): no repository at all
+    (``repo_not_configured``), fixed by a person on the Git tab. A server
+    without a Hub-issued key is passed through with ``credential="none"``:
+    whether it can read the repository is what the tool's own
+    ``git ls-remote`` reports, not something the Hub can know.
     """
     from app.core import vps_bootstrap, vps_deploy_key, vps_inventory
 
@@ -1888,13 +1930,10 @@ async def _vps_repo_block(
         logger.debug("mcp_gateway: could not list servers for a repo status", exc_info=True)
         servers = []
     row = next((s for s in servers if s["name"] == server), None)
+    # No Hub-issued credential is not an error: the server's own account may
+    # read the repository just fine, and `git ls-remote` on the server (the
+    # `remote_reachable` the tool reports) is the only honest answer to that.
     credential = str((row or {}).get("deploy_credential") or "none")
-    if credential == "none":
-        return (
-            f"Error: [repo_credential_missing] server {server} has no repository credential, so "
-            "it cannot clone or fetch. Do not retry: ask the person to press 'Grant "
-            "repository access' on the server's card in the Room's 'Secrets & variables' tab"
-        )
     return {
         **repo,
         "credential": credential,
@@ -2902,7 +2941,7 @@ async def execute_mcp_tool(
                 # Both resolve *after* the connection (an unknown server still
                 # fails on the server name, which is the error an agent can act
                 # on) and *before* billing, so a file that has to go by git and
-                # a repository nobody issued a key for cost nothing.
+                # a Room with no repository at all cost nothing.
                 if binding.tool_name == "vps_repo_status":
                     repo_block = await _vps_repo_block(db, room_id, server_name, environment)
                     if isinstance(repo_block, str):
@@ -3004,11 +3043,7 @@ async def execute_mcp_tool(
                 # Legion Gateway reserves it in the central wallet under it.
                 "call_id": str(call_id) if call_id else (str(legion_call_id) if legion_key else None),
             }
-            gateway_timeout = (
-                MCP_VISION_GATEWAY_TIMEOUT
-                if binding.market_slug == "mcp-vision"
-                else MCP_GATEWAY_TIMEOUT
-            )
+            gateway_timeout = _gateway_timeout_for(binding.market_slug, binding.tool_name, arguments)
             oauth_mode = _mcp_auth_mode(binding.custom_config) == "oauth"
             # A key-paid call names its account by the key; ours by this header.
             legion_account_id = (

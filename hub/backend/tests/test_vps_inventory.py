@@ -142,6 +142,54 @@ async def test_add_server_requires_exactly_one_root_credential():
                 name="prod", host="203.0.113.10",
                 root_password="pw", root_key=_TEST_SSH_KEY,
             )
+        with pytest.raises(vps_inventory.ServerInvalid):
+            await vps_inventory.add_server(
+                db, service=svc, room_id=room_id, actor_user_id=owner_id,
+                name="prod", host="203.0.113.10",
+                root_password="pw", key=_TEST_SSH_KEY,
+            )
+        break
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_add_server_connected_as_is_resolves_without_preparation():
+    """An already-set-up server: everyday key on add, no wizard, agent connects as that user."""
+    from app.core import vps_inventory
+    from app.db.session import engine, get_session
+
+    await _fresh_db()
+    room_id, owner_id = uuid4(), uuid4()
+
+    async for db in get_session():
+        await _make_room(db, room_id, owner_id)
+        svc = _service(db)
+        row = await vps_inventory.add_server(
+            db, service=svc, room_id=room_id, actor_user_id=owner_id,
+            name="prod", host="203.0.113.10", user="deploy", key=_TEST_SSH_KEY,
+        )
+        await db.commit()
+        assert row["has_key"] is True
+        assert row["has_root_key"] is False and row["has_root_password"] is False
+        assert row["prepared_at"] is None
+
+        conn = await vps_inventory.resolve_connection(
+            db, service=svc, room_id=room_id, actor_user_id=owner_id, server="prod",
+        )
+        assert conn.legion_conn["user"] == "deploy"
+        assert conn.legion_conn["auth"] == {"kind": "key", "private_key": _TEST_SSH_KEY, "passphrase": None}
+
+        row = await vps_inventory.add_server(
+            db, service=svc, room_id=room_id, actor_user_id=owner_id,
+            name="stage", host="203.0.113.11", user="www", password="everyday-password-value",
+        )
+        await db.commit()
+        assert row["has_password"] is True and row["has_key"] is False
+        conn = await vps_inventory.resolve_connection(
+            db, service=svc, room_id=room_id, actor_user_id=owner_id, server="stage",
+        )
+        assert conn.legion_conn["auth"] == {"kind": "password", "password": "everyday-password-value"}
         break
 
     await engine.dispose()

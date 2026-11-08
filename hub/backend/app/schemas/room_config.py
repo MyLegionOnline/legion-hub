@@ -129,6 +129,11 @@ class RoomVpsServerCreate(BaseModel):
     user: str = "root"
     root_password: Optional[str] = None
     root_key: Optional[str] = None
+    #: Everyday credentials for a server that is already set up and must not
+    #: be touched by the preparation wizard: the agent connects as ``user``
+    #: with exactly this key/password. Mutually exclusive with the root pair.
+    password: Optional[str] = None
+    key: Optional[str] = None
     environment: Optional[str] = None
 
 

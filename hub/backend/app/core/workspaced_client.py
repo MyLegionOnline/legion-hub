@@ -303,7 +303,28 @@ async def exec_in_workspace(
     async with _client(read_timeout=read_timeout) as c:
         r = await c.post(f"/workspaces/{room_id}/exec", json=payload)
         r.raise_for_status()
-        return r.json()
+        return _without_nul_output(r.json())
+
+
+def _without_nul_output(result: Any) -> Any:
+    """Drop NUL characters from an exec's stdout/stderr.
+
+    A command that prints binary data (``cat`` of an image, ``head`` of a
+    gzip) yields NUL characters in its output. PostgreSQL text and JSONB cannot
+    hold that character, so the first flush that carried it — the
+    ``workspace_execs`` row, a tool result in the session history — failed,
+    left the session's transaction aborted, and the next write ended the
+    whole agent run as "proxy session crashed" (2026-11-07, two tasks).
+    Nothing readable is lost: a NUL carries no text, and every consumer of
+    this result is text.
+    """
+    if not isinstance(result, dict):
+        return result
+    for key in ("stdout", "stderr"):
+        value = result.get(key)
+        if isinstance(value, str) and "\x00" in value:
+            result[key] = value.replace("\x00", "")
+    return result
 
 
 async def wait_workspace_idle(room_id: str, max_wait_sec: float = 20.0) -> dict[str, Any]:

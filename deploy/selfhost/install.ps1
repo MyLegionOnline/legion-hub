@@ -5,7 +5,9 @@
 .DESCRIPTION
   Checks Docker, writes .env with fresh secrets, copies config\legion.toml,
   pulls the images and starts the stack. Safe to run again: an existing .env
-  and config\legion.toml are never overwritten.
+  and config\legion.toml are never overwritten. Run through the download
+  command, it also updates an installation: it refreshes the bundle files and
+  moves LEGION_VERSION in .env to the release it downloaded.
 
 .PARAMETER Domain
   Serve the Hub on https://<Domain> with an automatic certificate (ports 80 and
@@ -46,6 +48,7 @@ function Test-Native([string]$Message, [scriptblock]$Command) {
 
 # ── Where the files are ────────────────────────────────────────────────────
 $ScriptDir = $PSScriptRoot
+$Downloaded = $false
 if (-not $ScriptDir -or -not (Test-Path (Join-Path $ScriptDir 'docker-compose.yml'))) {
   $Target = if ($env:LEGION_DIR) { $env:LEGION_DIR } else { Join-Path $HOME 'legion' }
   Write-Step "Downloading the install bundle to $Target"
@@ -57,6 +60,7 @@ if (-not $ScriptDir -or -not (Test-Path (Join-Path $ScriptDir 'docker-compose.ym
   Expand-Archive -Path $Zip -DestinationPath $Target -Force
   Remove-Item $Zip
   $ScriptDir = $Target
+  $Downloaded = $true
 }
 Set-Location $ScriptDir
 
@@ -101,7 +105,15 @@ if (Test-Path .env) {
   }
   Write-Host 'Created .env with new secrets (keep a copy somewhere safe).'
 }
-if ($Version) { Set-EnvVar 'LEGION_VERSION' $Version }
+# A freshly downloaded bundle names its release in .env.example; an existing
+# .env still names the old one, and pulling that would change nothing.
+if (-not $Version -and $Downloaded) {
+  $Version = (Get-Content .env.example | Where-Object { $_ -match '^LEGION_VERSION=' } | Select-Object -First 1) -replace '^LEGION_VERSION=', ''
+}
+if ($Version) {
+  Set-EnvVar 'LEGION_VERSION' $Version
+  Write-Host "Running release $Version"
+}
 if ($Domain) {
   Set-EnvVar 'HUB_DOMAIN' $Domain
   Set-EnvVar 'HUB_PUBLIC_URL' "https://$Domain"
@@ -148,4 +160,5 @@ Write-Host "  Open $PublicUrl"
 Write-Host '  The first account you register becomes the owner of this Hub.'
 Write-Host ''
 Write-Host 'Manage it from this folder:'
-Write-Host '  docker compose ps | logs -f backend | down | pull; docker compose up -d   (update)'
+Write-Host '  docker compose ps | logs -f backend | down'
+Write-Host 'Update it by running the install command again (see docs\INSTALL.md, Updating).'

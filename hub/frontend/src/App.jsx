@@ -991,7 +991,14 @@ function App() {
         )}
         {roomTab === 'secrets' && (
           <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
-            <RoomSecretsPanel key={selectedRoom.id} room={selectedRoom} token={token} />
+            <RoomSecretsPanel
+              key={selectedRoom.id} room={selectedRoom} token={token}
+              onRoomChange={(patch) => {
+                const id = selectedRoom.id;
+                setSelectedRoom(prev => (prev && prev.id === id ? { ...prev, ...patch } : prev));
+                setRooms(prev => prev.map(r => (r.id === id ? { ...r, ...patch } : r)));
+              }}
+            />
           </div>
         )}
       </div>
@@ -1033,8 +1040,10 @@ function App() {
           {renderMain()}
         </div>
         {tab === 'chats' && selectedRoom && !isMobile && roomSidebar}
+        {/* z-40, below the z-50 modals the drawer opens (portaled to <body>), so a
+            dialog launched from the drawer is not hidden behind it. */}
         {tab === 'chats' && selectedRoom && isMobile && roomPanelOpen && (
-          <div className="fixed inset-0 z-[60] flex justify-end" style={{ background: 'rgba(0,0,0,0.5)' }} onClick={() => setRoomPanelOpen(false)}>
+          <div className="fixed inset-0 z-40 flex justify-end" style={{ background: 'rgba(0,0,0,0.5)' }} onClick={() => setRoomPanelOpen(false)}>
             <div className="h-full flex flex-col" style={{ width: 'min(320px, 88vw)', background: 'var(--bg-panel)' }} onClick={e => e.stopPropagation()}>
               <div className="flex items-center justify-between px-4 py-3 border-b flex-shrink-0" style={{ borderColor: 'var(--border)' }}>
                 <p className="font-semibold text-sm" style={{ color: 'var(--text-primary)' }}>Room panel</p>

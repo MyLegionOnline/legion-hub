@@ -274,7 +274,7 @@ async def test_upload_of_a_missing_path_is_free_and_says_which_path():
 
 
 @pytest.mark.asyncio
-async def test_repo_status_separates_no_repository_from_no_credential():
+async def test_repo_status_blocks_only_a_missing_repository():
     from app.core import mcp_gateway
     from app.core.mcp_gateway import execute_mcp_tool
     from app.db.session import engine, get_session
@@ -300,14 +300,15 @@ async def test_repo_status_separates_no_repository_from_no_credential():
         room.git_config = {"repo_url": "https://github.com/acme/site", "branch": "main"}
         await db.commit()
 
-        with patch.object(mcp_gateway, "_gateway_post", gateway):
-            no_cred = await execute_mcp_tool(
-                _binding("vps_repo_status"), owner_id, room_id,
-                {"server": "prod"}, db=db, request_id=uuid4(),
-            )
-        assert "[repo_credential_missing]" in no_cred
-        # Neither case is worth a billed call: both are fixed by a person.
+        # No repository is not worth a billed call: it is fixed by a person.
         gateway.assert_not_awaited()
+
+        # A server without a Hub-issued key is not blocked: it may read the
+        # repository with its own credentials, and the tool's `ls-remote` says.
+        block = await mcp_gateway._vps_repo_block(db, room_id, "prod", None)
+        assert isinstance(block, dict)
+        assert block["credential"] == "none"
+        assert block["remote"].startswith("https://github.com/acme/site")
         break
 
     await engine.dispose()

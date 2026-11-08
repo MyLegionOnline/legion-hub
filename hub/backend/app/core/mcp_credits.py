@@ -693,10 +693,16 @@ async def store_price_snapshot(
     return snapshot
 
 
-async def refresh_price_snapshot(
-    db: AsyncSession, *, market_item_id: UUID, market_slug: str
-) -> "McpPriceSnapshot":
-    """Re-fetch one item's price from Market and update the cached snapshot.
+async def refresh_price_snapshot(*, market_item_id: UUID, market_slug: str) -> "McpPriceSnapshot":
+    """Re-fetch one item's price from Market and commit it to the cached snapshot.
+
+    Opens its own short session and commits, like the charging functions:
+    :func:`resolve_price_mcr` reads the price in a separate session, so a
+    refresh left uncommitted in the caller's (agent-turn-long) transaction
+    would keep charging the old price for the rest of the turn, be lost if
+    that transaction never commits, and hold the snapshot row lock against
+    every other user's discovery meanwhile. The Market round trip happens
+    before the session opens.
 
     Raises whatever ``app.core.market_client`` raises on failure — the caller
     (``room_mcp_tools`` during discovery) decides whether to fall back to a
@@ -705,13 +711,17 @@ async def refresh_price_snapshot(
     from app.core import market_client
 
     catalog_item = await market_client.get_catalog_item(market_slug)
-    return await store_price_snapshot(
-        db,
-        market_item_id=market_item_id,
-        market_slug=market_slug,
-        call_price_mcr=int(catalog_item.get("call_price_mcr") or 0),
-        tool_price_overrides=catalog_item.get("tool_price_overrides") or {},
-    )
+    async_session = _short_session_factory()
+    async with async_session() as db:
+        snapshot = await store_price_snapshot(
+            db,
+            market_item_id=market_item_id,
+            market_slug=market_slug,
+            call_price_mcr=int(catalog_item.get("call_price_mcr") or 0),
+            tool_price_overrides=catalog_item.get("tool_price_overrides") or {},
+        )
+        await db.commit()
+    return snapshot
 
 
 async def refresh_price_snapshot_by_slug(db: AsyncSession, *, market_slug: str) -> "McpPriceSnapshot":

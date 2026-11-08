@@ -306,16 +306,24 @@ async def add_server(
     user: str = DEFAULT_USER,
     root_password: Optional[str] = None,
     root_key: Optional[str] = None,
+    password: Optional[str] = None,
+    key: Optional[str] = None,
     environment: Optional[str] = None,
     request_id: Optional[UUID] = None,
     source_ip: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Add a server: variables for the coordinates, a secret for root access.
+    """Add a server: variables for the coordinates plus one credential.
 
-    Exactly one of ``root_password`` / ``root_key`` is required — this is the
-    one-time credential Stage 8's bootstrap consumes; §3.4/§3.6 forbid the
-    resolver (this module's own :func:`resolve_connection`) from ever reading
-    it back.
+    Exactly one of four credentials is required:
+
+    * ``root_password`` / ``root_key`` — the one-time credential Stage 8's
+      bootstrap consumes; §3.4/§3.6 forbid the resolver (this module's own
+      :func:`resolve_connection`) from ever reading it back.
+    * ``password`` / ``key`` — everyday access to a server that is already
+      set up (services running under their own users) and must not be
+      prepared. Stored as ``VPS_<NAME>_PASSWORD`` / ``VPS_<NAME>_KEY``, the
+      agent connects as ``user`` straight away; what it may do there is still
+      decided by the Room's ``vps_access_mode`` and the policy layer.
 
     Every step after the existence check is best-effort-rolled-back on
     failure: ``create_variable``/``bind_room_secret`` each commit on their
@@ -328,8 +336,8 @@ async def add_server(
     host = str(host or "").strip()
     if not host:
         raise ServerInvalid("host is required")
-    if bool(root_password) == bool(root_key):
-        raise ServerInvalid("exactly one of root_password or root_key is required")
+    if sum(1 for c in (root_password, root_key, password, key) if c) != 1:
+        raise ServerInvalid("exactly one of root_password, root_key, password or key is required")
     port = int(port or DEFAULT_PORT)
     if not (1 <= port <= 65535):
         raise ServerInvalid("port must be between 1 and 65535")
@@ -353,22 +361,21 @@ async def add_server(
             environment=environment, materialize_to_env=False, created_by=actor_user_id,
         ))
 
-        if root_key is not None:
-            await room_secrets.bind_room_secret(
-                db, service=service, room_id=room_id, actor_user_id=actor_user_id,
-                env_name=_var_name(name, "ROOT_KEY"), value=root_key,
-                environment=environment, purpose=SecretPurpose.VPS_ACCESS,
-                kind_override=SecretKind.SSH_PRIVATE_KEY,
-                request_id=request_id, source_ip=source_ip,
-            )
+        if root_key:
+            suffix, value, kind = "ROOT_KEY", root_key, SecretKind.SSH_PRIVATE_KEY
+        elif root_password:
+            suffix, value, kind = "ROOT_PASSWORD", root_password, SecretKind.ROOM_ENV
+        elif key:
+            suffix, value, kind = "KEY", key, SecretKind.SSH_PRIVATE_KEY
         else:
-            await room_secrets.bind_room_secret(
-                db, service=service, room_id=room_id, actor_user_id=actor_user_id,
-                env_name=_var_name(name, "ROOT_PASSWORD"), value=root_password,
-                environment=environment, purpose=SecretPurpose.VPS_ACCESS,
-                kind_override=SecretKind.ROOM_ENV,
-                request_id=request_id, source_ip=source_ip,
-            )
+            suffix, value, kind = "PASSWORD", password, SecretKind.ROOM_ENV
+        await room_secrets.bind_room_secret(
+            db, service=service, room_id=room_id, actor_user_id=actor_user_id,
+            env_name=_var_name(name, suffix), value=value,
+            environment=environment, purpose=SecretPurpose.VPS_ACCESS,
+            kind_override=kind,
+            request_id=request_id, source_ip=source_ip,
+        )
     except Exception:
         for row in created_rows:
             try:

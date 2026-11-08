@@ -3587,6 +3587,7 @@ function InternalAgentChat({ room, token }) {
 
   return (
     <ChatLayout
+      token={token}
       header={
         <div className="flex items-center gap-2">
           <div className="relative">
@@ -4839,6 +4840,7 @@ function RoomChat({ room, token, onDelete, onRoomStateChange, onTaskEvent, onGoa
     )}
     <ChatLayout
       showHeader={false}
+      token={token}
       readOnly={readOnly}
       messages={messages}
       thinking={false}
@@ -4916,6 +4918,7 @@ function getMentionQuery(value, cursorPos) {
 /* ─── Shared layout ─── */
 function ChatLayout({
   header,
+  token = null,
   readOnly = null,
   showHeader = true,
   messages,
@@ -5163,7 +5166,7 @@ function ChatLayout({
         >
           <Lock size={15} className="flex-shrink-0" />
           <span>{readOnly}</span>
-          <RenewPlanLink />
+          <RenewPlanLink token={token} />
         </div>
       ) : (
       <div className="px-4 py-3 flex-shrink-0 border-t" style={{ borderColor: 'var(--border)', background: 'var(--bg-panel)' }}>

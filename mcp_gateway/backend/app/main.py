@@ -53,6 +53,27 @@ market = MarketClient(cache)
 #: mcp-vision it is a shared internal service whose bearer token belongs to
 #: Gateway configuration, not to the public Market catalog record.
 VPS_MCP_SLUG = "legion-vps-mcp"
+_VPS_COMMAND_DEFAULT_TIMEOUT_SEC = {"vps_exec": 60, "vps_service": 120}
+_VPS_COMMAND_MAX_TIMEOUT_SEC = 600
+
+
+def _upstream_timeout_sec(slug: str | None, tool: str, arguments: dict[str, Any] | None) -> float | None:
+    """The upstream MCP request ceiling for one call; None keeps the default.
+
+    A VPS command is allowed to run for its own ``timeout_sec``; cutting the
+    request at the ordinary 30 s abandoned every longer build or restart while
+    it was still running on the server.
+    """
+    if slug == "mcp-vision":
+        return config.VISION_REQUEST_TIMEOUT_SEC
+    if slug == VPS_MCP_SLUG and tool in _VPS_COMMAND_DEFAULT_TIMEOUT_SEC:
+        raw = (arguments or {}).get("timeout_sec")
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
+            command = float(min(raw, _VPS_COMMAND_MAX_TIMEOUT_SEC))
+        else:
+            command = float(_VPS_COMMAND_DEFAULT_TIMEOUT_SEC[tool])
+        return max(config.REQUEST_TIMEOUT_SEC, command + config.VPS_TIMEOUT_MARGIN_SEC)
+    return None
 _EGRESS_MODES = {"broker", "host_firewall", "off"}
 
 
@@ -688,9 +709,9 @@ async def _execute_for_account(body: ExecuteRequest, caller: Caller, room_id: st
     meta = {"user_id": caller.tenant_id()}
     if room_id:
         meta["room_id"] = room_id
-    vision_timeout = config.VISION_REQUEST_TIMEOUT_SEC if item.get("slug") == "mcp-vision" else None
+    upstream_timeout = _upstream_timeout_sec(item.get("slug"), body.tool, body.arguments)
     try:
-        response = await McpHttpClient(endpoint, token=token, timeout_sec=vision_timeout).call(
+        response = await McpHttpClient(endpoint, token=token, timeout_sec=upstream_timeout).call(
             body.tool, body.arguments, meta=meta if isolation == "tenant_aware" else None,
         )
     except HTTPException as exc:
@@ -758,12 +779,8 @@ async def execute(
     meta = {"user_id": user_id}
     if room_id:
         meta["room_id"] = room_id
-    vision_timeout = (
-        config.VISION_REQUEST_TIMEOUT_SEC
-        if item.get("slug") == "mcp-vision"
-        else None
-    )
-    response = await McpHttpClient(endpoint, token=token, timeout_sec=vision_timeout).call(
+    upstream_timeout = _upstream_timeout_sec(item.get("slug"), body.tool, body.arguments)
+    response = await McpHttpClient(endpoint, token=token, timeout_sec=upstream_timeout).call(
         body.tool,
         body.arguments,
         meta=meta if isolation == "tenant_aware" else None,

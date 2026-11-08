@@ -170,13 +170,42 @@ disconnect, remove the line (or set `false`) and run `docker compose up -d` agai
 
 ## Updating
 
+Run the install command again. It downloads the newest bundle into the install
+folder, keeps your `.env` and `config/legion.toml`, moves `LEGION_VERSION` in
+`.env` to the new release, pulls the images and restarts the Hub.
+
+Linux, macOS, WSL:
+
 ```bash
-cd ~/legion          # the install folder
-docker compose pull
-docker compose up -d
+curl -fsSL https://github.com/MyLegionOnline/legion-hub/releases/latest/download/install.sh | sh
 ```
 
-To move to a specific release, set `LEGION_VERSION=v0.1.0` in `.env` first.
+Windows (PowerShell):
+
+```powershell
+irm https://github.com/MyLegionOnline/legion-hub/releases/latest/download/install.ps1 | iex
+```
+
+If the Hub is not in `~/legion`, set `LEGION_DIR` to its folder first
+(`LEGION_DIR=/opt/legion` before `sh`, or `$env:LEGION_DIR = 'D:\legion'` in
+PowerShell). To move to a specific release instead of the newest one:
+
+```bash
+curl -fsSL https://github.com/MyLegionOnline/legion-hub/releases/latest/download/install.sh | sh -s -- --version v0.1.4
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://github.com/MyLegionOnline/legion-hub/releases/latest/download/install.ps1))) -Version v0.1.4
+```
+
+**By hand.** `.env` names the release the Hub runs (`LEGION_VERSION`), so
+`docker compose pull` alone fetches the same release again. Change
+`LEGION_VERSION` in `.env` to the new tag, replace `docker-compose.yml` and
+`Caddyfile` with the ones from that release's bundle (a release may add a
+service or a setting), then run `docker compose pull && docker compose up -d`
+in the install folder. With `LEGION_VERSION=latest`, which a checkout of this
+repository uses, the two commands are enough.
+
 Your data lives in Docker volumes and survives updates. Read the release notes
 before a major step; database changes are applied by the Hub when it starts.
 
@@ -226,6 +255,9 @@ List them with `docker ps -a --filter name=ws-` and remove them with `docker rm 
   screenshots.
 
 ## Troubleshooting
+
+**After an update the Hub still shows the old version.** `LEGION_VERSION` in
+`.env` still names the old release; see [Updating](#updating).
 
 **`docker compose pull` says "denied" or "not found".** The release you asked
 for does not exist or its images are not public yet. Check `LEGION_VERSION` in

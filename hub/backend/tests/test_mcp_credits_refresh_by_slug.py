@@ -83,3 +83,41 @@ async def test_refresh_by_slug_propagates_market_client_failures(monkeypatch):
     db = _FakeSession()
     with pytest.raises(market_client.MarketNotFoundError):
         await refresh_price_snapshot_by_slug(db, market_slug="mcp-vision")
+
+
+class _CommittingSession(_FakeSession):
+    def __init__(self, existing=None):
+        super().__init__(existing)
+        self.committed = False
+
+    async def commit(self):
+        self.committed = True
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+@pytest.mark.asyncio
+async def test_discovery_refresh_commits_in_its_own_session(monkeypatch):
+    """The charge reads the price in a separate session, so a refresh left
+    uncommitted in the caller's turn-long transaction would keep billing the
+    old price — the refresh must commit on its own."""
+    from app.core import mcp_credits
+    from app.models.mcp_credits import McpPriceSnapshot
+
+    market_item_id = uuid.uuid4()
+    stale = McpPriceSnapshot(market_item_id=market_item_id, market_slug="legion-vps-mcp", call_price_mcr=300)
+    session = _CommittingSession(existing=stale)
+    monkeypatch.setattr(mcp_credits, "_short_session_factory", lambda: (lambda: session))
+    monkeypatch.setattr(
+        "app.core.market_client.get_catalog_item",
+        AsyncMock(return_value={"id": str(market_item_id), "call_price_mcr": 200, "tool_price_overrides": {}}),
+    )
+
+    snapshot = await mcp_credits.refresh_price_snapshot(market_item_id=market_item_id, market_slug="legion-vps-mcp")
+
+    assert snapshot.call_price_mcr == 200
+    assert session.committed is True

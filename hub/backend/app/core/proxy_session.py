@@ -1232,6 +1232,26 @@ def _is_retryable_llm_error(exc: BaseException) -> bool:
     return False
 
 
+async def _rollback_if_aborted(db: Any) -> None:
+    """Roll back a session whose transaction a failed tool flush left aborted.
+
+    A tool that fails inside ``flush`` (2026-11-07: a NUL byte in a bash
+    output row) is turned into a tool result below, but the session it used
+    stayed in the "rolled back due to a previous exception" state, so the
+    run's very next write raised ``PendingRollbackError`` and ended the whole
+    task as "proxy session crashed". The aborted transaction's own changes
+    are gone either way; rolling back only lets the run carry on.
+    """
+    if db is None:
+        return
+    try:
+        tx = db.get_transaction()
+        if tx is not None and not tx.is_active:
+            await db.rollback()
+    except Exception:
+        logger.warning("proxy_session: rollback after a failed tool did not succeed", exc_info=True)
+
+
 async def _execute_registry_tool(tool_name: str, ctx: Any, tool_input: dict[str, Any]) -> str:
     """Run one workspace-registry tool and turn its failure into a tool result.
 
@@ -1254,6 +1274,7 @@ async def _execute_registry_tool(tool_name: str, ctx: Any, tool_input: dict[str,
             "proxy_session: tool %s failed (session=%s): %s",
             tool_name, getattr(ctx, "session_id", None), exc, exc_info=True,
         )
+        await _rollback_if_aborted(getattr(ctx, "db", None))
         detail = safe_tool_error_text(str(exc))
         return f"Error: {detail}" if detail else f"Error: {type(exc).__name__}"
 

@@ -219,21 +219,32 @@ export async function pollMcpOAuthStatus(itemId, token, request = fetch) {
   return response.json();
 }
 
+// How long to keep polling after the popup looks closed while the flow is
+// still pending. A provider page with Cross-Origin-Opener-Policy severs the
+// opener's handle, so `popup.closed` turns true while the person is still
+// signing in; the server-side flow state is the source of truth.
+export const OAUTH_CLOSED_GRACE_MS = 120000;
+
 // Opens the provider login popup and resolves once the flow settles —
 // success, a provider error, or the popup being closed before either
-// (treated as a cancellation, never left hanging). `request` is injectable
-// for tests.
-export async function startMcpOAuthPopup(itemId, token, { onPending, request = fetch, popupFeatures = 'width=520,height=680,noopener' } = {}) {
+// (treated as a cancellation after a grace period, never left hanging).
+// `request` is injectable for tests.
+export async function startMcpOAuthPopup(itemId, token, { onPending, request = fetch, popupFeatures = 'width=520,height=680', closedGraceMs = OAUTH_CLOSED_GRACE_MS } = {}) {
   const { authorization_url: authorizationUrl } = await startMcpOAuthLogin(itemId, token, request);
+  // No `noopener` feature here: with it, window.open() returns null by spec
+  // even though the window opens, and the login was reported as blocked
+  // before it even started. The opener link is cut by hand instead.
   const popup = window.open(authorizationUrl, 'legion-mcp-oauth', popupFeatures);
   if (!popup) {
     const error = new Error('The browser blocked the sign-in popup. Allow popups and try again.');
     error.code = 'mcp_oauth_popup_blocked';
     throw error;
   }
+  try { popup.opener = null; } catch { /* already cross-origin */ }
   return new Promise((resolve, reject) => {
     let settled = false;
     let ticking = false;
+    let closedSince = 0;
     const finish = (fn, value) => {
       if (settled) return;
       settled = true;
@@ -262,6 +273,8 @@ export async function startMcpOAuthPopup(itemId, token, { onPending, request = f
               return;
             }
           } catch { /* fall through to cancellation below */ }
+          if (!closedSince) closedSince = Date.now();
+          if (Date.now() - closedSince < closedGraceMs) return;
           finish(reject, Object.assign(new Error('The sign-in window was closed before completion.'), { code: 'mcp_oauth_cancelled' }));
           return;
         }

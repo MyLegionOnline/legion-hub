@@ -578,6 +578,8 @@ async def add_vps_server(
             user=body.user,
             root_password=body.root_password,
             root_key=body.root_key,
+            password=body.password,
+            key=body.key,
             environment=body.environment,
             request_id=request_id_from_request(request),
             source_ip=_source_ip(request),

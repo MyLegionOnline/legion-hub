@@ -50,6 +50,10 @@ def test_volatile_legion_paths_are_excluded():
     # a real, shared CI config stays tracked
     assert ".legion/run.json" not in lines
     assert set(git_ops._VOLATILE_LEGION_PATHS) == {".legion/generation.json", ".legion/runs"}
+    # background job logs: excluded and untracked, but never deleted on disk
+    assert ".legion/bg/" in lines
+    assert ".legion/bg" in git_ops._UNTRACK_LEGION_PATHS
+    assert ".legion/bg" not in git_ops._VOLATILE_LEGION_PATHS
 
 
 def test_fresh_room_keeps_volatile_metadata_out_of_git(repo):
@@ -132,6 +136,43 @@ def test_promotion_heals_a_legacy_tracked_generation_json(repo):
     # generation.json is gone from history on both branches
     assert ".legion/generation.json" not in _g(root, "ls-tree", "-r", "--name-only", "main")
     assert ".legion/generation.json" not in _g(root, "ls-tree", "-r", "--name-only", "dev")
+
+
+def test_promotion_heals_legacy_tracked_bg_logs_on_both_branches(repo):
+    """Field failure: agents' ``git add -A`` committed ``.legion/bg/*.log.exit``
+    on ``dev`` and ``main`` with different bodies, and every ``dev → main``
+    publication died on add/add conflicts. The gate now untracks them on both
+    branches, keeps the on-disk logs (a job may still be writing), and merges."""
+    room_id, root = repo
+    _write(root, "app.py", "v1\n")
+    git_ops.git_commit(room_id, "seed")
+    git_ops.git_merge_branch(room_id, "dev", target="main", theirs=False)
+
+    # pre-fix room: the same bg marker force-committed with different bodies,
+    # and the room's exclude file predates the `.legion/bg/` rule
+    for branch, code in (("main", "0"), ("dev", "1")):
+        git_ops._run(["checkout", branch], cwd=root)
+        _write(root, ".legion/bg/abc.log.exit", f"{code}\n")
+        git_ops._run(["add", "-f", "--", ".legion/bg/abc.log.exit"], cwd=root)
+        git_ops._run(["commit", "-m", f"legacy: bg log on {branch}"], cwd=root)
+    exclude = root / ".git" / "info" / "exclude"
+    exclude.write_text(
+        "\n".join(l for l in exclude.read_text().splitlines() if l != ".legion/bg/") + "\n"
+    )
+
+    git_ops._run(["checkout", "dev"], cwd=root)
+    _write(root, "feature.txt", "shipped\n")
+    git_ops.git_commit(room_id, "feature")
+    _write(root, ".legion/bg/live.log", "still running\n")  # a running job's log
+
+    res = git_ops.git_merge_branch(room_id, "dev", target="main", theirs=False)
+
+    assert res["ok"] and not res["conflict"], res
+    assert _g(root, "show", "main:feature.txt") == "shipped"
+    for branch in ("main", "dev"):
+        names = _g(root, "ls-tree", "-r", "--name-only", branch).splitlines()
+        assert not any(n.startswith(".legion/bg/") for n in names), (branch, names)
+    assert (root / ".legion/bg/live.log").read_text() == "still running\n"
 
 
 def test_revert_commit_parks_a_dirty_tree(repo):

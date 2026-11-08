@@ -1370,6 +1370,9 @@ function ServersSection({ roomId, token, environment, vpsAccessMode, onVpsAccess
   const [user, setUser] = useState('root');
   const [authKind, setAuthKind] = useState('password');
   const [authValue, setAuthValue] = useState('');
+  // 'prepare' — root credentials for the wizard; 'direct' — the server is
+  // already set up, agents connect as `user` with this key/password as is.
+  const [setupMode, setSetupMode] = useState('prepare');
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState(null);
   const [preparing, setPreparing] = useState(null); // the server whose wizard is open
@@ -1394,8 +1397,8 @@ function ServersSection({ roomId, token, environment, vpsAccessMode, onVpsAccess
         name: name.trim(), host: host.trim(), port: Number(port) || 22, user: user.trim() || 'root',
         environment: environment || undefined,
       };
-      if (authKind === 'password') body.root_password = authValue;
-      else body.root_key = authValue;
+      const prefix = setupMode === 'direct' ? '' : 'root_';
+      body[`${prefix}${authKind === 'password' ? 'password' : 'key'}`] = authValue;
       const res = await jsonFetch(`/api/v1/rooms/${roomId}/vps/servers`, token, 'POST', body);
       if (!res.ok) throw new Error(await extractError(res));
       setName(''); setHost(''); setPort(22); setUser('root'); setAuthValue('');
@@ -1431,7 +1434,9 @@ function ServersSection({ roomId, token, environment, vpsAccessMode, onVpsAccess
     <div className="space-y-4 max-w-3xl">
       <p className="text-xs" style={{ color: 'var(--text-secondary)' }}>
         The agent sees a server only by name — the IP, login and credentials never get into its context.
-        The root password/key is used once to prepare the server and can be deleted after that.
+        A new server can be prepared from root (the password/key is used once and can be deleted after that),
+        or connected as is: agents log in as the user you give, and what they may change there is decided
+        by the access mode below.
       </p>
 
       <AccessModeToggle roomId={roomId} token={token} mode={vpsAccessMode} onChange={onVpsAccessModeChange} />
@@ -1439,6 +1444,28 @@ function ServersSection({ roomId, token, environment, vpsAccessMode, onVpsAccess
       <EgressPostureLine roomId={roomId} token={token} mode={vpsAccessMode} />
 
       <form onSubmit={create} className="p-4 rounded-2xl space-y-3" style={{ background: 'var(--bg-card)', border: '1px solid var(--border)' }}>
+        <div className="flex flex-wrap gap-1.5">
+          {[['prepare', 'New server — prepare it'], ['direct', 'Already set up — connect as is']].map(([m, label]) => (
+            <button
+              type="button" key={m} onClick={() => setSetupMode(m)}
+              className="px-2.5 py-1 rounded-full text-[11px] font-medium transition-colors"
+              style={{
+                background: setupMode === m ? 'var(--accent)' : 'var(--bg-hover)',
+                color: setupMode === m ? 'white' : 'var(--text-secondary)',
+                border: '1px solid ' + (setupMode === m ? 'var(--accent)' : 'var(--border)'),
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        {setupMode === 'direct' && (
+          <p className="text-[11px]" style={{ color: 'var(--text-secondary)' }}>
+            Nothing on the server is changed: no legion user, no packages. Agents connect as the user below with
+            this key/password and get that user's file permissions. In Read-only mode they only read; Full asks
+            you before each change; Trusted lets them write without asking.
+          </p>
+        )}
         <div className="grid grid-cols-2 gap-3">
           <Field label="Name">
             <input required value={name} onChange={(e) => setName(e.target.value.toUpperCase())} style={inputStyle} placeholder="PROD" />
@@ -1464,11 +1491,14 @@ function ServersSection({ roomId, token, environment, vpsAccessMode, onVpsAccess
                 border: '1px solid ' + (authKind === k ? 'var(--accent)' : 'var(--border)'),
               }}
             >
-              {k === 'password' ? 'Root password' : 'Root key'}
+              {(setupMode === 'direct' ? '' : 'Root ') + (k === 'password' ? 'password' : 'key')}
             </button>
           ))}
         </div>
-        <Field label={authKind === 'password' ? 'Root password' : 'Root private key (PEM / OpenSSH)'}>
+        <Field
+          label={(setupMode === 'direct' ? 'User\'s ' : 'Root ')
+            + (authKind === 'password' ? 'password' : 'private key (PEM / OpenSSH)')}
+        >
           {authKind === 'password' ? (
             <input required type="password" value={authValue} onChange={(e) => setAuthValue(e.target.value)} style={inputStyle} />
           ) : (
@@ -1501,9 +1531,14 @@ function ServersSection({ roomId, token, environment, vpsAccessMode, onVpsAccess
                 <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
                   <span
                     className="px-1.5 py-0.5 rounded text-[10px]"
-                    style={{ background: 'var(--bg-hover)', color: s.prepared_at ? '#4ade80' : 'var(--text-muted)' }}
+                    style={{
+                      background: 'var(--bg-hover)',
+                      color: s.prepared_at || (s.has_key || s.has_password) ? '#4ade80' : 'var(--text-muted)',
+                    }}
                   >
-                    {s.prepared_at ? `prepared · ${formatTime(s.prepared_at)}` : 'not prepared'}
+                    {s.prepared_at
+                      ? `prepared · ${formatTime(s.prepared_at)}`
+                      : (s.has_key || s.has_password) ? 'connected as is' : 'not prepared'}
                   </span>
                   {(s.has_key || s.has_password) && (
                     <span className="px-1.5 py-0.5 rounded text-[10px]" style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}>
@@ -1573,10 +1608,17 @@ const SECTIONS = [
   { id: 'servers', label: 'Servers', icon: ShieldAlert },
 ];
 
-export function RoomSecretsPanel({ room, token }) {
+export function RoomSecretsPanel({ room, token, onRoomChange }) {
   const [section, setSection] = useState('variables');
   const [environment, setEnvironment] = useState(null); // Stage 12: null = "all"
-  const [vpsAccessMode, setVpsAccessMode] = useState(room?.vps_access_mode || 'readonly');
+  const [vpsAccessMode, setVpsAccessModeLocal] = useState(room?.vps_access_mode || 'readonly');
+  // The panel remounts on every visit to this tab and seeds itself from the
+  // `room` object App holds, so a saved mode must also land there — otherwise
+  // the next visit shows the stale value the room list was loaded with.
+  const setVpsAccessMode = useCallback((mode) => {
+    setVpsAccessModeLocal(mode);
+    onRoomChange?.({ vps_access_mode: mode });
+  }, [onRoomChange]);
   const roomId = room?.id;
 
   if (!roomId) return null;

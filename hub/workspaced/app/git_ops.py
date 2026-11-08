@@ -126,6 +126,11 @@ _LEGION_LOCAL_EXCLUDES = (
     ".legion/git.lock\n"
     ".legion/generation.json\n"
     ".legion/runs/\n"
+    # Background ``bash`` job logs and their ``.exit`` markers. An agent's
+    # ``git add -A`` used to commit them; each room run writes new ones, so
+    # ``dev`` and ``main`` collected diverging copies and the ``dev → main``
+    # gate hit add/add conflicts on pure noise.
+    ".legion/bg/\n"
     # internal design notes Stage 0 — task-formation dialogue archives
     # and drafts. Legion's own infrastructure: written into the room clone only,
     # never committed. If they became tracked they would vanish on branch switch
@@ -156,6 +161,14 @@ _KNOWN_SEED_GITIGNORES = (
 # heals itself the first time it promotes. ``.legion/run.json`` is absent on
 # purpose: it is a shared CI config and must stay tracked.
 _VOLATILE_LEGION_PATHS = (".legion/generation.json", ".legion/runs")
+
+# Legion paths that must leave the index but whose on-disk copy must survive a
+# branch switch: background job logs are still read by ``bash_output`` /
+# ``bash_wait`` (a running job keeps writing to its log), so unlike
+# ``_VOLATILE_LEGION_PATHS`` they are never deleted from the working tree. Once
+# untracked they are covered by ``.git/info/exclude``, and git treats ignored
+# files as expendable on checkout, so they cannot block the switch either.
+_UNTRACK_LEGION_PATHS = (*_VOLATILE_LEGION_PATHS, ".legion/bg")
 
 
 def _workspace_root(room_id: str) -> Path:
@@ -887,7 +900,10 @@ def git_merge_branch(
     # operation) — makes the checkout below abort with "Your local changes
     # would be overwritten by checkout". Park it first, the same guard "Pull
     # from Git" already uses, then clear the volatile remnants so the switch
-    # cannot trip on an untracked-vs-tracked collision.
+    # cannot trip on an untracked-vs-tracked collision. The exclude rules are
+    # refreshed first so a room older than a rule (``.legion/bg/``) has the
+    # just-untracked files ignored — and therefore expendable — on checkout.
+    _write_local_excludes(root)
     park_error = _park_worktree_before_switch(root, room_id, git_current_branch(room_id))
     if park_error:
         return {"ok": False, "conflict": False, "stdout": "", "stderr": park_error}
@@ -1265,7 +1281,7 @@ def git_ls_remote_userfiles(root: Path, ref: str = "FETCH_HEAD", *, limit: int =
 
 
 def _untrack_volatile_legion_paths(root) -> bool:
-    """Drop per-volume Legion metadata (``_VOLATILE_LEGION_PATHS``) from the
+    """Drop per-volume Legion metadata (``_UNTRACK_LEGION_PATHS``) from the
     index if a legacy room still tracks it. Idempotent; does not commit.
 
     ``git rm --cached`` only — the working-tree copies stay, and once they are
@@ -1273,7 +1289,7 @@ def _untrack_volatile_legion_paths(root) -> bool:
     ``git add -A``. Returns True when something was actually unstaged.
     """
     r = _run(
-        ["rm", "-r", "--cached", "--ignore-unmatch", "--", *_VOLATILE_LEGION_PATHS],
+        ["rm", "-r", "--cached", "--ignore-unmatch", "--", *_UNTRACK_LEGION_PATHS],
         cwd=root,
     )
     return r.returncode == 0 and bool(r.stdout.strip())
@@ -1330,7 +1346,7 @@ def _park_worktree_before_switch(root, room_id: str, current: Optional[str]) -> 
     Git" or a gate merge (``git_merge_branch`` / ``git_revert_commit``) makes.
 
     Per-volume Legion metadata a legacy room still tracks
-    (``_VOLATILE_LEGION_PATHS``) is unstaged first so it never lands in project
+    (``_UNTRACK_LEGION_PATHS``) is unstaged first so it never lands in project
     history — ``generation.json`` changes on every operation and would otherwise
     make the tree permanently dirty and dead-end every promotion.
 

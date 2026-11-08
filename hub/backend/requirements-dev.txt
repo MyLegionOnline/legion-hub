@@ -10,6 +10,6 @@
 #
 # pytest.ini sets asyncio_mode = strict, so pytest-asyncio is required, not
 # optional. pytest-randomly is what `-p no:randomly` refers to.
-pytest==9.1.1
-pytest-asyncio==1.4.0
+pytest==9.2.0
+pytest-asyncio==1.4.1.post1
 pytest-randomly==5.0.0

@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from uuid import UUID
-from pydantic import BaseModel, model_validator, field_validator
+from pydantic import BaseModel, Field, model_validator, field_validator
 from app.models.room import RoomState, RoomType, VpsAccessMode
 from app.core.secrets.redaction import assert_no_secret_fields, sanitize_response
 
@@ -33,6 +33,8 @@ class RoomBase(BaseModel):
     coordinator_config: Dict[str, Any] = {}
     git_config: Dict[str, Any] = {}
     vps_access_mode: VpsAccessMode = VpsAccessMode.readonly
+    auto_retry_enabled: bool = True
+    auto_retry_max: int = Field(default=3, ge=1, le=10)
 
     @field_validator("coordinator_config", "git_config")
     @classmethod
@@ -80,6 +82,8 @@ class RoomUpdate(BaseModel):
     coordinator_config: Optional[Dict[str, Any]] = None
     git_config: Optional[Dict[str, Any]] = None
     vps_access_mode: Optional[VpsAccessMode] = None
+    auto_retry_enabled: Optional[bool] = None
+    auto_retry_max: Optional[int] = Field(default=None, ge=1, le=10)
     user_ids: Optional[List[UUID]] = None
     agent_ids: Optional[List[UUID]] = None
 

@@ -28,6 +28,8 @@ class TaskOut(BaseModel):
     stop_reason: Optional[str] = None
     dispatch_status: DispatchStatus = DispatchStatus.READY
     retry_count: int = 0
+    auto_retry_count: int = 0
+    auto_retry_at: Optional[datetime] = None
     rework_count: int = 0
     continuation_of_task_id: Optional[UUID] = None
     assigned_agent_id: Optional[UUID]

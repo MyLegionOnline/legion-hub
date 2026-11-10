@@ -14,6 +14,7 @@ Public API:
 from __future__ import annotations
 
 
+import asyncio
 import json
 import logging
 import os
@@ -72,7 +73,7 @@ from app.core.reasoning import (
     reasoning_from_chat_choice,
     show_reasoning_in_chat,
 )
-from app.core import session_interject
+from app.core import dialogue_queue, loop_guard, session_interject
 from app.core.events import (
     AgentStatus,
     emit_event,
@@ -1978,8 +1979,9 @@ async def _end_turn_on_user_stop(
 async def stop_dialogue_turn(room_id: UUID, user_id: UUID, db: AsyncSession) -> dict[str, Any]:
     """The Stop button: end the user's running dialogue turn in this room.
 
-    ``stopped`` — a turn was running and has been told to wind down at its next
-    boundary (a tool call already in flight finishes first). ``finalized`` — the
+    ``stopped`` — a turn was running and has been told to wind down: a model
+    request in flight is dropped at once, a tool call already in flight
+    finishes first. ``finalized`` — the
     session was idle but still held unrecorded work (a turn that died without its
     gate), which is recorded now. ``idle`` — nothing to stop.
     """
@@ -1995,6 +1997,26 @@ async def stop_dialogue_turn(room_id: UUID, user_id: UUID, db: AsyncSession) -> 
     await _finalize_session_work(session, db, reason=USER_STOP_REASON)
     await db.commit()
     return {"status": "finalized", "session_id": str(session.id)}
+
+
+async def flush_dialogue_queue(room_id: UUID, user_id: UUID, db: AsyncSession) -> dict[str, Any]:
+    """"Send now" on a queued message: hand the queue to the agent right away.
+
+    Queued messages normally wait for the agent's next step, so a long model
+    request is never cut by a message on its own.  This is the explicit
+    override: the request in flight is dropped and asked again with the queued
+    messages in it (``interrupted``); during a tool call they go in right after
+    it (``next_step``).  ``idle`` — no turn is running; ``nothing_queued`` —
+    the queue was already delivered.
+    """
+    from app.repositories.session import SessionRepository
+
+    session = await SessionRepository(db).find_open_user_session(room_id, user_id)
+    if session is None or not turn_in_progress(session.id):
+        return {"status": "idle"}
+    outcome = session_interject.request_flush(session.id)
+    logger.info("flush_dialogue_queue: session %s → %s", session.id, outcome)
+    return {"status": outcome, "session_id": str(session.id)}
 
 
 async def _run_close_flow(
@@ -2882,6 +2904,17 @@ async def open_session_context(
 # a ceiling of 10 cut real answers short; the agent-side proxy loop allows 60
 # (PROXY_AGENT_MAX_TOOL_CALLS).
 _WS_MAX_TOOL_CALLS = int(os.getenv("USER_SESSION_MAX_TOOL_CALLS", "150"))
+# How often a model request in flight reports "waiting for the model" to the
+# chat.  The UI drops a status after 60 s without a fresh one.
+_LLM_HEARTBEAT_S = float(os.getenv("USER_SESSION_LLM_HEARTBEAT_S", "10"))
+
+
+class _LLMCallAborted(Exception):
+    """The user cut the model request short: Stop, or "Send now" on a queued message."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 # ``bash_wait`` blocks server-side until a background process exits, so a turn
 # that installs packages or runs a long build must not pay a budget step for it.
 # Each wait refunds its step, up to this many per turn, so a hung process
@@ -3574,6 +3607,97 @@ async def _call_with_ws_loop_impl(
     # _looks_like_unexecuted_tool_call / _TOOL_MIMIC_MAX_RETRIES.
     tool_mimic_retries = 0
 
+    # One model request of this loop once hung for 14 minutes with the chat
+    # silent and the Stop bar gone (its status expired after 60 s).  Every
+    # request is now awaited beside a heartbeat ("waiting for the model ·
+    # 3:40") and beside the abort event that Stop and "Send now" set
+    # (session_interject).  A queued message alone never aborts it.
+    _turn_t0 = time.monotonic()
+
+    async def _await_llm(awaitable: Any) -> Any:
+        abort = session_interject.begin_llm_call(session_id)
+        call = asyncio.ensure_future(awaitable)
+        started = time.monotonic()
+
+        async def _beat() -> None:
+            now = time.monotonic()
+            await emit_status(
+                room_id,
+                AgentStatus.LLM_HEARTBEAT,
+                session_id=session_id,
+                agent_id=agent_id,
+                extra={
+                    "elapsed_s": int(now - _turn_t0),
+                    "phase": "llm",
+                    "attempt": 1,
+                    "max_attempts": 1,
+                    "attempt_elapsed_s": int(now - started),
+                    "provider": provider,
+                    "queued_messages": len(session_interject._PENDING.get(session_id, [])),
+                },
+            )
+
+        waiter = asyncio.ensure_future(abort.wait())
+        try:
+            await _beat()
+            while True:
+                done, _ = await asyncio.wait(
+                    {call, waiter},
+                    timeout=_LLM_HEARTBEAT_S,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if call in done:
+                    return call.result()
+                if waiter in done:
+                    reason = session_interject.abort_reason(session_id) or session_interject.ABORT_STOP
+                    logger.info(
+                        "user_sessions: model request of session %s aborted (%s) after %.0fs",
+                        session_id, reason, time.monotonic() - started,
+                    )
+                    raise _LLMCallAborted(reason)
+                await _beat()
+        finally:
+            session_interject.end_llm_call(session_id, abort)
+            for fut in (waiter, call):
+                if not fut.done():
+                    fut.cancel()
+            await asyncio.gather(waiter, call, return_exceptions=True)
+
+    async def _on_abort(exc: "_LLMCallAborted") -> _LLMTurnResult | None:
+        """Stop → the stopped result; "Send now" → ``None`` (ask again)."""
+        if exc.reason == session_interject.ABORT_STOP:
+            stopped = await _stopped_result()
+            if stopped is not None:
+                return stopped
+            return _result(
+                None, None, total_in, total_out, model,
+                tool_notes=tool_notes, externally_stopped=True,
+            )
+        return None
+
+    async def _take_and_mark_interjections() -> str | None:
+        note = _take_interjections()
+        if note is not None:
+            await dialogue_queue.publish_marks(session_id, room_id)
+        return note
+
+    error_streak = loop_guard.ToolErrorStreak()
+
+    def _guard_tool_result(tool_name: str, result_text: Any) -> Any:
+        """Signal D (loop_guard): the note goes in front, ahead of truncation."""
+        if not isinstance(result_text, str):
+            return result_text
+        note = error_streak.observe(tool_name, result_text)
+        if note is None:
+            return result_text
+        logger.warning(
+            "user_sessions: session %s — %s failed the same way %d times in a row "
+            "(note %d, exhausted=%s)",
+            session_id, tool_name, error_streak.limit, error_streak.notes,
+            error_streak.exhausted,
+        )
+        return note + "\n" + result_text
+
     # ---- Anthropic path ----
     if uses_messages_wire(provider, model):
         if uses_anthropic_env_key(provider):
@@ -3597,7 +3721,9 @@ async def _call_with_ws_loop_impl(
             stopped = await _stopped_result()
             if stopped is not None:
                 return stopped
-            _note = _take_interjections()
+            if error_streak.exhausted:
+                break
+            _note = await _take_and_mark_interjections()
             if _note is not None:
                 session_interject.append_user_note(working, _note)
             if not _budget_left():
@@ -3636,18 +3762,26 @@ async def _call_with_ws_loop_impl(
             apply_reasoning_body(body, llm_config, provider, model)
             _reasoning_t0 = time.monotonic()
             await release_db(db, reason="ws_loop/anthropic")
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await timed_llm(
-                    client.post(
-                        messages_url(provider, base_url),
-                        headers=messages_headers(provider, api_key),
-                        json=body,
-                    ),
-                    provider=provider,
-                    side=SIDE_CHAT_MASTER,
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    resp = await _await_llm(timed_llm(
+                        client.post(
+                            messages_url(provider, base_url),
+                            headers=messages_headers(provider, api_key),
+                            json=body,
+                        ),
+                        provider=provider,
+                        side=SIDE_CHAT_MASTER,
+                    ))
+                    resp.raise_for_status()
+                    data = resp.json()
+            except _LLMCallAborted as exc:
+                stopped = await _on_abort(exc)
+                if stopped is not None:
+                    return stopped
+                # "Send now": ask again with the queued messages, same step.
+                _iter -= 1
+                continue
             _text_all, _thinking = messages_text_and_thinking(data)
             await _emit_reasoning(
                 _thinking, messages_reasoning_tokens(data), started_at=_reasoning_t0
@@ -3688,16 +3822,24 @@ async def _call_with_ws_loop_impl(
                     )
                     retry_body = {**body, "tool_choice": {"type": "any"}}
                     await release_db(db, reason="ws_loop/anthropic_mimic_retry")
-                    async with httpx.AsyncClient(timeout=120.0) as retry_client:
-                        retry_resp = await timed_llm(
-                            retry_client.post(
-                                messages_url(provider, base_url),
-                                headers=messages_headers(provider, api_key),
-                                json=retry_body,
-                            ),
-                            provider=provider,
-                            side=SIDE_CHAT_MASTER,
-                        )
+                    try:
+                        async with httpx.AsyncClient(timeout=120.0) as retry_client:
+                            retry_resp = await _await_llm(timed_llm(
+                                retry_client.post(
+                                    messages_url(provider, base_url),
+                                    headers=messages_headers(provider, api_key),
+                                    json=retry_body,
+                                ),
+                                provider=provider,
+                                side=SIDE_CHAT_MASTER,
+                            ))
+                    except _LLMCallAborted as exc:
+                        stopped = await _on_abort(exc)
+                        if stopped is not None:
+                            return stopped
+                        # "Send now": the user's message matters more than
+                        # re-asking for this tool call — answer the text.
+                        break
                     if retry_resp.status_code >= 400:
                         break
                     retry_data = retry_resp.json()
@@ -3814,6 +3956,7 @@ async def _call_with_ws_loop_impl(
                         result_text = await _exec_ws_tool(tool_name, tool_input_data)
                         if tool_name == _WS_WAIT_TOOL and _wait_refunds < _WS_MAX_WAIT_REFUNDS:
                             _wait_refunds += 1
+                    result_text = _guard_tool_result(tool_name, result_text)
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tool_id,
@@ -3854,6 +3997,7 @@ async def _call_with_ws_loop_impl(
                         )
                         result_text, circuit_open = _observe_mcp_result(tool_name, result_text)
                         mcp_circuit_open = mcp_circuit_open or circuit_open
+                    result_text = _guard_tool_result(tool_name, result_text)
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tool_id,
@@ -3939,7 +4083,9 @@ async def _call_with_ws_loop_impl(
         stopped = await _stopped_result()
         if stopped is not None:
             return stopped
-        _note = _take_interjections()
+        if error_streak.exhausted:
+            break
+        _note = await _take_and_mark_interjections()
         if _note is not None:
             session_interject.append_user_note(working_oai, _note)
         if not _budget_left():
@@ -3972,17 +4118,25 @@ async def _call_with_ws_loop_impl(
         apply_reasoning_chat(create_extra_oai, llm_config, provider, model)
         _reasoning_t0 = time.monotonic()
         await release_db(db, reason="ws_loop/openai")
-        resp_oai = await timed_llm(
-            oai.chat.completions.create(
-                model=model,
-                messages=request_messages_oai,
-                tools=all_oai_tools,
-                tool_choice="auto",
-                **create_extra_oai,
-            ),
-            provider=provider,
-            side=SIDE_CHAT_MASTER,
-        )
+        try:
+            resp_oai = await _await_llm(timed_llm(
+                oai.chat.completions.create(
+                    model=model,
+                    messages=request_messages_oai,
+                    tools=all_oai_tools,
+                    tool_choice="auto",
+                    **create_extra_oai,
+                ),
+                provider=provider,
+                side=SIDE_CHAT_MASTER,
+            ))
+        except _LLMCallAborted as exc:
+            stopped = await _on_abort(exc)
+            if stopped is not None:
+                return stopped
+            # "Send now": ask again with the queued messages, same step.
+            _iter -= 1
+            continue
         choice = resp_oai.choices[0]
         usage_oai = resp_oai.usage
         await _emit_reasoning(
@@ -4021,17 +4175,25 @@ async def _call_with_ws_loop_impl(
                     session_id, tool_mimic_retries, _TOOL_MIMIC_MAX_RETRIES,
                 )
                 await release_db(db, reason="ws_loop/openai_mimic_retry")
-                retry_resp_oai = await timed_llm(
-                    oai.chat.completions.create(
-                        model=model,
-                        messages=request_messages_oai,
-                        tools=all_oai_tools,
-                        tool_choice="required",
-                        **create_extra_oai,
-                    ),
-                    provider=provider,
-                    side=SIDE_CHAT_MASTER,
-                )
+                try:
+                    retry_resp_oai = await _await_llm(timed_llm(
+                        oai.chat.completions.create(
+                            model=model,
+                            messages=request_messages_oai,
+                            tools=all_oai_tools,
+                            tool_choice="required",
+                            **create_extra_oai,
+                        ),
+                        provider=provider,
+                        side=SIDE_CHAT_MASTER,
+                    ))
+                except _LLMCallAborted as exc:
+                    stopped = await _on_abort(exc)
+                    if stopped is not None:
+                        return stopped
+                    # "Send now": the user's message matters more than
+                    # re-asking for this tool call — answer the text.
+                    break
                 retry_choice = retry_resp_oai.choices[0]
                 retry_usage_oai = retry_resp_oai.usage
                 total_in += retry_usage_oai.prompt_tokens if retry_usage_oai else 0
@@ -4124,6 +4286,7 @@ async def _call_with_ws_loop_impl(
                     result_text = await _exec_ws_tool(tc.function.name, tool_args)
                     if tc.function.name == _WS_WAIT_TOOL and _wait_refunds < _WS_MAX_WAIT_REFUNDS:
                         _wait_refunds += 1
+                result_text = _guard_tool_result(tc.function.name, result_text)
                 working_oai.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -4164,6 +4327,7 @@ async def _call_with_ws_loop_impl(
                     )
                     result_text, circuit_open = _observe_mcp_result(tc.function.name, result_text)
                     mcp_circuit_open = mcp_circuit_open or circuit_open
+                result_text = _guard_tool_result(tc.function.name, result_text)
                 working_oai.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -4380,13 +4544,18 @@ async def process_user_turn(
     stop.
     """
     if inject_user_message and session.id in _ACTIVE_TURNS:
-        session_interject.queue(session.id, user_message_text)
+        # The bubble is marked "queued" (with "Send now") before the text is
+        # parked, so the loop's drain always finds the id next to the text.
+        message_id = await dialogue_queue.mark_queued(session, user_message_text)
+        session_interject.queue(session.id, user_message_text, message_id)
         logger.info(
             "process_user_turn: session %s is mid-turn — message queued for the loop",
             session.id,
         )
         return True
     _ACTIVE_TURNS.add(session.id)
+    if inject_user_message:
+        await dialogue_queue.drop_stale(session.room_id, getattr(session, "user_id", None))
     try:
         still_open = await _process_user_turn(
             session,
@@ -4403,6 +4572,7 @@ async def process_user_turn(
             pending = session_interject.drain(session.id)
             if not pending:
                 break
+            await dialogue_queue.publish_marks(session.id, session.room_id)
             still_open = await _process_user_turn(
                 session, "\n\n".join(pending), db, allow_rotation=allow_rotation,
             )
@@ -4410,6 +4580,7 @@ async def process_user_turn(
     finally:
         _ACTIVE_TURNS.discard(session.id)
         session_interject.clear(session.id)
+        await dialogue_queue.publish_marks(session.id, session.room_id)
 
 
 async def _process_user_turn(

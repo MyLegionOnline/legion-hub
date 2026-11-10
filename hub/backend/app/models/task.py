@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional, List, TYPE_CHECKING
 from uuid import UUID, uuid4
-from sqlalchemy import Column, Integer, String, DateTime, Uuid, text
+from sqlalchemy import Column, DateTime, Integer, String, Uuid, event, text
 from sqlmodel import SQLModel, Field, Relationship, JSON
 
 if TYPE_CHECKING:
@@ -126,6 +126,15 @@ class Task(SQLModel, table=True):
         default=0,
         sa_column=Column("retry_count", Integer, nullable=False, server_default="0"),
     )
+    auto_retry_count: int = Field(
+        default=0,
+        sa_column=Column("auto_retry_count", Integer, nullable=False, server_default="0"),
+    )
+    auto_retry_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), nullable=True),
+    )
+    auto_retry_reason: Optional[str] = Field(default=None)
     rework_count: int = Field(
         default=0,
         sa_column=Column("rework_count", Integer, nullable=False, server_default="0"),
@@ -289,6 +298,15 @@ class Task(SQLModel, table=True):
     )
 
     sessions: List["AgentSession"] = Relationship(back_populates="task")
+
+
+@event.listens_for(Task.state, "set")
+def _reset_auto_retry_on_state_change(task: Task, state: TaskState, previous, _initiator) -> None:
+    if state != previous:
+        task.auto_retry_at = None
+        task.auto_retry_reason = None
+    if state in (TaskState.WAITING_REVIEW, TaskState.COMPLETED):
+        task.auto_retry_count = 0
 
 
 class TaskDependency(SQLModel, table=True):

@@ -56,6 +56,15 @@ export const BUSY_KINDS = new Set(['dispatching', 'thinking', 'reasoning', 'tool
 // (internal design notes Stage 0). The backend cuts one off at 600 s.
 export const SLOW_ATTEMPT_S = 180;
 
+/** 220 → "3:40", 3725 → "1:02:05". */
+export function formatClock(totalSeconds) {
+  const s = Math.max(0, Math.floor(totalSeconds || 0));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = String(s % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`;
+}
+
 /*
  * llm_heartbeat covers a whole agent turn: model requests AND the tools the
  * turn runs. `elapsed_s` is the turn; `phase` (+ attempt/tool fields, see
@@ -93,10 +102,11 @@ function describeThinking(entry, extra, now, kind, color) {
     lines.unshift(slow
       ? `model not responding for ${t}s — the provider may be hung`
       : `waiting for model reply ${t}s`);
+    if (extra.queued_messages) lines.push(`your messages waiting for the next step: ${extra.queued_messages}`);
     return {
       kind,
       color: slow ? KIND_COLORS.stalled : color,
-      label: `thinking… ${t}s${retry}`,
+      label: `waiting for the model · ${formatClock(t)}${retry}`,
       title: lines.join('\n'),
     };
   }

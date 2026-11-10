@@ -1207,20 +1207,17 @@ async def pause_workspace_tasks(
     from app.models.workspace import Workspace
 
     result = await db.execute(
-        select(Task).where(
+        select(Task)
+        .where(
             Task.room_id == room_id,
             Task.state.in_(
-                [
-                    TaskState.IN_PROGRESS,
-                    TaskState.PAUSING,
-                    TaskState.RESUMING,
-                    # A watchdog can mark the lifecycle blocked before an
-                    # inner tool-loop has observed the stop.  It still needs
-                    # a user-initiated runtime stop request.
-                    TaskState.BLOCKED,
-                ]
-            ),
+                [TaskState.IN_PROGRESS, TaskState.PAUSING, TaskState.RESUMING, TaskState.BLOCKED]
+            )
+            | ((Task.state == TaskState.ASSIGNED) & Task.auto_retry_reason.is_not(None)),
         )
+        .order_by(Task.id)
+        .with_for_update(key_share=True)
+        .execution_options(populate_existing=True)
     )
     tasks = result.scalars().all()
     now = _now()
@@ -1255,6 +1252,8 @@ async def pause_workspace_tasks(
         await request_task_stop(task.id, pause_reason, db)
         task.pause_reason = pause_reason
         task.paused_at = now
+        task.auto_retry_at = None
+        task.auto_retry_reason = None
         task.updated_at = now.replace(tzinfo=None)
         # Preserve the diagnostic BLOCKED lifecycle state; it is distinct from
         # whether a stale runtime is being stopped.  Runnable tasks move into

@@ -61,6 +61,7 @@ async def close_room(
     readable (internal design notes TR4). ``notice`` is posted to the room's
     history as ``notice_event`` when anything was actually stopped.
     """
+    from app.core.auto_retry import clear_room_auto_retries
     from app.core.billing_interval import close_usage
     from app.core.workspace_lifecycle import (
         WorkspaceStartError,
@@ -68,7 +69,7 @@ async def close_room(
         publish_room_closed,
         stop_workspace,
     )
-    from app.models.task import Task
+    from app.models.task import Task, TaskState
     from app.models.workspace import Workspace, WorkspaceUsage
 
     ws = (
@@ -81,7 +82,10 @@ async def close_room(
     live_task = (
         await db.execute(
             select(Task.id).where(
-                Task.room_id == room_id, Task.state.in_(_live_task_states())
+                Task.room_id == room_id,
+                Task.state.in_(_live_task_states())
+                | Task.auto_retry_at.is_not(None)
+                | ((Task.state == TaskState.ASSIGNED) & Task.auto_retry_reason.is_not(None)),
             ).limit(1)
         )
     ).first()
@@ -117,6 +121,7 @@ async def close_room(
         ws.closed_at = now
         ws.presence_at = None
         db.add(ws)
+    await clear_room_auto_retries(room_id, db)
     await db.commit()
 
     if close_view:

@@ -19,7 +19,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from app.api.v1.tasks import MAX_TASK_RETRIES, change_task_state, retry_task
+from app.api.v1.tasks import MAX_TASK_RETRIES, change_task_state, resume_task, retry_task
+from app.core.proxy_session import TaskDispatchPreflightError
+from app.core.task_restart import restart_task
 from app.core.watchdog import close_open_task_sessions
 from app.models.task import DispatchStatus, TaskState
 from app.schemas.task import TaskRetry, TaskStateChange
@@ -73,6 +75,7 @@ def _make_task(state=TaskState.BLOCKED, retry_count=0) -> SimpleNamespace:
         state=state,
         dispatch_status=DispatchStatus.DISPATCHED,
         retry_count=retry_count,
+        auto_retry_count=0,
         assigned_agent_id=uuid.uuid4(),
         created_by_agent_id=None,
         created_at=NOW,
@@ -133,8 +136,6 @@ async def test_close_open_task_sessions_noop_when_nothing_open():
 @pytest.mark.asyncio
 async def test_start_rejects_before_changing_state_when_dispatch_is_unavailable():
     """The Start button must not recreate an in-progress task with no session."""
-    from app.core.proxy_session import TaskDispatchPreflightError
-
     task = _make_task(TaskState.ASSIGNED)
     db = _make_db([
         _result(first_row=object()),  # _verify_membership
@@ -165,7 +166,7 @@ async def test_start_rejects_before_changing_state_when_dispatch_is_unavailable(
 async def test_start_dispatches_direct_task_without_goal_or_plan():
     task = _make_task(TaskState.ASSIGNED)
     task.goal_id = None
-    db = _endpoint_db(task)
+    db = _endpoint_db(task, restart=False)
 
     with (
         patch("app.api.v1.tasks.prepare_task_dispatch", new_callable=AsyncMock,
@@ -191,13 +192,14 @@ async def test_start_dispatches_direct_task_without_goal_or_plan():
     )
 
 
-def _endpoint_db(task, plan_id=None):
+def _endpoint_db(task, plan_id=None, *, restart=True):
     """db.execute sequence for the endpoint happy path."""
     agent = MagicMock()
     agent.nickname = "worker"
     return _make_db([
         _result(first_row=object()),          # _verify_membership
-        _result(first_row=task),              # _get_task
+        *([_result(first_row=task)] if restart else []),  # Read the current attempt.
+        _result(first_row=task),              # Lock the task and re-read the attempt.
         _result(first_row=agent),             # _enrich_task: agent
         _result(all_rows=[]),                 # _enrich_task: sessions
         _result(row=(1,)),                    # _enrich_task: assignee still in the room
@@ -221,11 +223,11 @@ async def test_retry_blocked_task_resets_state_and_redispatches():
     db = _endpoint_db(task, plan_id=plan_id)
 
     with (
-        patch("app.api.v1.tasks.close_open_task_sessions", new_callable=AsyncMock, return_value=2) as mock_close,
-        patch("app.api.v1.tasks.emit_event", new_callable=AsyncMock) as mock_event,
-        patch("app.api.v1.tasks.prepare_task_dispatch", new_callable=AsyncMock,
+        patch("app.core.task_restart.close_open_task_sessions", new_callable=AsyncMock, return_value=2) as mock_close,
+        patch("app.core.task_restart.emit_event", new_callable=AsyncMock) as mock_event,
+        patch("app.core.task_restart.prepare_task_dispatch", new_callable=AsyncMock,
               return_value=_dispatch_context(task, plan_id)),
-        patch("app.api.v1.tasks.request_task_dispatch", new_callable=AsyncMock,
+        patch("app.core.task_restart.request_task_dispatch", new_callable=AsyncMock,
               return_value="started") as mock_dispatch,
     ):
         out = await retry_task(task.room_id, task.id, TaskRetry(), False, db, MagicMock())
@@ -234,6 +236,7 @@ async def test_retry_blocked_task_resets_state_and_redispatches():
     assert task.state == TaskState.ASSIGNED
     assert task.dispatch_status == DispatchStatus.READY
     assert task.retry_count == 2
+    assert task.auto_retry_count == 0
     assert out.retry_count == 2
 
     mock_event.assert_awaited_once()
@@ -249,17 +252,50 @@ async def test_retry_blocked_task_resets_state_and_redispatches():
 
 
 @pytest.mark.asyncio
+async def test_retry_preflight_failure_restores_assignee_before_any_restart():
+    task = _make_task()
+    db = _endpoint_db(task)
+    original_assignee = task.assigned_agent_id
+    new_assignee = uuid.uuid4()
+
+    async def reject_dispatch(candidate, session, *, require_ready):
+        assert candidate.assigned_agent_id == new_assignee
+        assert session is db
+        assert require_ready is False
+        raise TaskDispatchPreflightError("no_chat_master", "coordinator not configured")
+
+    with (
+        patch("app.api.v1.tasks._require_room_agent", new_callable=AsyncMock) as membership,
+        patch("app.core.task_restart.prepare_task_dispatch", side_effect=reject_dispatch),
+        patch("app.core.task_restart.close_open_task_sessions", new_callable=AsyncMock) as close,
+        pytest.raises(HTTPException) as exc,
+    ):
+        await retry_task(
+            task.room_id, task.id, TaskRetry(assigned_agent_id=new_assignee), False, db, MagicMock(),
+        )
+
+    assert exc.value.status_code == 422
+    assert exc.value.detail == "Task cannot be retried: no_chat_master (coordinator not configured)"
+    membership.assert_awaited_once_with(task.room_id, new_assignee, db)
+    assert task.assigned_agent_id == original_assignee
+    assert task.state == TaskState.BLOCKED
+    assert task.retry_count == task.auto_retry_count == 0
+    close.assert_not_awaited()
+    db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_retry_assigned_task_after_proxy_failure_redispatches():
     """A failed proxy can leave the task assigned after closing both sessions."""
     task = _make_task(TaskState.ASSIGNED, retry_count=1)
     db = _endpoint_db(task, plan_id=uuid.uuid4())
 
     with (
-        patch("app.api.v1.tasks.close_open_task_sessions", new_callable=AsyncMock),
-        patch("app.api.v1.tasks.emit_event", new_callable=AsyncMock),
-        patch("app.api.v1.tasks.prepare_task_dispatch", new_callable=AsyncMock,
+        patch("app.core.task_restart.close_open_task_sessions", new_callable=AsyncMock),
+        patch("app.core.task_restart.emit_event", new_callable=AsyncMock),
+        patch("app.core.task_restart.prepare_task_dispatch", new_callable=AsyncMock,
               return_value=_dispatch_context(task, task.goal_id)),
-        patch("app.api.v1.tasks.request_task_dispatch", new_callable=AsyncMock,
+        patch("app.core.task_restart.request_task_dispatch", new_callable=AsyncMock,
               return_value="started"),
     ):
         out = await retry_task(task.room_id, task.id, TaskRetry(), False, db, MagicMock())
@@ -277,11 +313,11 @@ async def test_retry_pausing_task_restarts_and_clears_pause_metadata():
     db = _endpoint_db(task, plan_id=uuid.uuid4())
 
     with (
-        patch("app.api.v1.tasks.close_open_task_sessions", new_callable=AsyncMock),
-        patch("app.api.v1.tasks.emit_event", new_callable=AsyncMock) as mock_event,
-        patch("app.api.v1.tasks.prepare_task_dispatch", new_callable=AsyncMock,
+        patch("app.core.task_restart.close_open_task_sessions", new_callable=AsyncMock),
+        patch("app.core.task_restart.emit_event", new_callable=AsyncMock) as mock_event,
+        patch("app.core.task_restart.prepare_task_dispatch", new_callable=AsyncMock,
               return_value=_dispatch_context(task, task.goal_id)),
-        patch("app.api.v1.tasks.request_task_dispatch", new_callable=AsyncMock,
+        patch("app.core.task_restart.request_task_dispatch", new_callable=AsyncMock,
               return_value="started") as mock_dispatch,
     ):
         out = await retry_task(task.room_id, task.id, TaskRetry(), False, db, MagicMock())
@@ -303,6 +339,7 @@ async def test_retry_refused_for_non_retryable_states(state):
     db = _make_db([
         _result(first_row=object()),
         _result(first_row=task),
+        _result(first_row=task),
     ])
 
     with pytest.raises(HTTPException) as exc:
@@ -316,6 +353,7 @@ async def test_retry_limit_reached_refused_without_force():
     task = _make_task(TaskState.BLOCKED, retry_count=MAX_TASK_RETRIES)
     db = _make_db([
         _result(first_row=object()),
+        _result(first_row=task),
         _result(first_row=task),
     ])
 
@@ -332,17 +370,133 @@ async def test_retry_limit_bypassed_with_force():
     db = _endpoint_db(task, plan_id=uuid.uuid4())
 
     with (
-        patch("app.api.v1.tasks.close_open_task_sessions", new_callable=AsyncMock, return_value=0),
-        patch("app.api.v1.tasks.emit_event", new_callable=AsyncMock),
-        patch("app.api.v1.tasks.prepare_task_dispatch", new_callable=AsyncMock,
+        patch("app.core.task_restart.close_open_task_sessions", new_callable=AsyncMock, return_value=0),
+        patch("app.core.task_restart.emit_event", new_callable=AsyncMock),
+        patch("app.core.task_restart.prepare_task_dispatch", new_callable=AsyncMock,
               return_value=_dispatch_context(task, task.goal_id)),
-        patch("app.api.v1.tasks.request_task_dispatch", new_callable=AsyncMock,
+        patch("app.core.task_restart.request_task_dispatch", new_callable=AsyncMock,
               return_value="started"),
     ):
         out = await retry_task(task.room_id, task.id, TaskRetry(), True, db, MagicMock())
 
     assert task.state == TaskState.ASSIGNED
     assert out.retry_count == MAX_TASK_RETRIES + 1
+
+
+# ---------------------------------------------------------------------------
+# resume_task endpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resume_restores_history_without_spending_a_manual_retry():
+    task = _make_task(TaskState.PAUSED, retry_count=MAX_TASK_RETRIES)
+    task.pause_reason = "workspace_switch"
+    task.paused_at = NOW
+    db = _endpoint_db(task)
+    history = [{"role": "user", "content": "Continue the task"}]
+
+    with (
+        patch("app.core.task_restart._last_limit_reason", new_callable=AsyncMock,
+              return_value="tool_calls"),
+        patch("app.core.task_restart.load_paused_history", new_callable=AsyncMock,
+              return_value=history) as mock_history,
+        patch("app.core.task_restart.prepare_task_dispatch", new_callable=AsyncMock),
+        patch("app.core.task_restart.close_open_task_sessions", new_callable=AsyncMock,
+              return_value=2) as mock_close,
+        patch("app.core.task_restart.emit_event", new_callable=AsyncMock) as mock_event,
+        patch("app.core.task_restart.request_task_dispatch", new_callable=AsyncMock,
+              return_value="started") as mock_dispatch,
+    ):
+        out = await resume_task(task.room_id, task.id, db, MagicMock())
+
+    mock_history.assert_awaited_once_with(task.id, db)
+    mock_close.assert_awaited_once_with(task.id, "retry", db)
+    mock_dispatch.assert_awaited_once_with(task, task.room_id, db, resume=True, source="resume")
+    assert task.state == TaskState.ASSIGNED
+    assert task.dispatch_status == DispatchStatus.READY
+    assert task.pause_reason == "workspace_switch"
+    assert task.paused_at == NOW
+    assert out.retry_count == MAX_TASK_RETRIES
+    assert task.auto_retry_count == 0
+    assert mock_event.await_args.kwargs["event_type"] == "TASK_RESUMED"
+    assert mock_event.await_args.kwargs["metadata"] == {
+        "task_id": str(task.id),
+        "task_title": task.title,
+        "prev_state": "paused",
+        "sessions_closed": 2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_resume_without_history_refuses_before_changing_the_task():
+    task = _make_task()
+    db = _endpoint_db(task)
+
+    with (
+        patch("app.core.task_restart.load_paused_history", new_callable=AsyncMock,
+              return_value=None),
+        patch("app.core.task_restart.prepare_task_dispatch", new_callable=AsyncMock) as preflight,
+        pytest.raises(HTTPException) as exc,
+    ):
+        await resume_task(task.room_id, task.id, db, MagicMock())
+
+    assert exc.value.status_code == 422
+    assert exc.value.detail == "No paused limit session found for this task — use retry instead"
+    assert task.state == TaskState.BLOCKED
+    preflight.assert_not_awaited()
+    db.commit.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Automatic restart
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "history", "expected_mode"),
+    [
+        ("retry", None, "retry"),
+        ("resume", [{"role": "user", "content": "Continue the task"}], "resume"),
+        ("resume", None, "retry"),
+    ],
+)
+async def test_automatic_restart_only_spends_an_automatic_attempt(mode, history, expected_mode):
+    task = _make_task(retry_count=MAX_TASK_RETRIES)
+    task.auto_retry_count = 1
+    db = _make_db([])
+
+    with (
+        patch("app.core.task_restart.load_paused_history", new_callable=AsyncMock,
+              return_value=history) as mock_history,
+        patch("app.core.task_restart.prepare_task_dispatch", new_callable=AsyncMock),
+        patch("app.core.task_restart.close_open_task_sessions", new_callable=AsyncMock),
+        patch("app.core.task_restart.emit_event", new_callable=AsyncMock) as mock_event,
+        patch("app.core.task_restart.request_task_dispatch", new_callable=AsyncMock,
+              return_value="started") as mock_dispatch,
+    ):
+        action = await restart_task(
+            task, task.room_id, db, mode=mode, source="auto_retry", reason="tool_calls",
+        )
+
+    if mode == "resume":
+        mock_history.assert_awaited_once_with(task.id, db)
+    else:
+        mock_history.assert_not_awaited()
+    assert action == expected_mode
+    assert task.state == TaskState.ASSIGNED
+    assert task.dispatch_status == DispatchStatus.READY
+    assert task.retry_count == MAX_TASK_RETRIES
+    assert task.auto_retry_count == 2
+    assert mock_event.await_args.kwargs["event_type"] == "TASK_AUTO_RETRIED"
+    assert mock_event.await_args.kwargs["metadata"] == {
+        "attempt": 2, "reason": "tool_calls", "action": expected_mode,
+    }
+    mock_dispatch.assert_awaited_once_with(
+        task, task.room_id, db, resume=expected_mode == "resume", source="auto_retry",
+        auto_retry_started_at=task.updated_at,
+    )
 
 
 # ---------------------------------------------------------------------------

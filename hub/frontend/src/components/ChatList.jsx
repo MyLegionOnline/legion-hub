@@ -3,6 +3,8 @@ import { Search, Hash, Plus, X, Crown, Check, Square } from 'lucide-react';
 import { AgentAvatarSlot } from '../lib/AgentAvatar';
 import StorageBar from './StorageBar';
 import PlanBanner from './PlanBanner';
+import { AutoRetryFields } from './AutoRetrySettings';
+import { autoRetrySettings, DEFAULT_AUTO_RETRY_MAX } from '../lib/autoRetry';
 
 // Message.timestamp is stored naive (no offset) and serializes without one
 // (e.g. "2026-08-14T16:12:23.456"); Room.created_at is timezone-aware and
@@ -66,6 +68,8 @@ function CreateRoomModal({ agents, token, onCreated, onClose }) {
   const [name, setName] = useState('');
   const [selectedAgents, setSelectedAgents] = useState([]);
   const [masterId, setMasterId] = useState(null);
+  const [autoRetryEnabled, setAutoRetryEnabled] = useState(true);
+  const [autoRetryAttempts, setAutoRetryAttempts] = useState(DEFAULT_AUTO_RETRY_MAX);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -89,6 +93,7 @@ function CreateRoomModal({ agents, token, onCreated, onClose }) {
         has_coordinator: !!masterId,
         coordinator_config: masterId ? { master_agent_id: masterId } : {},
         agent_ids: selectedAgents,
+        ...autoRetrySettings(autoRetryEnabled, autoRetryAttempts),
       };
       const res = await fetch('/api/v1/rooms/', {
         method: 'POST',
@@ -140,6 +145,14 @@ function CreateRoomModal({ agents, token, onCreated, onClose }) {
                 onChange={e => setName(e.target.value)}
               />
             </div>
+
+            <AutoRetryFields
+              enabled={autoRetryEnabled}
+              attempts={autoRetryAttempts}
+              onEnabledChange={setAutoRetryEnabled}
+              onAttemptsChange={setAutoRetryAttempts}
+              disabled={loading}
+            />
 
             {/* Agent picker */}
             {agents.length > 0 && (

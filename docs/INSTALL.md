@@ -240,11 +240,15 @@ List them with `docker ps -a --filter name=ws-` and remove them with `docker rm 
 ## Known limits of this release
 
 - **Previews of web apps running in a room** (the Browser tab, where you start a
-  room's app and open it through the Hub) are off. Each app is served on its own
-  address, `svc-<id>.<your domain>`, so it needs wildcard DNS and a wildcard
-  certificate, which this stack does not set up. Agents still run dev servers
-  and check them from inside the room; you just cannot open them in the
-  Browser tab. How the feature works, and what a self-hoster would have to add:
+  room's app and open it through the Hub) are off by default. Each app is
+  served on its own address. With `LEGION_BROWSER_PREVIEW=true` in `.env`
+  (then `docker compose up -d`) that address is
+  `http://svc-<id>.preview.localhost:<LEGION_PORT>`. Browsers resolve
+  `*.localhost` by themselves, so no DNS is needed, but only a browser on the
+  machine that runs the Hub can open it. Serving previews on your own domain
+  needs wildcard DNS and a wildcard certificate, which this stack does not set
+  up. Without previews, agents still run dev servers and check them from inside
+  the room. How the feature works:
   [hub/BROWSER_SERVICES_REFERENCE.md](../hub/BROWSER_SERVICES_REFERENCE.md), section 7.
 - **The Market's SSH tool for servers and its image-understanding tool** are
   not part of the Hub. An agent sees images through its own model when that

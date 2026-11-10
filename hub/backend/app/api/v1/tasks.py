@@ -16,7 +16,6 @@ from app.core.events import emit_event
 from app.core.proxy_session import (
     INFRASTRUCTURE_INTERRUPTION_REASONS,
     TaskDispatchPreflightError,
-    load_paused_history,
     prepare_task_dispatch,
     request_task_dispatch,
 )
@@ -25,6 +24,7 @@ from app.core.task_deps import (
     publish_unblocked_tasks,
     try_unblock_tasks,
 )
+from app.core.task_restart import TaskRestartError, restart_task
 from app.core.task_runtime import (
     RUNTIME_RUNNING,
     RUNTIME_STOP_REQUESTED,
@@ -39,12 +39,11 @@ from app.models.context_artifact import ContextArtifact
 from app.models.message import (
     CHECKPOINT_RESOLVED,
     Message,
+    TASK_AUTO_RETRY_CANCELLED,
     TASK_DEPENDENCY_FAILED,
     TASK_DISPATCH_FAILED,
     TASK_DISPATCH_STARTED,
     TASK_HANDOFF_CREATED,
-    TASK_RESUMED,
-    TASK_RETRIED,
     TASK_STALLED,
     TASK_STATE_CHANGED,
     TOOL_LIMIT_REACHED,
@@ -102,10 +101,13 @@ async def _get_room(room_id: UUID, db: AsyncSession) -> Room:
     return room
 
 
-async def _get_task(task_id: UUID, room_id: UUID, db: AsyncSession) -> Task:
-    res = await db.execute(
-        select(Task).where(Task.id == task_id, Task.room_id == room_id)
-    )
+async def _get_task(
+    task_id: UUID, room_id: UUID, db: AsyncSession, *, lock: bool = False,
+) -> Task:
+    query = select(Task).where(Task.id == task_id, Task.room_id == room_id)
+    if lock:
+        query = query.with_for_update(key_share=True).execution_options(populate_existing=True)
+    res = await db.execute(query)
     task = res.scalars().first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -625,11 +627,13 @@ async def list_tasks(
     room_id: UUID,
     db: AsyncSession = Depends(get_session),
     current_user: User = Depends(deps.get_current_user),
+    auto_retry_pending: bool = False,
 ) -> Any:
     await _verify_membership(room_id, current_user, db)
-    res = await db.execute(
-        select(Task).where(Task.room_id == room_id).order_by(Task.created_at.asc())
-    )
+    query = select(Task).where(Task.room_id == room_id).order_by(Task.created_at.asc())
+    if auto_retry_pending:
+        query = query.where(Task.state == TaskState.BLOCKED, Task.auto_retry_at.is_not(None))
+    res = await db.execute(query)
     tasks = res.scalars().all()
     return [await _enrich_task(t, db) for t in tasks]
 
@@ -699,7 +703,7 @@ async def change_task_state(
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
     await _verify_membership(room_id, current_user, db)
-    task = await _get_task(task_id, room_id, db)
+    task = await _get_task(task_id, room_id, db, lock=True)
 
     # Idempotent Start (part 3, stage 4): TASK_TRANSITIONS has no
     # in_progress→in_progress entry — states normally only *change* — so
@@ -1483,6 +1487,71 @@ RETRYABLE_STATES = (
 )
 
 
+def _require_auto_retry_schedule(task: Task, scheduled_at: datetime) -> None:
+    if task.state != TaskState.BLOCKED or task.auto_retry_at != scheduled_at:
+        raise HTTPException(status_code=409, detail="This automatic retry is no longer scheduled")
+
+
+@router.post("/{room_id}/tasks/{task_id}/auto-retry/run-now", response_model=TaskOut)
+async def run_task_auto_retry_now(
+    room_id: UUID,
+    task_id: UUID,
+    db: AsyncSession = Depends(get_session),
+    current_user: User = Depends(deps.get_current_user),
+    auto_retry_at: datetime | None = None,
+) -> Any:
+    """Run the pending automatic attempt now instead of waiting for its delay.
+
+    The attempt keeps its scheduled action — Resume continues the saved
+    conversation of a session that hit its limit — and counts as an
+    automatic attempt, not as a manual Retry.
+    """
+    from app.core.auto_retry import AutoRetryBusy, run_claimed_auto_retry
+
+    await _verify_membership(room_id, current_user, db)
+    task = await _get_task(task_id, room_id, db, lock=True)
+    if task.auto_retry_at is None:
+        raise HTTPException(status_code=409, detail="This automatic retry is no longer scheduled")
+    if auto_retry_at is not None:
+        _require_auto_retry_schedule(task, auto_retry_at)
+    try:
+        await run_claimed_auto_retry(task, db)
+    except AutoRetryBusy:
+        raise HTTPException(
+            status_code=409, detail="The room is being updated — try again in a moment",
+        ) from None
+    await db.refresh(task)
+    return await _enrich_task(task, db)
+
+
+@router.post("/{room_id}/tasks/{task_id}/auto-retry/cancel", status_code=204)
+async def cancel_task_auto_retry(
+    room_id: UUID,
+    task_id: UUID,
+    db: AsyncSession = Depends(get_session),
+    current_user: User = Depends(deps.get_current_user),
+    auto_retry_at: datetime | None = None,
+) -> Response:
+    """Withdraw a pending automatic retry while leaving the task blocked."""
+    await _verify_membership(room_id, current_user, db)
+    task = await _get_task(task_id, room_id, db, lock=True)
+    if task.auto_retry_at is None:
+        return Response(status_code=204)
+    if auto_retry_at is not None:
+        _require_auto_retry_schedule(task, auto_retry_at)
+
+    task.auto_retry_at = None
+    task.auto_retry_reason = None
+    await emit_event(
+        room_id=room_id,
+        event_type=TASK_AUTO_RETRY_CANCELLED,
+        content=f'Auto-retry cancelled for task "{task.title}".',
+        db=db,
+        task_id=task.id,
+    )
+    return Response(status_code=204)
+
+
 @router.post("/{room_id}/tasks/{task_id}/retry", response_model=TaskOut)
 async def retry_task(
     room_id: UUID,
@@ -1491,15 +1560,24 @@ async def retry_task(
     force: bool = False,
     db: AsyncSession = Depends(get_session),
     current_user: User = Depends(deps.get_current_user),
+    auto_retry_at: datetime | None = None,
 ) -> Any:
     """Restart a stuck or rejected task (chat upgrade stage 5).
 
     Closes any still-open proxy sessions with reason='retry', resets the task
-    to ASSIGNED + READY and redispatches it. After MAX_TASK_RETRIES automatic
-    retries the endpoint refuses unless ?force=true is passed.
+    to ASSIGNED + READY and redispatches it. After MAX_TASK_RETRIES manual
+    retries the endpoint refuses unless ?force=true is passed. Passing
+    auto_retry_at requires that the same automatic retry is still pending.
     """
     await _verify_membership(room_id, current_user, db)
     task = await _get_task(task_id, room_id, db)
+
+    attempt = task.auto_retry_count
+    task = await _get_task(task_id, room_id, db, lock=True)
+    if auto_retry_at is not None:
+        _require_auto_retry_schedule(task, auto_retry_at)
+    if task.auto_retry_count > attempt:
+        return await _enrich_task(task, db)
 
     if task.state not in RETRYABLE_STATES:
         raise HTTPException(
@@ -1513,57 +1591,13 @@ async def retry_task(
         )
 
     await _require_room_agent(room_id, body.assigned_agent_id, db)
-    original_assignee = task.assigned_agent_id
-    if body.assigned_agent_id is not None:
-        task.assigned_agent_id = body.assigned_agent_id
-
     try:
-        # Validate before mutating anything — configuration must be valid
-        # before the visible state changes. request_task_dispatch resolves
-        # the dispatch context again below, after the reset lands.
-        await prepare_task_dispatch(task, db, require_ready=False)
-    except TaskDispatchPreflightError as exc:
-        task.assigned_agent_id = original_assignee
-        raise HTTPException(
-            status_code=422,
-            detail=f"Task cannot be retried: {exc.code} ({exc})",
-        ) from None
-
-    sessions_closed = await close_open_task_sessions(task.id, "retry", db)
-
-    from app.models.task import DispatchStatus
-    prev_state = task.state
-    task.state = TaskState.ASSIGNED
-    task.dispatch_status = DispatchStatus.READY
-    task.pause_reason = None
-    task.paused_at = None
-    task.retry_count += 1
-    task.updated_at = datetime.utcnow()
-
-    db.add(task)
-    await db.commit()
-    await db.refresh(task)
-
-    await emit_event(
-        room_id=room_id,
-        event_type=TASK_RETRIED,
-        content=f"Task \"{task.title}\" re-queued for retry (attempt {task.retry_count}).",
-        db=db,
-        task_id=task.id,
-        metadata={
-            "task_id": str(task.id),
-            "task_title": task.title,
-            "prev_state": prev_state.value,
-            "retry_count": task.retry_count,
-            "sessions_closed": sessions_closed,
-        },
-    )
-
-    # Retry deliberately starts a new agent conversation.  In contrast, the
-    # /resume endpoint restores the paused transcript, so it is important not
-    # to inherit it here: the fresh task-agent system prompt must be applied.
-    outcome = await request_task_dispatch(task, room_id, db, resume=False, source="retry")
-    _logger.info("tasks: retry dispatch for task %s outcome=%s", task.id, outcome)
+        await restart_task(
+            task, room_id, db, mode="retry", source="retry",
+            assigned_agent_id=body.assigned_agent_id,
+        )
+    except TaskRestartError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
 
     return await _enrich_task(task, db)
 
@@ -2120,52 +2154,20 @@ async def resume_task(
     await _verify_membership(room_id, current_user, db)
     task = await _get_task(task_id, room_id, db)
 
+    attempt = task.auto_retry_count
+    task = await _get_task(task_id, room_id, db, lock=True)
+    if task.auto_retry_count > attempt:
+        return await _enrich_task(task, db)
+
     if task.state not in (TaskState.BLOCKED, TaskState.IN_PROGRESS, TaskState.PAUSED):
         raise HTTPException(
             status_code=422,
             detail="Only paused, blocked or in_progress tasks can be resumed",
         )
-    if await load_paused_history(task_id, db) is None:
-        raise HTTPException(
-            status_code=422,
-            detail="No paused limit session found for this task — use retry instead",
-        )
     try:
-        # Validate before mutating anything, same as /retry above.
-        await prepare_task_dispatch(task, db, require_ready=False)
-    except TaskDispatchPreflightError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Task cannot be resumed: {exc.code} ({exc})",
-        ) from None
-
-    sessions_closed = await close_open_task_sessions(task.id, "retry", db)
-
-    from app.models.task import DispatchStatus
-    prev_state = task.state
-    task.state = TaskState.ASSIGNED
-    task.dispatch_status = DispatchStatus.READY
-    task.updated_at = datetime.utcnow()
-    db.add(task)
-    await db.commit()
-    await db.refresh(task)
-
-    await emit_event(
-        room_id=room_id,
-        event_type=TASK_RESUMED,
-        content=f"Task \"{task.title}\" resumed from where it stopped (the new session's counters were reset).",
-        db=db,
-        task_id=task.id,
-        metadata={
-            "task_id": str(task.id),
-            "task_title": task.title,
-            "prev_state": prev_state.value,
-            "sessions_closed": sessions_closed,
-        },
-    )
-
-    outcome = await request_task_dispatch(task, room_id, db, resume=True, source="resume")
-    _logger.info("tasks: resume dispatch for task %s outcome=%s", task.id, outcome)
+        await restart_task(task, room_id, db, mode="resume", source="resume")
+    except TaskRestartError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
 
     return await _enrich_task(task, db)
 

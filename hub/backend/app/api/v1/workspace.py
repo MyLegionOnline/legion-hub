@@ -378,6 +378,9 @@ async def stop_workspace(
             detail={"error_code": exc.error_code, "message": exc.message},
         ) from exc
 
+    from app.core.auto_retry import clear_room_auto_retries
+
+    await clear_room_auto_retries(room_id, db)
     ws = await _get_or_create_workspace(room_id, db)
     # Mark all running background processes as failed — container is gone.
     bg_res = await db.execute(

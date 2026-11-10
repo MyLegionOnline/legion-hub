@@ -250,6 +250,8 @@ async def create_room(
         room_type=room_in.room_type,
         has_coordinator=room_in.has_coordinator,
         coordinator_config=room_in.coordinator_config,
+        auto_retry_enabled=room_in.auto_retry_enabled,
+        auto_retry_max=room_in.auto_retry_max,
         creator_id=current_user.id,
     )
     db.add(db_obj)
@@ -845,6 +847,17 @@ async def update_room(
         flag_modified(db_obj, 'git_config')
     if room_in.vps_access_mode is not None:
         db_obj.vps_access_mode = room_in.vps_access_mode
+    if room_in.auto_retry_enabled is not None:
+        db_obj.auto_retry_enabled = room_in.auto_retry_enabled
+        if not room_in.auto_retry_enabled:
+            from app.core.auto_retry import clear_room_auto_retries
+
+            # Flush the room update before removing its schedules so concurrent
+            # schedulers either finish first or see that the room is disabled.
+            await db.flush()
+            await clear_room_auto_retries(room_id, db)
+    if room_in.auto_retry_max is not None:
+        db_obj.auto_retry_max = room_in.auto_retry_max
 
     # Update memberships if provided
     if room_in.user_ids is not None:

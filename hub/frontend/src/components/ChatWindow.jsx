@@ -5,6 +5,8 @@ import remarkGfm from 'remark-gfm';
 import remarkBreaks from 'remark-breaks';
 import { describeStatus, useTicker, BUSY_KINDS } from '../hooks/useAgentStatuses';
 import { RuntimeStatusCard } from './RuntimeStatusCard';
+import { AutoRetryBadge } from './AutoRetryBadge';
+import { hasScheduledAutoRetry, useAutoRetryRefresh } from '../lib/autoRetry';
 import { retryTaskRequest, describeInterruption, interruptionTitle } from './TaskPanel';
 import { GitFlowReviewCard, isGitFlowCheckpoint } from './GitFlowCards';
 import { startMcpOAuthPopup } from '../api/mcp';
@@ -16,6 +18,11 @@ import { AgentAvatarSlot } from '../lib/AgentAvatar';
 import { NOT_IN_ROOM_LABEL, notifyRoomAgentsChanged, onRoomAgentsChanged } from '../lib/roomAgents';
 import StorageBanner from './StorageBanner';
 import { RenewPlanLink } from './PlanBanner';
+
+const AUTO_RETRY_EVENTS = new Set([
+  'TASK_AUTO_RETRY_SCHEDULED', 'TASK_AUTO_RETRIED', 'TASK_AUTO_RETRY_EXHAUSTED', 'TASK_AUTO_RETRY_CANCELLED',
+  'TASK_AUTO_RETRY_SKIPPED',
+]);
 
 /* ─── helpers ─── */
 function formatTime(ts) {
@@ -643,7 +650,7 @@ function SubtaskActivityGroup({ group }) {
 }
 
 /* ─── Tool limit reached card (interactive: resume / restart / cancel) ─── */
-function ToolLimitCard({ msg, taskActions }) {
+function ToolLimitCard({ msg, taskActions, autoRetryBadge, autoRetryResolved }) {
   const [actioned, setActioned] = useState(null); // 'resumed' | 'handed_off' | 'retried' | 'cancelled'
   const [pending, setPending] = useState(false);
   const [error, setError] = useState(null);
@@ -760,14 +767,14 @@ function ToolLimitCard({ msg, taskActions }) {
           </div>
           <span style={{ color: 'var(--text-muted)', flexShrink: 0 }}>{msg.time}</span>
         </div>
-        {actioned ? (
+        {autoRetryBadge || (actioned ? (
           <div className="pl-6 text-[11px]" style={{ color: actioned === 'cancelled' ? 'var(--text-muted)' : '#22c55e' }}>
             {actioned === 'resumed' && '▶ Session resumed from where it stopped'}
             {actioned?.type === 'handed_off' && `→ Continuation task "${actioned.taskTitle || '…'}" created with a compact context`}
             {actioned === 'retried' && '↻ Task restarted from scratch'}
             {actioned === 'cancelled' && 'Cancelled — the task stays blocked (Retry on the task board)'}
           </div>
-        ) : (
+        ) : !autoRetryResolved && (
           <div className="pl-6 flex flex-wrap items-center gap-2">
             {!isPromptCap && (
               <button
@@ -806,7 +813,7 @@ function ToolLimitCard({ msg, taskActions }) {
               Cancel
             </button>
           </div>
-        )}
+        ))}
         {error && (
           <div className="pl-6 text-[11px]" style={{ color: '#f87171' }}>{error}</div>
         )}
@@ -822,7 +829,7 @@ function ToolLimitCard({ msg, taskActions }) {
  */
 const PROVIDER_FAILURE_REASONS = ['provider_error', 'timeout'];
 
-function ProviderErrorCard({ msg, taskActions }) {
+function ProviderErrorCard({ msg, taskActions, autoRetryBadge, autoRetryResolved }) {
   const [retried, setRetried] = useState(false);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState(null);
@@ -864,9 +871,9 @@ function ProviderErrorCard({ msg, taskActions }) {
           </div>
           <span style={{ color: 'var(--text-muted)', flexShrink: 0 }}>{msg.time}</span>
         </div>
-        {retried ? (
+        {autoRetryBadge || (retried ? (
           <div className="pl-6 text-[11px]" style={{ color: '#22c55e' }}>↻ Task restarted</div>
-        ) : (
+        ) : !autoRetryResolved && (
           <div className="pl-6">
             <button
               className="px-3 py-1.5 rounded-lg text-[11px] font-medium transition-opacity"
@@ -880,7 +887,7 @@ function ProviderErrorCard({ msg, taskActions }) {
               ↻ Retry
             </button>
           </div>
-        )}
+        ))}
         {error && (
           <div className="pl-6 text-[11px]" style={{ color: '#f87171' }}>{error}</div>
         )}
@@ -2219,11 +2226,24 @@ function Message({ msg, prevMsg, tokenMap, taskActions, onPlanAccepted, onPlanEd
   if (msg.type === 'reasoning_group') {
     return <ReasoningBlock group={msg} />;
   }
+  const autoRetryTask = taskActions?.autoRetryByMessage.get(msg.id);
+  const autoRetryResolved = taskActions?.resolvedRetryMessages.has(msg.id);
+  const autoRetryBadge = autoRetryTask && (
+    <AutoRetryBadge
+      key={autoRetryTask.auto_retry_at}
+      task={autoRetryTask}
+      roomId={taskActions.roomId}
+      token={taskActions.token}
+      maxAttempts={taskActions.autoRetryMax}
+      onDone={taskActions.onDone}
+      disabled={taskActions.readOnly}
+    />
+  );
   if (msg.eventType === 'TOOL_LIMIT_REACHED') {
-    return <ToolLimitCard msg={msg} taskActions={taskActions} />;
+    return <ToolLimitCard msg={msg} taskActions={taskActions} autoRetryBadge={autoRetryBadge} autoRetryResolved={autoRetryResolved} />;
   }
   if (msg.eventType === 'TASK_STALLED' && PROVIDER_FAILURE_REASONS.includes(msg.metadata?.reason)) {
-    return <ProviderErrorCard msg={msg} taskActions={taskActions} />;
+    return <ProviderErrorCard msg={msg} taskActions={taskActions} autoRetryBadge={autoRetryBadge} autoRetryResolved={autoRetryResolved} />;
   }
   if (msg.eventType === 'TASK_DISPATCH_FAILED' && msg.metadata?.reason === 'connector_not_granted' && msg.metadata?.connector_id) {
     return <ConnectorNotGrantedCard msg={msg} taskActions={taskActions} />;
@@ -2318,7 +2338,12 @@ function Message({ msg, prevMsg, tokenMap, taskActions, onPlanAccepted, onPlanEd
   // AGENT_INTERIM_TEXT — what the agent said alongside a tool call; it reads
   // as the agent's own words, so it falls through to the ordinary bubble.
   if (msg.eventType && msg.eventType !== 'MESSAGE' && msg.eventType !== 'AGENT_INTERIM_TEXT') {
-    return <SystemEventLine msg={msg} />;
+    return (
+      <>
+        <SystemEventLine msg={msg} hideRetryHint={autoRetryBadge || autoRetryResolved} />
+        {autoRetryBadge && <div className="mx-auto max-w-md">{autoRetryBadge}</div>}
+      </>
+    );
   }
 
   const sameGroup = prevMsg && prevMsg.sender === msg.sender && prevMsg.type !== 'system' && msg.type !== 'system';
@@ -2362,7 +2387,10 @@ function Message({ msg, prevMsg, tokenMap, taskActions, onPlanAccepted, onPlanEd
           onDelete={(attachment) => taskActions?.onAttachmentDeleted?.(msg.id, attachment)}
         />
         {msg.metadata?.kind === 'task_interjection' && <InterjectionMark metadata={msg.metadata} />}
-        {sameGroup && <span className="text-[10px] mt-0.5 px-1" style={{ color: 'var(--text-muted)' }}>{msg.time}</span>}
+        {isUser && msg.metadata?.dialogue_queued_at && (
+          <DialogueQueueMark metadata={msg.metadata} roomId={taskActions?.roomId} token={taskActions?.token} />
+        )}
+        {sameGroup &&<span className="text-[10px] mt-0.5 px-1" style={{ color: 'var(--text-muted)' }}>{msg.time}</span>}
       </div>
     </div>
   );
@@ -2388,6 +2416,87 @@ function InterjectionMark({ metadata }) {
       data-testid="interjection-mark"
     >
       {done ? '✓ ' : '⏳ '}{interjectionMarkText(metadata)}
+    </span>
+  );
+}
+
+/* A message sent while the agent's turn was still running waits for the agent's
+ * next step — it never cuts a long model request on its own (that could throw
+ * away a long legitimate generation). "Send now" is the explicit override: the
+ * request in flight is dropped and the model is asked again with the message.
+ * Marks come from the WS `dialogue_queue` frame live and from metadata on reload. */
+// eslint-disable-next-line react-refresh/only-export-components -- pure helper.
+export function dialogueQueueState(metadata = {}) {
+  if (metadata.dialogue_delivered_at) return 'delivered';
+  if (metadata.dialogue_dropped_at) return 'dropped';
+  if (metadata.dialogue_queued_at) return 'queued';
+  return null;
+}
+
+function DialogueQueueMark({ metadata, roomId, token }) {
+  const state = dialogueQueueState(metadata);
+  const [sending, setSending] = useState(false);
+  const [note, setNote] = useState(null);
+  useEffect(() => { if (state !== 'queued') { setSending(false); setNote(null); } }, [state]);
+  if (!state) return null;
+
+  if (state === 'delivered') {
+    return (
+      <span className="text-[10px] mt-0.5 px-1" style={{ color: 'var(--text-muted)' }} data-testid="dialogue-queue-mark">
+        ✓ read by the agent {formatTime(metadata.dialogue_delivered_at)}
+      </span>
+    );
+  }
+  if (state === 'dropped') {
+    return (
+      <span
+        className="text-[10px] mt-0.5 px-1"
+        style={{ color: 'var(--text-muted)' }}
+        title="The agent's turn ended before it read this message. Send it again if it is still needed."
+        data-testid="dialogue-queue-mark"
+      >
+        not delivered — the turn ended first
+      </span>
+    );
+  }
+
+  const sendNow = async () => {
+    if (!roomId || sending) return;
+    setSending(true);
+    setNote(null);
+    try {
+      const res = await fetch(`/api/v1/chat/rooms/${roomId}/send_queued_now`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+      if (data.status === 'next_step') setNote('goes in right after the current tool call');
+      else if (data.status === 'idle') setNote('the agent is no longer working');
+      // 'interrupted' / 'nothing_queued': the `delivered` frame follows.
+    } catch (e) {
+      setSending(false);
+      setNote(`could not send: ${e.message}`);
+    }
+  };
+
+  return (
+    <span className="flex items-center gap-2 text-[10px] mt-0.5 px-1" style={{ color: '#fbbf24' }} data-testid="dialogue-queue-mark">
+      <span title="The agent is busy with its current step. The message goes in before its next model request.">
+        ⏳ queued — the agent reads it after its current step
+      </span>
+      <button
+        type="button"
+        onClick={sendNow}
+        disabled={sending}
+        className="px-1.5 py-0.5 rounded-md transition-colors"
+        style={{ border: '1px solid rgba(251,191,36,0.4)', background: 'rgba(251,191,36,0.08)', color: '#fbbf24', opacity: sending ? 0.6 : 1 }}
+        title="Interrupt the agent's current model request and hand it this message now. The request in flight is lost."
+        data-testid="dialogue-send-now"
+      >
+        {sending ? 'sending…' : 'Send now'}
+      </button>
+      {note && <span style={{ color: 'var(--text-muted)' }}>{note}</span>}
     </span>
   );
 }
@@ -3208,6 +3317,11 @@ const EVENT_ICONS = {
   TASK_DEPS_CYCLE:   <AlertTriangle size={11} style={{ color: '#ef4444' }} />,
   TASK_STALLED:      <Hourglass size={11} style={{ color: '#f97316' }} />,
   TASK_RETRIED:      <RotateCcw size={11} style={{ color: '#a78bfa' }} />,
+  TASK_AUTO_RETRY_SCHEDULED: <Hourglass size={11} style={{ color: '#a78bfa' }} />,
+  TASK_AUTO_RETRIED: <RotateCcw size={11} style={{ color: '#a78bfa' }} />,
+  TASK_AUTO_RETRY_EXHAUSTED: <AlertTriangle size={11} style={{ color: '#f97316' }} />,
+  TASK_AUTO_RETRY_CANCELLED: <Square size={11} style={{ color: 'var(--text-muted)' }} />,
+  TASK_AUTO_RETRY_SKIPPED: <AlertTriangle size={11} style={{ color: '#f97316' }} />,
   TASK_DISPATCH_FAILED: <AlertTriangle size={11} style={{ color: '#ef4444' }} />,
   TASK_DISPATCH_STARTED: <Cpu size={11} style={{ color: '#06b6d4' }} />,
   TASK_RESUMED:      <Play size={11} style={{ color: '#22c55e' }} />,
@@ -3256,7 +3370,7 @@ const EVENT_ICONS = {
   AGENT_QUESTION_ANSWERED: <CheckCircle size={11} style={{ color: '#22c55e' }} />,
 };
 
-function SystemEventLine({ msg }) {
+function SystemEventLine({ msg, hideRetryHint }) {
   const icon = EVENT_ICONS[msg.eventType];
   const isStalled = msg.eventType === 'TASK_STALLED';
   const isRetried = msg.eventType === 'TASK_RETRIED';
@@ -3287,7 +3401,7 @@ function SystemEventLine({ msg }) {
       >
         {icon}
         <span>{msg.content}</span>
-        {(isStalled || isDispatchFailed) && (
+        {!hideRetryHint && (isStalled || isDispatchFailed) && (
           <span style={{ color: 'var(--text-muted)' }}>· Retry on the task board</span>
         )}
         <span style={{ color: 'var(--text-muted)', opacity: 0.6 }}>{msg.time}</span>
@@ -3646,7 +3760,7 @@ function decodeJwtSub(token) {
   try { return JSON.parse(atob(token.split('.')[1])).sub; } catch { return null; }
 }
 
-function RoomChat({ room, token, onDelete, onRoomStateChange, onTaskEvent, onGoalEvent, onFileEvent, onConnectedChange, onAgentStatus, onAgentSessionClosed, onWorkspaceStatus, onWorkspaceServiceEvent, onRoomActivity, agentStatuses, onGitFlowEvent, onRoomClosed }) {
+function RoomChat({ room, token, onDelete, onRoomStateChange, taskRefreshKey, onTaskEvent, onGoalEvent, onFileEvent, onConnectedChange, onAgentStatus, onAgentSessionClosed, onWorkspaceStatus, onWorkspaceServiceEvent, onRoomActivity, agentStatuses, onGitFlowEvent, onRoomClosed }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [draftAttachments, setDraftAttachments] = useState([]);
@@ -4003,6 +4117,7 @@ function RoomChat({ room, token, onDelete, onRoomStateChange, onTaskEvent, onGoa
           .catch(() => {});
 
         if (isReconnectRef.current) {
+          onTaskEvent?.();
           fetch(`${apiBase}/api/v1/rooms/${room.id}/messages?limit=1000`, {
             headers: { 'Authorization': `Bearer ${token}` },
           })
@@ -4125,6 +4240,21 @@ function RoomChat({ room, token, onDelete, onRoomStateChange, onTaskEvent, onGoa
         // got an answer — mark the user's bubble.
         if (data.type === 'task_interjection') {
           const field = data.state === 'answered' ? 'answered_at' : data.state === 'delivered' ? 'delivered_at' : null;
+          if (field && data.message_id) {
+            setMessages(prev => prev.map(m => (m.id === data.message_id
+              ? { ...m, metadata: { ...(m.metadata || {}), [field]: data.ts || new Date().toISOString() } }
+              : m)));
+          }
+          return;
+        }
+        // A message queued behind the agent's running turn was marked queued /
+        // read by the agent / not delivered (app/core/dialogue_queue.py).
+        if (data.type === 'dialogue_queue') {
+          const field = {
+            queued: 'dialogue_queued_at',
+            delivered: 'dialogue_delivered_at',
+            dropped: 'dialogue_dropped_at',
+          }[data.state];
           if (field && data.message_id) {
             setMessages(prev => prev.map(m => (m.id === data.message_id
               ? { ...m, metadata: { ...(m.metadata || {}), [field]: data.ts || new Date().toISOString() } }
@@ -4427,7 +4557,7 @@ function RoomChat({ room, token, onDelete, onRoomStateChange, onTaskEvent, onGoa
         // Without it the board and panel kept offering actions for a state the
         // task had already left, and the resulting PATCH was refused with 422.
         if (eventType === 'TASK_CREATED' || eventType === 'TASK_STATE_CHANGED' || eventType === 'TASK_UNBLOCKED' ||
-            eventType === 'TASK_UPDATED' ||
+            eventType === 'TASK_UPDATED' || AUTO_RETRY_EVENTS.has(eventType) ||
             eventType === 'TASK_STALLED' || eventType === 'TASK_RETRIED' || eventType === 'TASK_DISPATCH_FAILED' ||
             eventType === 'TOOL_LIMIT_REACHED' || eventType === 'TASK_RESUMED' || eventType === 'TASK_HANDOFF_CREATED' ||
             eventType === 'TASK_CHANGES_REQUESTED' || eventType === 'SESSION_STARTED' ||
@@ -4823,9 +4953,78 @@ function RoomChat({ room, token, onDelete, onRoomStateChange, onTaskEvent, onGoa
 
   const onTaskDone = useStableCallback(() => { onTaskEvent?.(); onGoalEvent?.(); onFileEvent?.(); });
   const onAttachmentDeleted = useStableCallback((...args) => handleMessageAttachmentDeleted(...args));
+  // History tells us where to place the controls. Only current task state
+  // tells us whether the attempt is still scheduled.
+  const { retryMessageIds, resolvedRetryMessages } = useMemo(() => {
+    const retryMessageIds = new Map();
+    const scheduled = new Set();
+    const resolvedRetryMessages = new Set();
+    // Tasks whose latest interruption already has a card to attach to. The
+    // Hub announces the interruption first and the schedule right after it;
+    // older history has the schedule first, and the card then takes over.
+    const anchored = new Set();
+    for (const message of messages) {
+      const taskId = message.taskId || message.metadata?.task_id;
+      if (!taskId) continue;
+      const event = message.eventType;
+      if (event === 'TASK_STALLED' || event === 'TOOL_LIMIT_REACHED') {
+        retryMessageIds.set(taskId, message.id);
+        anchored.add(taskId);
+      } else if (event === 'TASK_AUTO_RETRY_SCHEDULED') {
+        scheduled.add(taskId);
+        if (!anchored.has(taskId)) {
+          retryMessageIds.set(taskId, message.id);
+          anchored.add(taskId);
+        }
+      } else if (event === 'TASK_AUTO_RETRIED' || event === 'TASK_RETRIED' || event === 'TASK_RESUMED') {
+        if (scheduled.delete(taskId)) resolvedRetryMessages.add(retryMessageIds.get(taskId));
+        anchored.delete(taskId);
+      } else if (
+        event === 'TASK_AUTO_RETRY_CANCELLED' || event === 'TASK_AUTO_RETRY_EXHAUSTED'
+        || event === 'TASK_AUTO_RETRY_SKIPPED'
+      ) {
+        scheduled.delete(taskId);
+        anchored.delete(taskId);
+      }
+    }
+    return { retryMessageIds, resolvedRetryMessages };
+  }, [messages]);
+  const hasRetryMessages = retryMessageIds.size > 0;
+  const [scheduledTasks, setScheduledTasks] = useState([]);
+  const autoRetryLoadSeq = useRef(0);
+  const loadAutoRetries = useCallback(async () => {
+    if (!hasRetryMessages) return;
+    const seq = ++autoRetryLoadSeq.current;
+    try {
+      const res = await fetch(`/api/v1/rooms/${room.id}/tasks?auto_retry_pending=true`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) return;
+      const tasks = await res.json();
+      if (seq === autoRetryLoadSeq.current && Array.isArray(tasks)) {
+        setScheduledTasks(tasks.filter(hasScheduledAutoRetry));
+      }
+    } catch {
+      // Keep the last known schedule until the next refresh.
+    }
+  }, [room.id, token, hasRetryMessages]);
+  useEffect(() => { loadAutoRetries(); }, [loadAutoRetries, taskRefreshKey]);
+  useAutoRetryRefresh(scheduledTasks.length > 0, loadAutoRetries);
+
+  const autoRetryByMessage = useMemo(() => {
+    const byMessage = new Map();
+    for (const task of scheduledTasks) {
+      const id = retryMessageIds.get(task.id);
+      if (id) byMessage.set(id, task);
+    }
+    return byMessage;
+  }, [scheduledTasks, retryMessageIds]);
   const taskActions = useMemo(
-    () => ({ roomId: room.id, token, agentNames, onAttachmentDeleted, onDone: onTaskDone }),
-    [room.id, token, agentNames, onAttachmentDeleted, onTaskDone],
+    () => ({
+      roomId: room.id, token, agentNames, onAttachmentDeleted, onDone: onTaskDone,
+      autoRetryByMessage, resolvedRetryMessages, autoRetryMax: room.auto_retry_max, readOnly,
+    }),
+    [room.id, token, agentNames, onAttachmentDeleted, onTaskDone, autoRetryByMessage, resolvedRetryMessages, room.auto_retry_max, readOnly],
   );
 
   return (
@@ -5278,7 +5477,7 @@ function ChatLayout({
 }
 
 /* ─── Entry point ─── */
-export function ChatWindow({ room, token, onDelete, onRoomStateChange, onTaskEvent, onGoalEvent, onFileEvent, onConnectedChange, onAgentStatus, onAgentSessionClosed, onWorkspaceStatus, onWorkspaceServiceEvent, onRoomActivity, agentStatuses, onGitFlowEvent, onRoomClosed }) {
+export function ChatWindow({ room, token, onDelete, onRoomStateChange, taskRefreshKey, onTaskEvent, onGoalEvent, onFileEvent, onConnectedChange, onAgentStatus, onAgentSessionClosed, onWorkspaceStatus, onWorkspaceServiceEvent, onRoomActivity, agentStatuses, onGitFlowEvent, onRoomClosed }) {
   if (room.type === 'dm' && room.agent?.agent_type === 'internal') {
     return <InternalAgentChat room={room} token={token} />;
   }
@@ -5295,5 +5494,5 @@ export function ChatWindow({ room, token, onDelete, onRoomStateChange, onTaskEve
     );
   }
 
-  return <RoomChat room={room} token={token} onDelete={onDelete} onRoomStateChange={onRoomStateChange} onTaskEvent={onTaskEvent} onGoalEvent={onGoalEvent} onFileEvent={onFileEvent} onConnectedChange={onConnectedChange} onAgentStatus={onAgentStatus} onAgentSessionClosed={onAgentSessionClosed} onWorkspaceStatus={onWorkspaceStatus} onWorkspaceServiceEvent={onWorkspaceServiceEvent} onRoomActivity={onRoomActivity} agentStatuses={agentStatuses} onGitFlowEvent={onGitFlowEvent} onRoomClosed={onRoomClosed} />;
+  return <RoomChat room={room} token={token} onDelete={onDelete} onRoomStateChange={onRoomStateChange} taskRefreshKey={taskRefreshKey} onTaskEvent={onTaskEvent} onGoalEvent={onGoalEvent} onFileEvent={onFileEvent} onConnectedChange={onConnectedChange} onAgentStatus={onAgentStatus} onAgentSessionClosed={onAgentSessionClosed} onWorkspaceStatus={onWorkspaceStatus} onWorkspaceServiceEvent={onWorkspaceServiceEvent} onRoomActivity={onRoomActivity} agentStatuses={agentStatuses} onGitFlowEvent={onGitFlowEvent} onRoomClosed={onRoomClosed} />;
 }

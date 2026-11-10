@@ -218,15 +218,20 @@ export function TaskLiveBadge({ entry }) {
 
 /* ── shared retry call: handles the retry-limit 422 with a force confirm ── */
 // eslint-disable-next-line react-refresh/only-export-components -- shared API helper is intentionally imported by ChatWindow.
-export async function retryTaskRequest({ roomId, taskId, token, assignAgentId }) {
+export async function retryTaskRequest({ roomId, taskId, token, assignAgentId, autoRetryAt }) {
   const body = {};
   if (assignAgentId) body.assigned_agent_id = assignAgentId;
-  const doPost = (force) =>
-    fetch(`/api/v1/rooms/${roomId}/tasks/${taskId}/retry${force ? '?force=true' : ''}`, {
+  const doPost = (force) => {
+    const query = new URLSearchParams();
+    if (force) query.set('force', 'true');
+    if (autoRetryAt) query.set('auto_retry_at', autoRetryAt);
+    const search = query.size ? `?${query}` : '';
+    return fetch(`/api/v1/rooms/${roomId}/tasks/${taskId}/retry${search}`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
+  };
   let res = await doPost(false);
   if (res.status === 422) {
     const data = await res.json().catch(() => ({}));

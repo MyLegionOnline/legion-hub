@@ -147,7 +147,7 @@ test('delivery marks follow the queued message to the agent and back', async ({ 
   await expect(page.getByTestId('interjection-reply-label')).toBeVisible();
 });
 
-test('the "thinking…" chip opens the executor status card', async ({ page }) => {
+test('the "waiting for the model" chip opens the executor status card', async ({ page }) => {
   const state = await installHarness(page);
   await openRoom(page);
 
@@ -156,7 +156,7 @@ test('the "thinking…" chip opens the executor status card', async ({ page }) =
     session_id: SESSION_ID, task_id: TASK_ID, ts: '2026-10-01T11:48:00Z',
     elapsed_s: 900, phase: 'llm', attempt: 1, max_attempts: 4, attempt_elapsed_s: 400,
   });
-  const chip = page.locator('.status-chip', { hasText: 'thinking' });
+  const chip = page.locator('.status-chip', { hasText: /waiting for the model · 6:4\d/ });
   await expect(chip).toBeVisible();
   await chip.click();
 

@@ -44,6 +44,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auto_retry import emit_notice, run_due_auto_retries, schedule_auto_retry
 from app.core.events import AgentStatus, emit_event, emit_status
 from app.core.session_close import flush_session_memory, maybe_refresh_room_memory
 from app.core.user_session_limits import (
@@ -142,7 +143,15 @@ async def _emit_session_closed(session: Session, close_reason: str, db: AsyncSes
 
 
 async def block_stalled_task(
-    task_id, reason: str, content: str, db: AsyncSession, *, extra_meta: dict | None = None
+    task_id,
+    reason: str,
+    content: str,
+    db: AsyncSession,
+    *,
+    extra_meta: dict | None = None,
+    retry_after: float | None = None,
+    allow_auto_retry: bool = True,
+    expected_run_id: str | None = None,
 ) -> None:
     """Move an IN_PROGRESS task to BLOCKED and emit a persistent TASK_STALLED event.
 
@@ -151,8 +160,15 @@ async def block_stalled_task(
     count as active work forever and keep its room from going idle.
     """
     task = (
-        await db.execute(select(Task).where(Task.id == task_id))
+        await db.execute(
+            select(Task)
+            .where(Task.id == task_id)
+            .with_for_update(key_share=True)
+            .execution_options(populate_existing=True)
+        )
     ).scalars().first()
+    if task is not None and expected_run_id is not None and task.run_id != expected_run_id:
+        return
     if task is not None and task.state == TaskState.PAUSING:
         from app.core.task_runtime import RUNTIME_PAUSED
         from app.models.task import DispatchStatus
@@ -183,6 +199,11 @@ async def block_stalled_task(
     task.updated_at = datetime.utcnow()
     db.add(task)
     await db.flush()
+    notice = None
+    if allow_auto_retry:
+        notice = await schedule_auto_retry(
+            task, reason, (extra_meta or {}).get("http_status"), db, retry_after=retry_after,
+        )
     await emit_event(
         room_id=task.room_id,
         event_type=TASK_STALLED,
@@ -191,6 +212,7 @@ async def block_stalled_task(
         task_id=task.id,
         metadata={"task_id": str(task.id), "reason": reason, **(extra_meta or {})},
     )
+    await emit_notice(notice, task, db)
     # §4.2: the task just went BLOCKED — one of the two Room memory triggers.
     await maybe_refresh_room_memory(task.room_id, db, trigger="task_blocked")
 
@@ -788,13 +810,27 @@ async def run_watchdog_loop(engine) -> None:
     from sqlalchemy.orm import sessionmaker
 
     async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    while True:
-        try:
+    # Backoffs start at 30 seconds; keep their polling cadence independent of
+    # the slower watchdog scan and its session cleanup work.
+    async def retry_loop() -> None:
+        while True:
+            await asyncio.sleep(5)
+            try:
+                async with async_session() as db:
+                    await run_due_auto_retries(db)
+            except Exception:
+                logger.exception("watchdog: auto-retry cycle failed")
+
+    retry_worker = asyncio.create_task(retry_loop(), name="task_auto_retry")
+    try:
+        while True:
             await asyncio.sleep(_INTERVAL_SECONDS)
-            async with async_session() as db:
-                await run_watchdog_cycle(db)
-                await db.commit()
-        except asyncio.CancelledError:
-            break
-        except Exception as exc:
-            logger.warning("watchdog loop error: %s", exc)
+            try:
+                async with async_session() as db:
+                    await run_watchdog_cycle(db)
+                    await db.commit()
+            except Exception:
+                logger.exception("watchdog: session scan failed")
+    finally:
+        retry_worker.cancel()
+        await asyncio.gather(retry_worker, return_exceptions=True)

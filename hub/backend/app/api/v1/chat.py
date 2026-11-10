@@ -564,14 +564,33 @@ async def stop_dialogue(
     """The Stop button: end the agent's running turn in this room's dialogue.
 
     A direct dialogue has no task while the agent works, so there is no task
-    card to cancel — this is the only handle on it.  The turn winds down at its
-    next boundary (including a ``run_subtask`` child), the files written so far
+    card to cancel — this is the only handle on it.  A model request in flight
+    is dropped at once; otherwise the turn winds down at its next boundary
+    (including a ``run_subtask`` child), the files written so far
     are kept and sent through Gate 1, and the conversation stays open.
     """
     from app.core.user_sessions import stop_dialogue_turn
 
     await _verify_room_membership(room_id, current_user, db)
     return await stop_dialogue_turn(room_id, current_user.id, db)
+
+
+@router.post("/rooms/{room_id}/send_queued_now", status_code=200)
+async def send_queued_now(
+    room_id: UUID,
+    db: AsyncSession = Depends(get_session),
+    current_user: User = Depends(deps.get_current_user),
+):
+    """"Send now" on a message queued behind the agent's running turn.
+
+    A queued message waits for the agent's next step on its own, so a long
+    model request is not cut short by it.  This drops the request in flight
+    and asks the model again with the queued messages.
+    """
+    from app.core.user_sessions import flush_dialogue_queue
+
+    await _verify_room_membership(room_id, current_user, db)
+    return await flush_dialogue_queue(room_id, current_user.id, db)
 
 
 @router.get("/rooms/{room_id}/plan_request", status_code=200)

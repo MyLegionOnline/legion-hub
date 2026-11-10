@@ -31,11 +31,20 @@ from typing import Any, Optional
 from uuid import UUID, uuid4
 
 import httpx
-from openai import AsyncOpenAI
+from openai import APIConnectionError, AsyncOpenAI
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
 
+from app.core.auto_retry import (
+    SKIP_ROOM_INACTIVE,
+    auto_retry_policy,
+    emit_notice,
+    exhausted_notice,
+    retry_after_seconds,
+    schedule_auto_retry,
+    skipped_notice,
+)
 from app.core.context_baseline import (
     ToolCallStats,
     build_context_measurement,
@@ -3906,9 +3915,12 @@ async def _block_proxy_for_runtime_failure(
     reason: str,
     content: str,
     metadata: dict[str, Any] | None = None,
+    retry_after: float | None = None,
+    allow_auto_retry: bool = True,
 ) -> None:
     """Close both sides and persist a retryable runtime diagnostic."""
 
+    run_id = task.run_id
     for session in (agent_session, cm_session):
         if session.is_open:
             actions = await _close_side(session, None, "error", db)
@@ -3921,6 +3933,9 @@ async def _block_proxy_for_runtime_failure(
         content,
         db,
         extra_meta=metadata,
+        retry_after=retry_after,
+        allow_auto_retry=allow_auto_retry,
+        expected_run_id=run_id,
     )
 
 
@@ -4696,6 +4711,13 @@ async def _run_proxy_loop(
                 cm_act = await _close_side(cm_session, None, close_reason, db)
                 await _emit_closed(agent_session, close_reason, agent_act, db)
                 await _emit_closed(cm_session, close_reason, cm_act, db)
+                await db.refresh(task, with_for_update={"key_share": True})
+                if (
+                    task.state != TaskState.IN_PROGRESS
+                    or task.run_id != run_id
+                    or task.stop_requested_at is not None
+                ):
+                    return True
                 task.state = TaskState.BLOCKED
                 task.updated_at = datetime.utcnow()
                 # loop_guard Signal B: a session that ran out of budget/context
@@ -4705,6 +4727,7 @@ async def _run_proxy_loop(
                     task.stall_streak = (task.stall_streak or 0) + 1
                 db.add(task)
                 await _flush_task_first(db, task)
+                auto_retry_notice = await schedule_auto_retry(task, limit_reason, None, db)
                 preflight_detail = (
                     f"cannot send the request: the prompt is estimated at "
                     f"{getattr(exc, 'estimated_input_tokens', 0):,} tokens and exceeds "
@@ -4764,6 +4787,10 @@ async def _run_proxy_loop(
                     )
                 except Exception:
                     logger.exception("proxy_session: failed to emit TOOL_LIMIT_REACHED")
+                try:
+                    await emit_notice(auto_retry_notice, task, db)
+                except Exception:
+                    logger.exception("proxy_session: failed to emit the auto-retry notice")
                 break
             except Exception as exc:
                 # Preserve the traceback: provider errors alone are often not enough to
@@ -4782,6 +4809,18 @@ async def _run_proxy_loop(
                 # cause and move the task to BLOCKED so the user sees why it
                 # stopped and gets a Retry, instead of a silently dead session.
                 failure_reason, safe_error, http_status = _classify_llm_failure(exc)
+                retry_after = (
+                    retry_after_seconds(exc.response.headers.get("Retry-After"))
+                    if http_status == 429 else None
+                )
+                # The generic diagnostic also labels local exceptions as provider
+                # errors. Only a provider response, transport failure, or timeout
+                # qualifies for unattended recovery.
+                retryable_failure = (
+                    http_status is not None
+                    or failure_reason == "timeout"
+                    or isinstance(exc, (httpx.TransportError, APIConnectionError))
+                )
                 failure_hint = (
                     " Check the provider API key in the agent settings."
                     if http_status in (401, 403)
@@ -4793,6 +4832,8 @@ async def _run_proxy_loop(
                     task,
                     db,
                     reason=failure_reason,
+                    retry_after=retry_after,
+                    allow_auto_retry=retryable_failure,
                     content=(
                         f"Task '{task.title}' stopped: "
                         + (
@@ -6454,7 +6495,7 @@ def _format_manifest(manifest: list[dict[str, str]]) -> str:
 async def load_paused_history(
     task_id: UUID,
     db: AsyncSession,
-    close_reasons: tuple[str, ...] = ("tool_limit", "token_limit", "workspace_paused"),
+    close_reasons: tuple[str, ...] = ("tool_limit", "token_limit", "context_limit", "workspace_paused"),
 ) -> list[dict[str, Any]] | None:
     """Saved conversation of the latest matching agent session, or None.
 
@@ -6781,6 +6822,7 @@ async def handle_task_created(
     db: AsyncSession,
     resume: bool = False,
     rework_feedback: str | None = None,
+    auto_retry_started_at: datetime | None = None,
 ) -> None:
     """React to TASK_CREATED by creating a proxy session pair and running the conversation.
 
@@ -6790,8 +6832,11 @@ async def handle_task_created(
     - rework (rework_feedback is not None): agent history from the previous submission is
       loaded and the CM's feedback is appended so the agent knows what to fix.
     """
-    task_result = await db.execute(select(Task).where(Task.id == task_id))
-    task = task_result.scalars().first()
+    query = select(Task).where(Task.id == task_id)
+    automatic = auto_retry_started_at is not None
+    if automatic:
+        query = query.with_for_update(key_share=True)
+    task = (await db.execute(query)).scalars().first()
     if task is None:
         logger.error("proxy_session: task %s not found — aborting", task_id)
         return
@@ -6813,6 +6858,24 @@ async def handle_task_created(
         )
         return
 
+    if automatic:
+        if task.state != TaskState.ASSIGNED or task.updated_at != auto_retry_started_at:
+            return
+        # A locked room row is a concurrent room update; the attempt was just
+        # admitted, so run on the unlocked read rather than drop it.
+        limit, _contended = await auto_retry_policy(room_id, db)
+        if limit is None or task.auto_retry_count > limit:
+            reason = task.auto_retry_reason or ""
+            task.state = TaskState.BLOCKED
+            await db.commit()
+            notice = (
+                skipped_notice(task, reason, SKIP_ROOM_INACTIVE)
+                if limit is None
+                else exhausted_notice(task, reason)
+            )
+            await notice.emit(task, db)
+            return
+
     # A run id is the durable ownership fence for this background coroutine.
     # Retry/Cancel/Pause can revoke it from another worker without relying on
     # this process's in-memory Session identity map.
@@ -6833,6 +6896,21 @@ async def handle_task_created(
     # runtime_state="stopped" — which the first _pair_closed_externally check
     # reads as "superseded" and the new pair dies at turn 0 without ever
     # calling the model.
+    prev_state = task.state
+    prev_dispatch_status = task.dispatch_status
+    claim_values = {
+        "dispatch_status": DispatchStatus.DISPATCHED,
+        "run_id": run_id,
+        "runtime_state": "running",
+        "stop_requested_at": None,
+        "stop_reason": None,
+    }
+    if automatic:
+        # A workspace pause can now see the claimed run even before this
+        # coroutine creates its first session row.
+        claim_values.update(
+            state=TaskState.IN_PROGRESS, updated_at=datetime.utcnow(), auto_retry_reason=None,
+        )
     claim = await db.execute(
         update(Task)
         .where(
@@ -6840,13 +6918,8 @@ async def handle_task_created(
             Task.dispatch_status == DispatchStatus.READY,
             Task.state.notin_(_NON_DISPATCHABLE_STATES),
         )
-        .values(
-            dispatch_status=DispatchStatus.DISPATCHED,
-            run_id=run_id,
-            runtime_state="running",
-            stop_requested_at=None,
-            stop_reason=None,
-        )
+        .values(**claim_values)
+        .execution_options(synchronize_session=False)
     )
     if claim.rowcount == 0:
         await db.rollback()
@@ -6856,20 +6929,11 @@ async def handle_task_created(
         )
         return
     await db.commit()
-    prev_dispatch_status = task.dispatch_status
-    prev_state = task.state
 
     # Mirror the claim onto the in-memory row without marking it dirty: the
     # values are already durable, and a dirty attribute would be re-flushed
     # later, potentially overwriting a stop fence set in the meantime.
-    _sync_committed_claim(
-        task,
-        dispatch_status=DispatchStatus.DISPATCHED,
-        run_id=run_id,
-        runtime_state="running",
-        stop_requested_at=None,
-        stop_reason=None,
-    )
+    _sync_committed_claim(task, **claim_values)
 
     logger.info(
         "proxy_session: claimed task %s for dispatch (run_id=%s, prev_state=%s, "
@@ -6900,22 +6964,22 @@ async def handle_task_created(
     # The dispatcher has now claimed the task, so this is the first point at
     # which an automatic transition to IN_PROGRESS is truthful. It covers a
     # direct ChatMaster task even if no separate task_update was called.
-    if task.state != TaskState.IN_PROGRESS:
-        previous_state = task.state
-        task.state = TaskState.IN_PROGRESS
-        task.updated_at = datetime.utcnow()
-        db.add(task)
-        await db.flush()
+    if prev_state != TaskState.IN_PROGRESS:
+        if not automatic:
+            task.state = TaskState.IN_PROGRESS
+            task.updated_at = datetime.utcnow()
+            db.add(task)
+            await db.flush()
         await emit_event(
             room_id=room_id,
             event_type="TASK_STATE_CHANGED",
-            content=f"Task \"{task.title}\": {previous_state.value} → in_progress",
+            content=f"Task \"{task.title}\": {prev_state.value} → in_progress",
             db=db,
             task_id=task.id,
             metadata={
                 "task_id": str(task.id),
                 "task_title": task.title,
-                "prev_state": previous_state.value,
+                "prev_state": prev_state.value,
                 "task_state": TaskState.IN_PROGRESS.value,
                 "dispatch": "claimed",
             },
@@ -7175,7 +7239,7 @@ async def handle_task_created(
 
             if agent_history_seed:
                 resume_note = (
-                    "The user decided to continue after the session limit was reached. "
+                    "The previous session reached its limit. "
                     "Continue the task exactly from where you stopped — "
                     "do not start over and do not repeat steps already done."
                 )
@@ -7310,6 +7374,7 @@ async def _run_proxy_bg(
     plan_id: UUID | None,
     resume: bool = False,
     rework_feedback: str | None = None,
+    auto_retry_started_at: datetime | None = None,
 ) -> None:
     """Open an independent DB session and run handle_task_created."""
     from app.db.session import engine
@@ -7322,6 +7387,7 @@ async def _run_proxy_bg(
             await handle_task_created(
                 task_id, room_id, goal_id, plan_id, db,
                 resume=resume, rework_feedback=rework_feedback,
+                **({"auto_retry_started_at": auto_retry_started_at} if auto_retry_started_at else {}),
             )
         except asyncio.CancelledError:
             # A same-worker Cancel interrupts the coroutine immediately.  The
@@ -7402,6 +7468,8 @@ def dispatch_task_event(
     plan_id: UUID | None,
     resume: bool = False,
     rework_feedback: str | None = None,
+    *,
+    auto_retry_started_at: datetime | None = None,
 ) -> None:
     """Schedule proxy session handling as an asyncio background task.
 
@@ -7409,7 +7477,10 @@ def dispatch_task_event(
     The TASK_CREATED event should be emitted by the caller before this call.
     """
     runtime_task = asyncio.create_task(
-        _run_proxy_bg(task_id, room_id, goal_id, plan_id, resume=resume, rework_feedback=rework_feedback),
+        _run_proxy_bg(
+            task_id, room_id, goal_id, plan_id, resume=resume, rework_feedback=rework_feedback,
+            **({"auto_retry_started_at": auto_retry_started_at} if auto_retry_started_at else {}),
+        ),
         name=f"proxy_session_{task_id}",
     )
     from app.core.task_runtime import register_local_proxy_task
@@ -7426,6 +7497,7 @@ async def request_task_dispatch(
     rework_feedback: str | None = None,
     require_ready: bool = True,
     source: str = "unknown",
+    auto_retry_started_at: datetime | None = None,
 ) -> str:
     """Single owner for scheduling a task's proxy execution.
 
@@ -7476,6 +7548,7 @@ async def request_task_dispatch(
         plan_id=dispatch.plan_id,
         resume=resume,
         rework_feedback=rework_feedback,
+        **({"auto_retry_started_at": auto_retry_started_at} if auto_retry_started_at else {}),
     )
     logger.info(
         "proxy_session: dispatch requested for task %s (source=%s, resume=%s)",

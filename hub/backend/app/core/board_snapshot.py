@@ -140,6 +140,8 @@ def _compact_task(
         "blocked_reason": _blocked_reason(task),
         "waiting_for": waiting_for,
         "retry_count": int(task.retry_count or 0),
+        "auto_retry_count": task.auto_retry_count,
+        "auto_retry_at": task.auto_retry_at.isoformat() if task.auto_retry_at else None,
     }
 
 

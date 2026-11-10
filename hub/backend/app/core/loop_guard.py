@@ -522,3 +522,111 @@ def build_stall_report(signal: dict) -> str:
         "that does not exist in the workspace) — the corrected description via "
         "task_update."
     )
+
+
+# ---------------------------------------------------------------------------
+# Signal D — the same tool failing with the same error, call after call
+# ---------------------------------------------------------------------------
+#
+# A dialogue tool loop (ChatMaster or a direct agent, ``user_sessions``) has no
+# ChatMaster above it to hand a stall report to, and Signal A does not see this
+# shape: the 2026-11-09 incident was ~100 ``workspace_service declare/start``
+# calls whose arguments kept changing slightly while every result said
+# ``error: environment preparation failed (environment_manifest_missing)``.
+# The agent itself found a way out once someone told it it was looping — so
+# the guard tells the agent, not the user: change the approach, or stop and
+# say why the plan cannot be done.  If it ignores that and the streak builds
+# up again, the loop ends and the agent must answer in text.
+
+TOOL_ERROR_STREAK_LIMIT = _int_env("TOOL_ERROR_STREAK_LIMIT", 5)
+# Notes before the loop is ended; the second streak after a note ends it.
+TOOL_ERROR_STREAK_MAX_NOTES = _int_env("TOOL_ERROR_STREAK_MAX_NOTES", 1)
+
+# An error is a line that *starts* with "error" — "Error: action must be …",
+# "error: environment preparation failed (…)".  "state: error" is a status
+# field, not a failure of the call, and is not matched.
+_ERROR_LINE_RE = re.compile(r"^\s*error\b\s*[:\-]\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+# Numbers, hashes and ids differ between otherwise identical errors.
+_ERROR_NOISE_RE = re.compile(r"\b[0-9a-f]{8,}\b|\d+", re.IGNORECASE)
+_ERROR_SIGNATURE_LEN = 200
+
+
+def tool_error_line(result_text: str | None) -> str | None:
+    """The first error line of a tool result, or ``None`` for a success."""
+    if not result_text:
+        return None
+    match = _ERROR_LINE_RE.search(str(result_text))
+    if not match:
+        return None
+    return match.group(1).strip()[:_ERROR_SIGNATURE_LEN]
+
+
+def tool_error_signature(tool_name: str, result_text: str | None) -> str | None:
+    line = tool_error_line(result_text)
+    if line is None:
+        return None
+    normalized = " ".join(_ERROR_NOISE_RE.sub("#", line.lower()).split())
+    return f"{tool_name}\x00{normalized}"
+
+
+def build_tool_error_note(tool_name: str, count: int, error: str, *, final: bool) -> str:
+    tail = (
+        "This is the second time: the tool loop is now stopped. Answer in text — "
+        "say what you tried, why it fails, and what is needed to continue."
+        if final
+        else "If the same error keeps coming back, the tool loop will be stopped and "
+        "you will have to answer in text."
+    )
+    return (
+        "[LOOP GUARD — a system notice, not a message from the user]\n"
+        f"Your last {count} calls to `{tool_name}` failed with the same error: "
+        f"\"{error}\". Repeating the call, even with small changes to the "
+        "arguments, will not fix it. Before your next step, either change the "
+        "approach — find the cause with other tools (read the files, logs or "
+        "configuration the error points at) and fix it first — or stop and tell "
+        "the user that the plan cannot be completed and why. "
+        f"{tail}\n"
+    )
+
+
+class ToolErrorStreak:
+    """Counts consecutive tool failures with one error signature.
+
+    ``observe`` is called once per executed tool call, in order.  Any call
+    that does not fail resets the streak: "consecutive" is meant literally.
+    """
+
+    def __init__(
+        self,
+        limit: int = TOOL_ERROR_STREAK_LIMIT,
+        max_notes: int = TOOL_ERROR_STREAK_MAX_NOTES,
+    ) -> None:
+        self.limit = max(2, limit)
+        self.max_notes = max(0, max_notes)
+        self._signature: str | None = None
+        self._count = 0
+        self.notes = 0
+        self.exhausted = False
+
+    def observe(self, tool_name: str, result_text: str | None) -> str | None:
+        """A note to put in front of this result when the streak is hit."""
+        signature = tool_error_signature(tool_name, result_text)
+        if signature is None:
+            self._signature = None
+            self._count = 0
+            return None
+        if signature == self._signature:
+            self._count += 1
+        else:
+            self._signature = signature
+            self._count = 1
+        if self._count < self.limit:
+            return None
+        count, self._count = self._count, 0
+        final = self.notes >= self.max_notes
+        self.notes += 1
+        if final:
+            self.exhausted = True
+        return build_tool_error_note(
+            tool_name, count, tool_error_line(result_text) or "", final=final,
+        )

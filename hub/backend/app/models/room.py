@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional, List, TYPE_CHECKING, Dict, Any
 from uuid import UUID, uuid4
-from sqlalchemy import DateTime, func
+from sqlalchemy import Boolean, DateTime, Integer, func, true
 from sqlmodel import SQLModel, Field, Relationship, Column, JSON
 
 if TYPE_CHECKING:
@@ -68,6 +68,14 @@ class RoomBase(SQLModel):
     coordinator_config: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     git_config: Dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON))
     vps_access_mode: VpsAccessMode = Field(default=VpsAccessMode.readonly)
+    auto_retry_enabled: bool = Field(
+        default=True,
+        sa_column=Column(Boolean, nullable=False, server_default=true()),
+    )
+    auto_retry_max: int = Field(
+        default=3,
+        sa_column=Column(Integer, nullable=False, server_default="3"),
+    )
 
 class Room(RoomBase, table=True):
     id: UUID = Field(default_factory=uuid4, primary_key=True, index=True)

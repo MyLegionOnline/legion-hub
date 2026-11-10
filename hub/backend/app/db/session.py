@@ -334,6 +334,14 @@ END $$""",
     "ALTER TABLE cm_agent_proxy_session ALTER COLUMN plan_id DROP NOT NULL",
     # Chat Upgrade stage 5: task retry counter
     "ALTER TABLE task ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0",
+    # Room auto-retry settings and task state.
+    "ALTER TABLE room ADD COLUMN IF NOT EXISTS auto_retry_enabled BOOLEAN NOT NULL DEFAULT true",
+    "ALTER TABLE room ADD COLUMN IF NOT EXISTS auto_retry_max INTEGER NOT NULL DEFAULT 3",
+    "ALTER TABLE task ADD COLUMN IF NOT EXISTS auto_retry_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE task ADD COLUMN IF NOT EXISTS auto_retry_at TIMESTAMPTZ",
+    "ALTER TABLE task ADD COLUMN IF NOT EXISTS auto_retry_reason VARCHAR",
+    "CREATE INDEX IF NOT EXISTS ix_task_auto_retry_due ON task(auto_retry_at, id) "
+    "WHERE auto_retry_at IS NOT NULL",
     "ALTER TABLE task ADD COLUMN IF NOT EXISTS pause_reason VARCHAR",
     "ALTER TABLE task ADD COLUMN IF NOT EXISTS paused_at TIMESTAMPTZ",
     # Runtime state is distinct from Task.state: a task can be BLOCKED while a

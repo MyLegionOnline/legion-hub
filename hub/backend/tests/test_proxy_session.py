@@ -104,6 +104,9 @@ def _make_task(
     goal_id: uuid.UUID | None = None,
 ) -> MagicMock:
     t = MagicMock()
+    # A mock row has no SQLAlchemy instrumentation; mirror committed values
+    # onto its attributes through the fallback used by the dispatch test double.
+    del t._sa_instance_state
     t.id = uuid.uuid4()
     t.room_id = uuid.uuid4()
     t.title = "Implement login page"
@@ -746,6 +749,8 @@ class TestAgentTokenLimit:
             patch("app.core.proxy_session.build_system_prompt", return_value="SYS"),
             patch("app.core.proxy_session._get_agent_llm_config", new_callable=AsyncMock, return_value={}),
             patch("app.core.proxy_session._call_llm_with_tools", new_callable=AsyncMock, side_effect=overflow),
+            patch("app.core.proxy_session._call_compact_summary", new_callable=AsyncMock, return_value=""),
+            patch("app.core.proxy_session.schedule_auto_retry", new_callable=AsyncMock, return_value=None) as schedule,
             patch("app.core.proxy_session.track_llm_usage"),
             patch("app.core.proxy_session.apply_close_actions", new_callable=AsyncMock),
             patch("app.core.proxy_session.ProxyBroker") as MockBroker,
@@ -762,6 +767,7 @@ class TestAgentTokenLimit:
         assert cm_session.close_reason == "context_limit"
         limit_event = next(event for event in events if event.get("event_type") == "TOOL_LIMIT_REACHED")
         assert limit_event["metadata"]["reason"] == "context_window"
+        schedule.assert_awaited_once_with(task, "context_window", None, db)
         assert "token budget" not in limit_event["content"]
 
 
@@ -824,6 +830,7 @@ class TestRepeatedToolErrorInterruption:
             patch("app.core.proxy_session.build_system_prompt", return_value="SYS"),
             patch("app.core.proxy_session._get_agent_llm_config", new_callable=AsyncMock, return_value={}),
             patch("app.core.proxy_session._call_llm_with_tools", new_callable=AsyncMock, side_effect=repeated),
+            patch("app.core.proxy_session._call_compact_summary", new_callable=AsyncMock, return_value=""),
             patch("app.core.proxy_session.track_llm_usage"),
             patch("app.core.proxy_session.apply_close_actions", new_callable=AsyncMock),
             patch("app.core.proxy_session.ProxyBroker") as MockBroker,
@@ -897,6 +904,8 @@ class TestRepeatedToolErrorInterruption:
             patch("app.core.proxy_session.build_system_prompt", return_value="SYS"),
             patch("app.core.proxy_session._get_agent_llm_config", new_callable=AsyncMock, return_value={}),
             patch("app.core.proxy_session._call_llm_with_tools", new_callable=AsyncMock, side_effect=exhausted),
+            patch("app.core.proxy_session._call_compact_summary", new_callable=AsyncMock, return_value=""),
+            patch("app.core.proxy_session.schedule_auto_retry", new_callable=AsyncMock, return_value=None) as schedule,
             patch("app.core.proxy_session.track_llm_usage"),
             patch("app.core.proxy_session.apply_close_actions", new_callable=AsyncMock),
             patch("app.core.proxy_session.ProxyBroker") as MockBroker,
@@ -912,6 +921,7 @@ class TestRepeatedToolErrorInterruption:
         limit_event = next(event for event in events if event.get("event_type") == "TOOL_LIMIT_REACHED")
         meta = limit_event["metadata"]
         assert meta["reason"] == "tool_calls"
+        schedule.assert_awaited_once_with(task, "tool_calls", None, db)
         assert meta["trigger_tool"] is None
         assert meta["repeat_count"] is None
         assert meta["safe_error"] is None

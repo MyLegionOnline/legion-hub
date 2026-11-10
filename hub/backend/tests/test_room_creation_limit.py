@@ -17,6 +17,8 @@ def _room_input():
         room_type="group",
         has_coordinator=False,
         coordinator_config={},
+        auto_retry_enabled=True,
+        auto_retry_max=3,
         user_ids=[],
         agent_ids=[],
     )

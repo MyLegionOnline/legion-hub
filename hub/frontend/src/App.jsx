@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Hash, MoreVertical, Trash2, PauseCircle, ChevronLeft, PanelRight, Square, X } from 'lucide-react';
+import { Hash, MoreVertical, Trash2, PauseCircle, ChevronLeft, PanelRight, Square, X, RotateCcw } from 'lucide-react';
 import { NavSidebar } from './components/NavSidebar';
 import { ChatList } from './components/ChatList';
 import { ChatWindow } from './components/ChatWindow';
@@ -15,6 +15,8 @@ import { SessionsTab } from './components/SessionsTab';
 import { SkillsPanel } from './components/SkillsPanel';
 import { ConnectionsPanel } from './components/ConnectionsPanel';
 import { ConfirmDialog } from './components/ConfirmDialog';
+import { AutoRetrySettingsDialog } from './components/AutoRetrySettings';
+import { DEFAULT_AUTO_RETRY_MAX } from './lib/autoRetry';
 import { TaskBoardTab } from './components/TaskBoardTab';
 import { WorkspaceTab } from './components/WorkspaceTab';
 import { BrowserTab } from './components/BrowserTab';
@@ -83,6 +85,7 @@ function App() {
   const [workspaceRetryNonce, setWorkspaceRetryNonce] = useState(0);
   const [switchStatus, setSwitchStatus] = useState(null);
   const [roomMenuOpen, setRoomMenuOpen] = useState(false);
+  const [autoRetryRoomId, setAutoRetryRoomId] = useState(null);
   const [pausingAgents, setPausingAgents] = useState(false);
   const roomMenuRef = useRef(null);
   // Phone layout: one pane at a time. The list (rooms or agents) shows when
@@ -795,8 +798,36 @@ function App() {
     };
     if (!selectedRoom) return <EmptyState />;
 
+    const autoRetryLabel = (selectedRoom.auto_retry_enabled ?? true)
+      ? `On (${selectedRoom.auto_retry_max ?? DEFAULT_AUTO_RETRY_MAX})`
+      : 'Off';
+    const saveAutoRetrySettings = async (settings) => {
+      const roomId = selectedRoom.id;
+      const res = await API(`/api/v1/rooms/${roomId}`, token, {
+        method: 'PUT',
+        body: JSON.stringify(settings),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(switchErrorText(data, 'Could not save auto-retry settings.'));
+      }
+      const { auto_retry_enabled, auto_retry_max } = await res.json();
+      const patch = { auto_retry_enabled, auto_retry_max };
+      setSelectedRoom(prev => (prev?.id === roomId ? { ...prev, ...patch } : prev));
+      setRooms(prev => prev.map(room => (room.id === roomId ? { ...room, ...patch } : room)));
+      setTaskRefreshKey(key => key + 1);
+    };
+
     return (
       <div className="flex flex-col h-full overflow-hidden">
+        {autoRetryRoomId === selectedRoom.id && (
+          <AutoRetrySettingsDialog
+            key={selectedRoom.id}
+            room={selectedRoom}
+            onSave={saveAutoRetrySettings}
+            onClose={() => setAutoRetryRoomId(null)}
+          />
+        )}
         {/* Room header — shared across all tabs */}
         <div
           className="flex items-center justify-between gap-2 md:gap-3 px-3 md:px-5 py-3 flex-shrink-0 border-b"
@@ -872,6 +903,16 @@ function App() {
                     Room panel
                   </button>
                 )}
+                {selectedRoom.type !== 'dm' && (
+                  <button
+                    onClick={() => { setAutoRetryRoomId(selectedRoom.id); setRoomMenuOpen(false); }}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-xs text-left transition-colors hover:bg-[var(--bg-hover)]"
+                    style={{ color: 'var(--text-primary)' }}
+                  >
+                    <RotateCcw size={13} />
+                    Auto-retry: {autoRetryLabel}
+                  </button>
+                )}
                 {selectedRoom.billing_active && (
                   <button
                     onClick={() => { setRoomMenuOpen(false); closeRoom(selectedRoom); }}
@@ -932,6 +973,7 @@ function App() {
             token={token}
             onDelete={handleRoomDeleted}
             onRoomStateChange={handleRoomStateChange}
+            taskRefreshKey={taskRefreshKey}
             onTaskEvent={() => setTaskRefreshKey(k => k + 1)}
             onGoalEvent={() => setGoalRefreshKey(k => k + 1)}
             onFileEvent={() => setRepoRefreshKey(k => k + 1)}
@@ -954,6 +996,7 @@ function App() {
         {roomTab === 'board' && (
           <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
             <TaskBoardTab
+              key={selectedRoom.id}
               room={selectedRoom}
               token={token}
               refreshKey={taskRefreshKey}

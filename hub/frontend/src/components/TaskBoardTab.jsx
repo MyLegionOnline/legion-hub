@@ -1,4 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { hasScheduledAutoRetry, useAutoRetryRefresh } from '../lib/autoRetry';
+import { AutoRetryBadge } from './AutoRetryBadge';
 import {
   Plus, RefreshCw, Circle, Clock, CheckCircle2, AlertCircle, Ban,
   XCircle, Loader2, User2, Target, ChevronDown, ChevronUp, ChevronRight, Bot, GitBranch, RotateCcw,
@@ -66,7 +68,7 @@ function boardTransitionsFor(task) {
 
 // ── Compact task card ─────────────────────────────────────────────────────────
 
-function TaskCard({ task, roomId, token, agents, onRefresh, onShowDiff, liveStatus, baseRef = 'dev' }) {
+function TaskCard({ task, roomId, token, agents, onRefresh, onShowDiff, liveStatus, autoRetryMax, baseRef = 'dev' }) {
   const [expanded, setExpanded] = useState(false);
   const [transitioning, setTransitioning] = useState(false);
   const [actionError, setActionError] = useState('');
@@ -84,7 +86,8 @@ function TaskCard({ task, roomId, token, agents, onRefresh, onShowDiff, liveStat
   const isStalled = liveStatus?.status === 'session_stalled';
   // Same rule as TaskPanel: stuck in_progress with nothing dispatched/running.
   const noActivity = task.state === 'in_progress' && runtimeStatus === 'queued';
-  const canRetry = canRetryTask(task, liveStatus);
+  const autoRetryScheduled = hasScheduledAutoRetry(task);
+  const canRetry = !autoRetryScheduled && canRetryTask(task, liveStatus);
 
   const retryTask = async () => {
     setTransitioning(true);
@@ -159,6 +162,20 @@ function TaskCard({ task, roomId, token, agents, onRefresh, onShowDiff, liveStat
         {expanded ? <ChevronUp size={10} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
                   : <ChevronDown size={10} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />}
       </button>
+
+      {autoRetryScheduled && (
+        <div className="px-2.5 pb-2">
+          <AutoRetryBadge
+            key={task.auto_retry_at}
+            task={task}
+            roomId={roomId}
+            token={token}
+            maxAttempts={autoRetryMax}
+            onDone={onRefresh}
+            disabled={transitioning}
+          />
+        </div>
+      )}
 
       {expanded && (
         <div className="px-2.5 pb-2 flex flex-col gap-1.5 border-t" style={{ borderColor: 'var(--border)' }}>
@@ -402,7 +419,7 @@ function InlineCreateTask({ roomId, token, goalId, agents, onCreated, onCancel }
 
 // ── Goal board table ──────────────────────────────────────────────────────────
 
-function GoalBoard({ goal, tasks, roomId, token, agents, formerAgents = [], onRefresh, onShowDiff, taskStatuses = {}, workingBranch = 'dev' }) {
+function GoalBoard({ goal, tasks, roomId, token, agents, formerAgents = [], onRefresh, onShowDiff, taskStatuses = {}, autoRetryMax, workingBranch = 'dev' }) {
   const baseRef = goal.branch_name || workingBranch;
   const [addingState, setAddingState] = useState(null); // state key where "+ Add" was clicked
 
@@ -528,7 +545,7 @@ function GoalBoard({ goal, tasks, roomId, token, agents, formerAgents = [], onRe
                     {agentCols.length === 0 ? (
                       <td className="px-3 py-2 align-top">
                         {cellTasks(state, null).map(t => (
-                          <TaskCard key={t.id} task={t} roomId={roomId} token={token} agents={agents} onRefresh={onRefresh} onShowDiff={onShowDiff} liveStatus={taskStatuses[t.id]} baseRef={baseRef} />
+                          <TaskCard key={t.id} task={t} roomId={roomId} token={token} agents={agents} onRefresh={onRefresh} onShowDiff={onShowDiff} liveStatus={taskStatuses[t.id]} baseRef={baseRef} autoRetryMax={autoRetryMax} />
                         ))}
                         {addingState === state && (
                           <InlineCreateTask
@@ -547,7 +564,7 @@ function GoalBoard({ goal, tasks, roomId, token, agents, formerAgents = [], onRe
                           style={{ borderLeft: i > 0 ? '1px solid var(--border)' : undefined, minWidth: 160 }}
                         >
                           {cellTasks(state, col.id).map(t => (
-                            <TaskCard key={t.id} task={t} roomId={roomId} token={token} agents={agents} onRefresh={onRefresh} onShowDiff={onShowDiff} liveStatus={taskStatuses[t.id]} baseRef={baseRef} />
+                            <TaskCard key={t.id} task={t} roomId={roomId} token={token} agents={agents} onRefresh={onRefresh} onShowDiff={onShowDiff} liveStatus={taskStatuses[t.id]} baseRef={baseRef} autoRetryMax={autoRetryMax} />
                           ))}
                         </td>
                       ))
@@ -601,7 +618,7 @@ function GoalBoard({ goal, tasks, roomId, token, agents, formerAgents = [], onRe
 
 // ── Ungrouped tasks section ───────────────────────────────────────────────────
 
-function UngroupedSection({ tasks, roomId, token, agents, onRefresh, onShowDiff, taskStatuses = {}, baseRef = 'dev' }) {
+function UngroupedSection({ tasks, roomId, token, agents, onRefresh, onShowDiff, taskStatuses = {}, autoRetryMax, baseRef = 'dev' }) {
   const [adding, setAdding] = useState(false);
   if (tasks.length === 0 && !adding) return null;
 
@@ -638,7 +655,7 @@ function UngroupedSection({ tasks, roomId, token, agents, onRefresh, onShowDiff,
                   </td>
                   <td className="px-3 py-2 align-top">
                     {tasks.filter(t => t.state === state).map(t => (
-                      <TaskCard key={t.id} task={t} roomId={roomId} token={token} agents={agents} onRefresh={onRefresh} onShowDiff={onShowDiff} liveStatus={taskStatuses[t.id]} baseRef={baseRef} />
+                      <TaskCard key={t.id} task={t} roomId={roomId} token={token} agents={agents} onRefresh={onRefresh} onShowDiff={onShowDiff} liveStatus={taskStatuses[t.id]} baseRef={baseRef} autoRetryMax={autoRetryMax} />
                     ))}
                   </td>
                 </tr>
@@ -694,7 +711,6 @@ export function TaskBoardTab({ room, token, refreshKey = 0, onShowDiff, taskStat
   const load = useCallback(async () => {
     if (!roomId || !token) return;
     const seq = ++loadSeqRef.current;
-    setLoading(true);
     try {
       const [goalsRes, tasksRes, membersRes] = await Promise.all([
         fetch(`/api/v1/rooms/${roomId}/goals`, { headers: { Authorization: `Bearer ${token}` } }),
@@ -721,9 +737,9 @@ export function TaskBoardTab({ room, token, refreshKey = 0, onShowDiff, taskStat
     }
   }, [roomId, token]);
 
-  useEffect(() => { load(); }, [load]);
-  useEffect(() => { if (refreshKey > 0) load(); }, [refreshKey, load]);
+  useEffect(() => { load(); }, [load, refreshKey]);
   useEffect(() => onRoomAgentsChanged(roomId, load), [roomId, load]);
+  useAutoRetryRefresh(tasks.some(hasScheduledAutoRetry), load);
 
   const sortedGoals = useMemo(() => sortGoalsNewestFirst(goals), [goals]);
 
@@ -769,6 +785,7 @@ export function TaskBoardTab({ room, token, refreshKey = 0, onShowDiff, taskStat
               onShowDiff={onShowDiff}
               taskStatuses={taskStatuses}
               workingBranch={workingBranch}
+              autoRetryMax={room.auto_retry_max}
             />
           ))}
 
@@ -781,6 +798,7 @@ export function TaskBoardTab({ room, token, refreshKey = 0, onShowDiff, taskStat
             onShowDiff={onShowDiff}
             taskStatuses={taskStatuses}
             baseRef={workingBranch}
+            autoRetryMax={room.auto_retry_max}
           />
 
           {goals.length === 0 && tasks.length === 0 && (

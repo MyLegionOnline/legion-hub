@@ -1,6 +1,6 @@
 # Configuration
 
-A self-hosted Hub is configured in two places:
+A self-hosted Hub has two configuration files.
 
 | File | Holds | Changes take effect |
 |---|---|---|
@@ -61,6 +61,7 @@ encrypted with the keyring.
 | `LEGION_REGISTRATION` | from `legion.toml` | `closed`, `invite` or `open`; wins over the file |
 | `LEGION_OWNER_EMAIL` | – | For a database that had users before owners existed: the account that becomes the owner |
 | `LEGION_SOURCE_URL` | the public repository | The "Source code" link. If you run a modified Hub, point it at your source (AGPL-3.0 section 13) |
+| `LEGION_BROWSER_PREVIEW` | `false` | `true` opens apps started in a room in its Browser tab, at `http://svc-<id>.preview.localhost:<LEGION_PORT>`. Browsers resolve `*.localhost` themselves, so no DNS is needed, but only a browser on the Hub's machine can open these addresses. Needs v0.1.6 or newer. A preview on your own domain (wildcard DNS and certificate) is a compose change, see [BROWSER_SERVICES_REFERENCE.md](../hub/BROWSER_SERVICES_REFERENCE.md) section 7 |
 | `MARKET_ENABLED` | `false` | See [Legion Market](#legion-market) |
 | `DOCKER_SOCKET` | `/var/run/docker.sock` | The socket the room daemon and MCP supervisor use |
 | `WORKSPACE_TMP_MB` | `512` | Size of `/tmp` in each room container |
@@ -144,6 +145,52 @@ A server whose name the owner already has is left alone, so changes made in Sett
 stay. **Passwords and tokens never go in this file**: an unknown key (including
 `token`) stops the Hub at start. Add credentials in Settings → Secrets and bind them
 to the server.
+
+## Room auto-retry
+
+The Hub can restart interrupted tasks automatically. **Auto-retry on failure**
+is enabled by default with **3 attempts** per task, including in rooms that
+already exist when you upgrade. Set it when you create a room, or open the
+three-dot menu in the room header and choose **Auto-retry: On (3)** (the number
+reflects the current limit) or **Auto-retry: Off**. Set **Attempts** to a whole
+number from 1 to 10, or turn the switch off to clear the room's pending retries.
+Automatic attempts are billed like regular work and count separately from
+manual retries.
+
+| Interruption | Automatic action |
+|---|---|
+| Provider network errors, HTTP 429 or 5xx, response or inactivity timeouts, and sessions interrupted by a Hub restart | **Retry** starts a new session. |
+| Session tool-call or context-window limit | **Resume** continues the saved conversation. If the history is unavailable, the Hub uses **Retry**. |
+
+Other interruptions require the usual manual or system action. These include
+provider errors such as invalid credentials, insufficient balance, or a bad
+request, as well as prompt caps, model context limits, repeated tool errors,
+and dispatch configuration failures. When a session reaches its token budget
+(`token_budget`), choose **Retry** or **Resume** in the interruption card.
+Tasks waiting for user input, rejected or cancelled tasks, and tasks started by
+a direct connector are outside the policy, as are ChatMaster conversations.
+
+Attempts wait about 30 seconds, then 2 minutes, then 8 minutes for subsequent
+attempts, with up to 20% variation. For HTTP 429, the Hub waits at least as long
+as a valid `Retry-After` header specifies. A pending attempt survives a Hub
+restart. Auto-retry respects hard quotas and stops after repeated stalls.
+Stopping or pausing a room clears its pending attempts. A frozen room skips
+them, and a scheduled attempt never wakes a stopped workspace.
+
+The interruption card and task board show the attempt number and countdown.
+Choose **Retry now** to run the scheduled attempt immediately with its own
+action (a session that hit its limit is resumed, not started over); it counts as
+an automatic attempt, not a manual retry. Choose **Cancel auto-retry** to clear
+that attempt and leave the task blocked. When the automatic attempt limit is
+reached, use the manual actions on the card.
+
+When the Hub does not run an attempt, the room history says why: the last
+sessions ended without progress, the room was stopped or frozen (or auto-retry
+was turned off), or the task cannot start, for example because the plan's hours
+or the storage quota are used up. The card then keeps its manual actions.
+
+**Resume** is refused after a stop on the prompt cap or the model's context
+limit, because the saved conversation is itself over the limit. Use **Retry**.
 
 ## Legion Market
 

@@ -39,6 +39,7 @@ import signal
 import stat
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Optional, Union
 from urllib.parse import urlsplit
@@ -99,6 +100,10 @@ _SAFE_ENV = {
     "PAGER": "cat",
     # refs/replace/* in the room must not change what workspaced reads.
     "GIT_NO_REPLACE_OBJECTS": "1",
+    # Read-only commands (status, diff) run outside the room lock; without
+    # this ``git status`` takes index.lock to refresh the index and makes a
+    # concurrent commit fail with "index.lock exists".
+    "GIT_OPTIONAL_LOCKS": "0",
 }
 
 
@@ -578,6 +583,36 @@ def _subcommand(args: list[str]) -> str:
     return ""
 
 
+def _clear_stale_git_locks(git_dir: Optional[Path], since: float) -> list[str]:
+    """Remove ``*.lock`` files a killed git left in ``git_dir``.
+
+    A git killed at its timeout cannot release ``index.lock``, ``HEAD.lock``
+    or a ref lock, and every later operation in the room would then fail with
+    "… .lock exists" until someone deletes it by hand. Only locks created
+    since the killed process started are removed — workspaced holds the room
+    lock for the whole operation, so they are that process's. Objects are
+    skipped (git writes no ``.lock`` files there worth a walk).
+    """
+    if git_dir is None:
+        return []
+    removed: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(git_dir, followlinks=False):
+        if Path(dirpath) == git_dir and "objects" in dirnames:
+            dirnames.remove("objects")
+        for name in filenames:
+            if not name.endswith(".lock"):
+                continue
+            path = os.path.join(dirpath, name)
+            try:
+                st = os.lstat(path)
+                if stat.S_ISREG(st.st_mode) and st.st_mtime >= since - 1:
+                    os.unlink(path)
+                    removed.append(os.path.relpath(path, git_dir))
+            except OSError:
+                pass
+    return removed
+
+
 def _kill(proc: subprocess.Popen) -> None:
     try:
         if os.name == "posix":
@@ -632,6 +667,7 @@ def git_exec(
         if as_user:
             uid, gid = _workspace_ids()
             user_kw = {"user": uid, "group": gid, "extra_groups": []}
+        started = time.time()
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -651,7 +687,11 @@ def git_exec(
         except subprocess.TimeoutExpired:
             _kill(proc)
             out, err = proc.communicate()
-            logger.warning("git %s in %s timed out after %.0fs", _subcommand(args), cwd, timeout)
+            removed = _clear_stale_git_locks(
+                git_dir if git_dir is not None else _common_git_dir(Path(cwd))[0], started,
+            )
+            logger.warning("git %s in %s timed out after %.0fs; removed locks %s",
+                           _subcommand(args), cwd, timeout, removed or "none")
             note = f"\nlegion: git {_subcommand(args)} timed out after {timeout:.0f}s\n"
             return subprocess.CompletedProcess(
                 cmd, TIMEOUT_RETURNCODE, out, (err or empty) + (note if text else note.encode()),

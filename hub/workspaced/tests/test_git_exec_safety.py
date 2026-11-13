@@ -296,6 +296,42 @@ def test_a_hung_git_is_killed_at_the_timeout(room, tmp_path):
     assert "timed out" in r.stderr
 
 
+@posix_only
+def test_a_timed_out_git_leaves_no_lock_behind(room, tmp_path):
+    """git commit holds index.lock while its editor runs; killing it at the
+    timeout must not leave the lock to break every later operation."""
+    room_id, root = room
+    slow = tmp_path / "slow-editor.sh"
+    slow.write_text("#!/bin/sh\nsleep 30\n", encoding="utf-8")
+    slow.chmod(0o755)
+    (root / "f.txt").write_text("f\n", encoding="utf-8")
+    assert git_exec.git_exec(["add", "f.txt"], root).returncode == 0
+
+    r = git_exec.git_exec(["commit"], root, env={"GIT_EDITOR": str(slow)}, timeout=1)
+    assert r.returncode == git_exec.TIMEOUT_RETURNCODE
+    assert not (root / ".git" / "index.lock").exists()
+    assert git_ops.git_commit(room_id, "after the timeout")
+
+
+def test_an_older_lock_is_not_touched(tmp_path):
+    git_dir = tmp_path / ".git"
+    (git_dir / "refs" / "heads").mkdir(parents=True)
+    old = git_dir / "refs" / "heads" / "x.lock"
+    old.write_text("", encoding="utf-8")
+    past = old.stat().st_mtime - 3600
+    os.utime(old, (past, past))
+    new = git_dir / "index.lock"
+    new.write_text("", encoding="utf-8")
+
+    removed = git_exec._clear_stale_git_locks(git_dir, since=new.stat().st_mtime)
+    assert removed == ["index.lock"]
+    assert old.exists()
+
+
+def test_status_takes_no_optional_index_lock():
+    assert git_exec.base_env()["GIT_OPTIONAL_LOCKS"] == "0"
+
+
 def test_git_failures_come_back_as_results_not_exceptions(tmp_path):
     r = git_exec.git_exec(["rev-parse", "HEAD"], tmp_path)
     assert r.returncode != 0

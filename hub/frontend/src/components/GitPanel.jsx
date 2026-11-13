@@ -10,11 +10,51 @@ import { CiBadge, RiskBadge } from './GitFlowCards';
 import { GitLinkModal } from './RepoPanel';
 import { ModalPortal } from './shared';
 import { releaseTagMessages } from '../lib/releaseTagI18n';
+import { PULL_CONFLICT_MESSAGE, requestPullConflict } from '../lib/remoteDivergence';
 
 /* internal design notes Stage 4 (header / gate queue / operations)
  *                  Stage 5 (BranchTree + expand modal) */
 
 const API = import.meta.env.VITE_API_URL || '';
+
+/* ── PullConflictGateItem ─────────────────────────────────────────────────── */
+
+function PullConflictGateItem({ gate, roomId, token, onReview }) {
+  const { invalidate } = useGitState();
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState('');
+  const openReview = async () => {
+    setPending(true);
+    setError('');
+    try {
+      const data = ['detected', 'stale'].includes(gate.state)
+        ? await requestPullConflict(roomId, gate.id, token, { action: 'review' })
+        : gate;
+      onReview(gate, data.state === 'reviewing');
+      invalidate();
+    } catch (err) {
+      setError(err.message);
+      invalidate();
+    } finally {
+      setPending(false);
+    }
+  };
+  return (
+    <div data-testid="git-gate-queue" className="flex flex-col gap-1 rounded-lg p-2"
+      style={{ border: '1px solid rgba(251,191,36,0.35)', color: 'var(--text-secondary)' }}>
+      <div className="flex items-center gap-1 text-[10px]" style={{ color: '#fbbf24' }}>
+        <GitCompare size={12} className="shrink-0" />
+        <span className="truncate" title={gate.branch}>Pull conflict · {gate.branch}</span>
+      </div>
+      {gate.conflict_files?.length > 0 && <p className="break-words text-[10px]">{gate.conflict_files.join(', ')}</p>}
+      <button type="button" className="btn-ghost self-start" onClick={openReview} disabled={pending}>
+        {pending ? 'Opening review…' : gate.state === 'stale' ? 'Re-review' :
+          ['reviewed', 'reviewing'].includes(gate.state) ? 'Review in chat' : 'Review conflict'}
+      </button>
+      {error && <p role="alert" className="text-[10px]" style={{ color: '#f87171' }}>{error}</p>}
+    </div>
+  );
+}
 
 /* ── GoalGateItem ─────────────────────────────────────────────────────────── */
 
@@ -593,8 +633,8 @@ export function BranchTree({ dense = true, onShowDiff, roomId, token, onRelease 
       let msg;
       if (res.ok && data.ok) {
         msg = `"${node.name}" updated from the repository.`;
-      } else if (data.conflict) {
-        msg = 'Conflict with the remote — the merge was aborted, details in the chat.';
+      } else if (res.ok && data.conflict && !data.userfiles_policy_conflict) {
+        msg = PULL_CONFLICT_MESSAGE;
       } else if (/couldn't find remote ref|not found/i.test(err)) {
         msg = `The remote repository has no branch "${node.name}".`;
       } else {
@@ -780,7 +820,7 @@ function ReleaseTagModal({ roomId, token, onClose }) {
 
 /* ── GitPanel ─────────────────────────────────────────────────────────────── */
 
-export function GitPanel({ roomId, token, onShowDiff }) {
+export function GitPanel({ roomId, token, onShowDiff, onReviewPullConflict }) {
   const { state, invalidate, bumpWorkspace } = useGitState();
   const [gitModal, setGitModal] = useState(false);
   const [treeModal, setTreeModal] = useState(false);
@@ -795,7 +835,9 @@ export function GitPanel({ roomId, token, onShowDiff }) {
 
   const conn = state?.connection;
   const hasRepo = Boolean(conn?.repo_url);
-  const gates = state?.gates ?? [];
+  const gates = (state?.gates ?? []).filter(gate =>
+    ['goal_review', 'promotion', 'remote_divergence'].includes(gate.kind)
+  );
   const flow = state?.flow;
   const workingBranch = flow?.working_branch ?? 'dev';
   const releaseBranch = flow?.release_branch ?? 'main';
@@ -824,9 +866,19 @@ export function GitPanel({ roomId, token, onShowDiff }) {
         method: 'POST', headers: { Authorization: `Bearer ${token}` },
       });
       const data = await res.json().catch(() => ({}));
-      if (res.ok && data.ok) { setOpStatus({ type: 'ok', msg: 'Changes pulled from the repository.' }); invalidate(); bumpWorkspace(); }
-      else if (res.ok && data.conflict) setOpStatus({ type: 'err', msg: 'Conflict with the remote — resolve it manually or force push.' });
-      else setOpStatus({ type: 'err', msg: data.detail || data.errors?.[0] || 'Pull failed.' });
+      if (res.ok && data.ok) {
+        const restarted = data.services_restarted ?? [];
+        const added = data.services_added ?? [];
+        const parts = ['Changes pulled from the repository.'];
+        if (restarted.length) parts.push(`Restarted to pick them up: ${restarted.join(', ')}.`);
+        if (added.length) parts.push(`New services in the Browser tab: ${added.join(', ')}.`);
+        setOpStatus({ type: 'ok', msg: parts.join(' ') });
+        invalidate(); bumpWorkspace();
+      } else if (res.ok && data.conflict && !data.userfiles_policy_conflict) {
+        setOpStatus({ type: 'err', msg: PULL_CONFLICT_MESSAGE });
+        setForcePush(false);
+        invalidate();
+      } else setOpStatus({ type: 'err', msg: data.detail || data.errors?.[0] || 'Pull failed.' });
     } finally { setPulling(false); }
   };
 
@@ -917,11 +969,14 @@ export function GitPanel({ roomId, token, onShowDiff }) {
               : `Everything is merged. ${workingBranch} has nothing to publish.`}
           </p>
         ) : (
-          gates.map(gate =>
-            gate.kind === 'goal_review'
+          gates.map(gate => {
+            if (gate.kind === 'remote_divergence') {
+              return <PullConflictGateItem key={gate.id} gate={gate} roomId={roomId} token={token} onReview={onReviewPullConflict} />;
+            }
+            return gate.kind === 'goal_review'
               ? <GoalGateItem key={gate.id} gate={gate} roomId={roomId} token={token} />
-              : <PromotionGateItem key={gate.id} gate={gate} roomId={roomId} token={token} />
-          )
+              : <PromotionGateItem key={gate.id} gate={gate} roomId={roomId} token={token} />;
+          })
         )}
 
         {!hasOpenPromotion && pendingAhead > 0 && flow?.promote_policy === 'manual' && (

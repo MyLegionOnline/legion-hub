@@ -29,7 +29,8 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from app.git_ops import _inject_token, _run, _serialized, _workspace_root
+from app.git_exec import read_repo_file, write_repo_file
+from app.git_ops import _run, _serialized, _workspace_root
 
 logger = logging.getLogger("workspaced.release_guard")
 
@@ -92,9 +93,9 @@ RELEASE_BRANCH = "main"
 INTEGRATION_BRANCH = "dev"
 
 
-def _hook_current(path: Path, script: str) -> bool:
+def _hook_current(root: Path, name: str, script: str) -> bool:
     try:
-        return path.read_text(encoding="utf-8") == script
+        return read_repo_file(root, ".git", "hooks", name) == script
     except (OSError, UnicodeDecodeError):
         return False
 
@@ -110,7 +111,7 @@ def ensure_ref_guard(root: Path) -> bool:
     git_dir = root / ".git"
     if not git_dir.is_dir():
         return False
-    if all(_hook_current(git_dir / "hooks" / name, script) for name, script in HOOKS.items()):
+    if all(_hook_current(root, name, script) for name, script in HOOKS.items()):
         return False  # the common case: one stat + read per hook, no git call
     hooks_path = _run(["config", "--local", "--get", "core.hooksPath"], cwd=root).stdout.strip()
     if hooks_path:
@@ -121,18 +122,17 @@ def ensure_ref_guard(root: Path) -> bool:
         hooks = git_dir / "hooks"
         hooks.mkdir(exist_ok=True)
         for name, script in HOOKS.items():
-            path = hooks / name
-            if path.exists():
-                current = path.read_text(encoding="utf-8", errors="replace")
+            # Never through a link: the agent owns .git (app/git_exec.py).
+            current = read_repo_file(root, ".git", "hooks", name)
+            if current is not None:
                 if current == script:
                     continue
                 if _HOOK_MARKER.split(" v")[0] not in current:
                     logger.warning("ref guard: %s has its own %s hook; left alone", root, name)
                     continue
-            path.write_text(script, encoding="utf-8", newline="\n")
-            path.chmod(0o755)
+            write_repo_file(root, (".git", "hooks", name), script, mode=0o755)
             written = True
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         logger.warning("ref guard: could not install hooks in %s", root, exc_info=True)
     return written
 
@@ -253,5 +253,5 @@ def push_release_tag(room_id: str, remote_url: str, tag: str, token: Optional[st
     if not RELEASE_TAG_RE.match(tag or "") or _resolve(root, f"refs/tags/{tag}") is None:
         return {"ok": False, "stdout": "", "stderr": f"tag '{tag}' does not exist in the workspace"}
     refspec = f"refs/tags/{tag}:refs/tags/{tag}"
-    r = _run(["push", _inject_token(remote_url, token), refspec], cwd=root)
+    r = _run(["push", remote_url, refspec], cwd=root, auth=(remote_url, token))
     return {"ok": r.returncode == 0, "stdout": r.stdout[:4096], "stderr": r.stderr[:4096]}

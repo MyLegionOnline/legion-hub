@@ -207,6 +207,12 @@ class WorkspaceServiceTool(Tool):
             workspace.id, {**raw, "declared_by": "agent"}, source=f"agent:{ctx.session_id}"
         )
         await ctx.db.commit()
+        if changed:
+            from app.core.workspace_services_manifest import export_services_manifest
+
+            # Mirrors the catalog into .legion/services.json so the project
+            # carries its Browser services to whoever clones it.
+            await export_services_manifest(ctx.db, ctx.room_id, workspace.id)
         return self._summary(service, detail=f"declaration: {'updated' if changed else 'unchanged'}")
 
     async def _list(self, ctx: ToolContext) -> str:
@@ -263,6 +269,17 @@ class WorkspaceServiceTool(Tool):
             )
         if action == "start":
             await self._ensure_workspace_started(ctx)
+            if service.runtime_state == "ready":
+                # Start never touches a live process, so it keeps serving the
+                # code it loaded at launch — say so rather than imply freshness.
+                return self._summary(
+                    service,
+                    detail=(
+                        "note: already running; start did nothing. The process still runs the "
+                        "code it loaded when it started — after editing code or a git pull, "
+                        "use action=restart to serve the current files."
+                    ),
+                )
             await self._start_tree(ctx, workspace, registry, service, wsd, set())
             return self._summary(
                 service,
@@ -351,49 +368,12 @@ class WorkspaceServiceTool(Tool):
         await ctx.db.commit()
 
     async def _resolve_service_secrets(self, ctx: ToolContext, service) -> tuple[dict[str, str], dict[str, str]]:
-        """Resolve Room variables (always) and ``service.secrets`` (by name).
+        from app.core.workspace_services import ServiceSecretError, resolve_service_launch_env
 
-        internal design notes Stage 6 — mirrors ``_bash.py``'s
-        ``_build_exec_env``: Room variables always ride along (non-secret,
-        plan §3.1), declared secret *names* are resolved under the Room
-        owner (no human actor at service-start time, same reasoning as bash).
-        Returns ``(room_vars, resolved_secrets)`` so the caller can keep only
-        the latter maskable.
-        """
-        from sqlalchemy.future import select
-
-        from app.core.room_config import effective_variables
-        from app.core.secrets import room_secrets
-        from app.core.secrets.service import SecretService
-        from app.models.room import Room
-
-        room_vars = await effective_variables(ctx.db, ctx.room_id, None)
-        if not service.secrets:
-            return room_vars, {}
-
-        room = (await ctx.db.execute(select(Room).where(Room.id == ctx.room_id))).scalar_one_or_none()
-        if room is None:
-            raise WorkspaceServiceToolError("room not found")
-
-        secret_service = SecretService(ctx.db)
         try:
-            resolved = await room_secrets.resolve_room_env(
-                ctx.db,
-                service=secret_service,
-                room_id=ctx.room_id,
-                actor_user_id=room.creator_id,
-                names=service.secrets,
-                # Explicit-name request from the declared service, same as
-                # bash(secrets=[...]) — bypasses the scope allow-list, which
-                # exists to gate *automatic* injection, not a named ask.
-                scope=None,
-                environment=None,
-            )
-        except room_secrets.RoomSecretNotAvailable as exc:
-            raise WorkspaceServiceToolError(f"[{exc.code}] {exc}") from exc
-        except room_secrets.RoomSecretError as exc:
+            return await resolve_service_launch_env(ctx.db, ctx.room_id, service)
+        except ServiceSecretError as exc:
             raise WorkspaceServiceToolError(str(exc)) from exc
-        return room_vars, resolved
 
     async def _prepare(self, ctx, workspace, registry, service) -> str:
         from app.core.workspace_environments import WorkspaceEnvironmentError, prepare_service_environment

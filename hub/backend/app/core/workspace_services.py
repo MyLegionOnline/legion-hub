@@ -12,6 +12,7 @@ from uuid import UUID
 
 import httpx
 
+from sqlalchemy import delete as sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 
@@ -170,6 +171,55 @@ def normalize_declaration(raw: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+class ServiceSecretError(ServiceValidationError):
+    """A declared secret name could not be resolved for this room."""
+
+
+async def resolve_service_launch_env(
+    db: AsyncSession, room_id: UUID, service: WorkspaceManagedProcess,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Resolve Room variables (always) and ``service.secrets`` (by name).
+
+    internal design notes Stage 6 — mirrors ``_bash.py``'s
+    ``_build_exec_env``: Room variables always ride along (non-secret, plan
+    §3.1); declared secret *names* are resolved under the Room owner (no human
+    actor at service-start time, same reasoning as bash). Shared by the agent
+    tool and the Browser tab, so a service starts with the same env from both.
+    Returns ``(room_vars, resolved_secrets)`` so callers keep only the latter
+    maskable.
+    """
+    from app.core.room_config import effective_variables
+    from app.core.secrets import room_secrets
+    from app.core.secrets.service import SecretService
+    from app.models.room import Room
+
+    room_vars = await effective_variables(db, room_id, None)
+    if not service.secrets:
+        return room_vars, {}
+
+    room = (await db.execute(select(Room).where(Room.id == room_id))).scalar_one_or_none()
+    if room is None:
+        raise ServiceSecretError("room not found")
+    try:
+        resolved = await room_secrets.resolve_room_env(
+            db,
+            service=SecretService(db),
+            room_id=room_id,
+            actor_user_id=room.creator_id,
+            names=service.secrets,
+            # Explicit-name request from the declared service, same as
+            # bash(secrets=[...]) — bypasses the scope allow-list, which
+            # exists to gate *automatic* injection, not a named ask.
+            scope=None,
+            environment=None,
+        )
+    except room_secrets.RoomSecretNotAvailable as exc:
+        raise ServiceSecretError(f"[{exc.code}] {exc}") from exc
+    except room_secrets.RoomSecretError as exc:
+        raise ServiceSecretError(str(exc)) from exc
+    return room_vars, resolved
+
+
 def config_hash(declaration: dict[str, Any]) -> str:
     body = json.dumps(declaration, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(body.encode()).hexdigest()
@@ -292,6 +342,18 @@ class WorkspaceServiceRegistry:
         await self.db.flush()
         await self.event(service, "workspace.service.declared", source, {"changed": changed})
         return service, changed
+
+    async def delete(self, service: WorkspaceManagedProcess) -> None:
+        """Remove a declaration together with its event ledger.
+
+        ``workspace_service_event.service_id`` references the service, so a
+        bare row delete fails with a foreign-key violation once the service
+        has emitted any event (every declaration emits one).
+        """
+        await self.db.execute(
+            sa_delete(WorkspaceServiceEvent).where(WorkspaceServiceEvent.service_id == service.id)
+        )
+        await self.db.delete(service)
 
     async def transition(self, service: WorkspaceManagedProcess, target: str, source: str, payload: dict[str, Any] | None = None) -> None:
         current = service.runtime_state

@@ -202,3 +202,21 @@ async def test_start_tree_does_not_launch_when_environment_prepare_fails(monkeyp
     assert service.runtime_state == "error"
     assert "dependency_prepare_failed" in service.last_error
     supervisor.start_workspace_service.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_start_on_running_service_points_to_restart(monkeypatch):
+    # Start is a no-op on a live process, which keeps the code it loaded at
+    # launch; the agent must be told so instead of reporting fresh code.
+    monkeypatch.setenv("WORKSPACE_SERVICES_ENABLED", "true")
+    tool = WorkspaceServiceTool()
+    service = _service(runtime_state="ready")
+    tool._service = AsyncMock(return_value=(SimpleNamespace(id=uuid4()), MagicMock(), service))
+    tool._ensure_workspace_started = AsyncMock()
+    tool._start_tree = AsyncMock()
+
+    result = await tool.execute(_context(), {"action": "start", "slug": "catalog-web"})
+
+    tool._start_tree.assert_not_awaited()
+    assert "health: ready" in result
+    assert "action=restart" in result

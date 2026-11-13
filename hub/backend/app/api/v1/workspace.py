@@ -31,7 +31,10 @@ from app.core.workspace_lifecycle import (
     stop_workspace as stop_workspace_lifecycle,
     heartbeat_workspace,
 )
+from app.core.secrets.room_masking import bg_secrets, mask_room_secrets, remember_bg_secrets
 from app.core.workspace_services import (
+    ServiceSecretError,
+    resolve_service_launch_env,
     ServiceValidationError,
     WorkspaceServiceRegistry,
     normalize_declaration,
@@ -989,6 +992,20 @@ class ServiceOut(BaseModel):
     last_error: Optional[str] = None
     log_cursor: int = 0
     config_hash: str
+    # Who declared it: agent / user, or ``repo`` (imported from
+    # .legion/services.json, not yet confirmed) / ``repo_approved``.
+    declared_by: str = "agent"
+    # Shown only to confirm the first start of a service from the repository.
+    argv: list[str] = Field(default_factory=list)
+    cwd: str = "."
+    secrets: list[str] = Field(default_factory=list)
+    environment: Optional[dict[str, Any]] = None
+
+
+class ServiceStartIn(BaseModel):
+    # The user saw the command of a service imported from the repository and
+    # agreed to run it.
+    confirm_repo: bool = False
 
 
 class ServiceLogsOut(BaseModel):
@@ -1003,7 +1020,7 @@ class ServiceOpenTicketOut(BaseModel):
     expires_in_sec: int
 
 
-def _service_out(service: WorkspaceManagedProcess) -> ServiceOut:
+def _service_out(service: WorkspaceManagedProcess, environment=None) -> ServiceOut:
     listen = service.listen or {}
     return ServiceOut(
         id=service.id, slug=service.slug, title=service.title, kind=service.kind,
@@ -1011,7 +1028,33 @@ def _service_out(service: WorkspaceManagedProcess) -> ServiceOut:
         assigned_port=listen.get("assigned_port"), pid=service.pid, pgid=service.pgid,
         default_path=service.default_path, last_error=service.last_error,
         log_cursor=service.log_cursor, config_hash=service.config_hash,
+        declared_by=service.declared_by or "agent", argv=list(service.argv or []),
+        cwd=service.cwd or ".", secrets=list(service.secrets or []),
+        environment=None if environment is None else {
+            "profile": environment.profile, "root": environment.root,
+            "manifests": list(environment.manifests or []),
+        },
     )
+
+
+def _require_repo_confirmation(service: WorkspaceManagedProcess, body: Optional[ServiceStartIn]) -> None:
+    """A service imported from the repository runs only after the user saw it."""
+    from app.core.workspace_services_manifest import REPO_APPROVED, needs_repo_confirmation
+
+    if not needs_repo_confirmation(service):
+        return
+    if not (body and body.confirm_repo):
+        raise HTTPException(
+            status_code=409,
+            detail="This service comes from the project repository; confirm its command before the first start",
+        )
+    service.declared_by = REPO_APPROVED
+
+
+async def _export_manifest(room_id: UUID, workspace: Workspace, db: AsyncSession) -> None:
+    from app.core.workspace_services_manifest import export_services_manifest
+
+    await export_services_manifest(db, room_id, workspace.id)
 
 
 def _require_services_enabled() -> None:
@@ -1030,7 +1073,10 @@ async def list_workspace_services(
     workspace = await _get_or_create_workspace(room_id, db)
     registry = WorkspaceServiceRegistry(db)
     await _reconcile_service_runtime(room_id, workspace, registry, db)
-    return [_service_out(service) for service in await registry.list(workspace.id)]
+    return [
+        _service_out(service, await registry.environment_for(workspace.id, service))
+        for service in await registry.list(workspace.id)
+    ]
 
 
 @router.put("/rooms/{room_id}/workspace/services/{slug}", response_model=ServiceOut)
@@ -1052,6 +1098,7 @@ async def declare_workspace_service(
     except ServiceValidationError as exc:
         await db.rollback()
         raise HTTPException(status_code=422, detail=str(exc))
+    await _export_manifest(room_id, workspace, db)
     return _service_out(service)
 
 
@@ -1091,16 +1138,26 @@ async def _start_declared_service(
             runtime_env, _environment = await prepare_service_environment(
                 str(room_id), workspace.id, service, registry, db,
             )
+            # Same env as an agent-started service: Room variables plus the
+            # declared secrets, resolved from this room's own values.
+            room_vars, resolved_secrets = await resolve_service_launch_env(db, room_id, service)
             requested = (service.listen or {}).get("port", "auto")
             # Relative cwd is an invariant of the durable declaration; the
             # internal supervisor receives only an absolute workspace path.
             spec = {
                 "service_id": str(service.id), "slug": service.slug, "argv": service.argv,
-                "cwd": f"/workspace/{service.cwd}", "env": {**service.env, **runtime_env},
+                "cwd": f"/workspace/{service.cwd}",
+                "env": {**service.env, **runtime_env, **room_vars, **resolved_secrets},
                 "port": requested, "readiness": service.readiness,
                 "timeout_sec": int((service.readiness or {}).get("timeout_sec", 45)),
             }
             result = await wsd.start_workspace_service(str(room_id), spec)
+            remember_bg_secrets(f"service:{service.id}", resolved_secrets)
+        except ServiceSecretError as exc:
+            service.last_error = f"secret resolution failed: {exc}"
+            await registry.transition(service, "error", source, {"code": "secret_not_available"})
+            await db.commit()
+            return service
         except WorkspaceEnvironmentError as exc:
             service.last_error = f"environment preparation failed ({exc.code}): {exc}"
             await registry.transition(service, "error", source, {"code": exc.code})
@@ -1137,7 +1194,8 @@ async def _start_declared_service(
 
 @router.post("/rooms/{room_id}/workspace/services/{slug}/start", response_model=ServiceOut)
 async def start_declared_workspace_service(
-    room_id: UUID, slug: str, db: AsyncSession = Depends(get_session),
+    room_id: UUID, slug: str, body: Optional[ServiceStartIn] = None,
+    db: AsyncSession = Depends(get_session),
     current_user: User = Depends(deps.get_current_user),
 ) -> ServiceOut:
     _require_services_enabled()
@@ -1149,12 +1207,14 @@ async def start_declared_workspace_service(
     service = await registry.get(workspace.id, slug)
     if service is None:
         raise HTTPException(status_code=404, detail="Service not found")
+    _require_repo_confirmation(service, body)
     return _service_out(await _start_declared_service(room_id, workspace, service, registry, db, current_user, source=f"user:{current_user.id}"))
 
 
 @router.post("/rooms/{room_id}/workspace/services/{slug}/restart", response_model=ServiceOut)
 async def restart_declared_workspace_service(
-    room_id: UUID, slug: str, db: AsyncSession = Depends(get_session),
+    room_id: UUID, slug: str, body: Optional[ServiceStartIn] = None,
+    db: AsyncSession = Depends(get_session),
     current_user: User = Depends(deps.get_current_user),
 ) -> ServiceOut:
     _require_services_enabled()
@@ -1166,7 +1226,49 @@ async def restart_declared_workspace_service(
     service = await registry.get(workspace.id, slug)
     if service is None:
         raise HTTPException(status_code=404, detail="Service not found")
+    _require_repo_confirmation(service, body)
     return _service_out(await _start_declared_service(room_id, workspace, service, registry, db, current_user, source=f"user:{current_user.id}", restart=True))
+
+
+async def restart_running_services(
+    room_id: UUID, db: AsyncSession, current_user: User, *, source: str,
+) -> list[str]:
+    """Restart every running declared service in the room; return their slugs.
+
+    A service process loads its code once at start (a Flask app without the
+    reloader, a built bundle, an in-memory template cache), so after a Pull
+    moved the checked-out commit it keeps serving the code that is no longer on
+    disk. The supervisor's Start is a no-op on a live process, so nothing but
+    an explicit restart picks the new code up. Failures are logged and left on
+    the service row — the pull itself has already succeeded.
+    """
+    if not services_enabled():
+        return []
+    workspace = await _get_or_create_workspace(room_id, db)
+    if workspace.status != "running":
+        return []
+    registry = WorkspaceServiceRegistry(db)
+    await _reconcile_service_runtime(room_id, workspace, registry, db)
+    running = [
+        service for service in await registry.list(workspace.id)
+        if service.runtime_state in {"ready", "degraded"}
+    ]
+    # Dependencies first, so a dependent restarts against a fresh dependency.
+    running.sort(key=lambda service: len(service.depends_on or []))
+    restarted: list[str] = []
+    for service in running:
+        try:
+            await _start_declared_service(
+                room_id, workspace, service, registry, db, current_user,
+                source=source, restart=True,
+            )
+            restarted.append(service.slug)
+        except Exception:
+            logger.warning(
+                "restart_running_services: %s in room %s failed",
+                service.slug, room_id, exc_info=True,
+            )
+    return restarted
 
 
 @router.post("/rooms/{room_id}/workspace/services/{slug}/stop", response_model=ServiceOut)
@@ -1212,6 +1314,10 @@ async def declared_workspace_service_logs(
         result = await wsd.get_workspace_service_logs(str(room_id), str(service.id), max(cursor, 0), service.slug)
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Could not read service logs: {exc}")
+    result = {
+        **result,
+        "content": mask_room_secrets(str(result.get("content") or ""), bg_secrets(f"service:{service.id}")),
+    }
     service.log_cursor = int(result.get("cursor", cursor))
     service.last_accessed_at = datetime.now(timezone.utc)
     db.add(service)
@@ -1298,13 +1404,15 @@ async def delete_declared_workspace_service(
     await _get_room(room_id, db)
     await _verify_membership(room_id, current_user, db)
     workspace = await _get_or_create_workspace(room_id, db)
-    service = await WorkspaceServiceRegistry(db).get(workspace.id, slug)
+    registry = WorkspaceServiceRegistry(db)
+    service = await registry.get(workspace.id, slug)
     if service is None:
         raise HTTPException(status_code=404, detail="Service not found")
     if service.runtime_state not in {"stopped", "error"}:
         raise HTTPException(status_code=409, detail="Stop service before deletion")
-    await db.delete(service)
+    await registry.delete(service)
     await db.commit()
+    await _export_manifest(room_id, workspace, db)
     return Response(status_code=204)
 
 

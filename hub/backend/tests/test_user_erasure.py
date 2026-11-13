@@ -220,6 +220,11 @@ async def _seed_user(sessions, *, email=None) -> dict:
         task = m.Task(room_id=room.id, title="a task")
         db.add(task)
         await db.flush()
+        db.add(m.RemoteDivergence(
+            room_id=room.id, branch="dev", remote_ref="refs/legion/remote/main",
+            local_sha="a" * 40, remote_sha="b" * 40, conflict_files=["private.txt"],
+            rework_task_id=task.id,
+        ))
         session = UserAgentSession(room_id=room.id, kind="user_agent_p1", user_id=user.id, agent_id=agent.id,
                                    task_id=task.id)
         db.add(session)
@@ -353,6 +358,7 @@ async def test_erase_user_removes_everything_and_leaves_a_shell(sessions, outsid
     gone = [
         (m.Room, m.Room.creator_id == uid), (m.RoomUserLink, m.RoomUserLink.user_id == uid),
         (m.Message, m.Message.room_id == ids["room_id"]), (m.Workspace, m.Workspace.quota_owner_id == uid),
+        (m.RemoteDivergence, m.RemoteDivergence.room_id == ids["room_id"]),
         (m.Task, m.Task.room_id == ids["room_id"]), (m.AgentSession, m.AgentSession.room_id == ids["room_id"]),
         (m.Agent, m.Agent.owner_id == uid), (m.UserInstalledItem, m.UserInstalledItem.user_id == uid),
         (m.AgentSkill, m.AgentSkill.agent_id == ids["agent_id"]), (m.RoomMcpServer, m.RoomMcpServer.added_by == uid),

@@ -658,7 +658,7 @@ function RemoveAgentError({ error, onClose }) {
 }
 
 /* ── main sidebar ── */
-export function RoomSidebar({ room, token, user, taskRefreshKey = 0, goalRefreshKey = 0, repoRefreshKey = 0, agentStatuses = {}, taskStatuses = {}, onShowDiff, width = 256 }) {
+export function RoomSidebar({ room, token, user, taskRefreshKey = 0, goalRefreshKey = 0, repoRefreshKey = 0, agentStatuses = {}, taskStatuses = {}, onShowDiff, onReviewPullConflict, width = 256 }) {
   const isVirtualDm = !room?.id || String(room.id).startsWith('dm-');
   const realRoomId = isVirtualDm ? null : room.id;
 
@@ -783,7 +783,7 @@ export function RoomSidebar({ room, token, user, taskRefreshKey = 0, goalRefresh
         {realRoomId && (
           <section>
             {sectionTitle('Git')}
-            <GitPanel roomId={realRoomId} token={token} onShowDiff={onShowDiff} />
+            <GitPanel roomId={realRoomId} token={token} onShowDiff={onShowDiff} onReviewPullConflict={onReviewPullConflict} />
           </section>
         )}
 

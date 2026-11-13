@@ -38,6 +38,16 @@ const stateColor = (service) => {
   return 'var(--text-muted)';
 };
 
+const fromRepo = (service) => service?.declared_by === 'repo' || service?.declared_by === 'repo_approved';
+const needsRepoConfirm = (service) => service?.declared_by === 'repo';
+
+const INSTALL_HINT = {
+  'python-pip': 'pip install -r',
+  'node-npm': 'npm ci',
+  'node-pnpm': 'pnpm install --frozen-lockfile',
+  'node-yarn': 'yarn install --frozen-lockfile',
+};
+
 function normalizedPath(value, fallback = '/') {
   const path = (value || fallback).trim() || fallback;
   return path.startsWith('/') ? path : `/${path}`;
@@ -59,6 +69,9 @@ export function BrowserTab({ room, token, serviceEventVersion = 0, fileEventVers
   const [frameKey, setFrameKey] = useState(0);
   const [loading, setLoading] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(readAutoRefreshPreference);
+  // A service imported from the repository's .legion/services.json waits for
+  // the user to see its command before it runs for the first time.
+  const [repoConfirm, setRepoConfirm] = useState(null);
   const pendingTicketRef = useRef(false);
   // A fresh open goes through the gateway's ticket→redirect→app sequence, so
   // the iframe may fire `load` once or twice in quick succession (an HTTP-level
@@ -242,15 +255,16 @@ export function BrowserTab({ room, token, serviceEventVersion = 0, fileEventVers
     }
   };
 
-  const startAndOpen = async (service = selected) => {
+  const startAndOpen = async (service = selected, { confirmed = false } = {}) => {
     if (!service) return;
+    if (needsRepoConfirm(service) && !confirmed) { setRepoConfirm({ service, action: 'start' }); return; }
     setBusySlug(service.slug);
     setActionError('');
     setPendingOpen(service.kind === 'worker' ? null : {
       slug: service.slug, path: service.slug === selected?.slug ? path : service.default_path,
     });
     try {
-      const result = await request(`/api/v1/rooms/${roomId}/workspace/services/${service.slug}/start`, { method: 'POST' });
+      const result = await request(`/api/v1/rooms/${roomId}/workspace/services/${service.slug}/start`, { method: 'POST', body: JSON.stringify({ confirm_repo: confirmed }) });
       mergeService(result);
       if (result.runtime_state === 'error' || result.runtime_state === 'degraded') setPendingOpen(null);
     } catch (error) {
@@ -277,13 +291,14 @@ export function BrowserTab({ room, token, serviceEventVersion = 0, fileEventVers
     }
   };
 
-  const restartService = async (service = selected) => {
+  const restartService = async (service = selected, { confirmed = false } = {}) => {
     if (!service) return;
+    if (needsRepoConfirm(service) && !confirmed) { setRepoConfirm({ service, action: 'restart' }); return; }
     setBusySlug(service.slug);
     setActionError('');
     setPendingOpen(service.kind === 'worker' ? null : { slug: service.slug, path: service.slug === selected?.slug ? path : service.default_path });
     try {
-      const result = await request(`/api/v1/rooms/${roomId}/workspace/services/${service.slug}/restart`, { method: 'POST' });
+      const result = await request(`/api/v1/rooms/${roomId}/workspace/services/${service.slug}/restart`, { method: 'POST', body: JSON.stringify({ confirm_repo: confirmed }) });
       mergeService(result);
     } catch (error) {
       setPendingOpen(null);
@@ -343,8 +358,46 @@ export function BrowserTab({ room, token, serviceEventVersion = 0, fileEventVers
 
   const canOpen = selected && selected.kind !== 'worker';
 
+  const confirmRepoStart = () => {
+    const intent = repoConfirm;
+    setRepoConfirm(null);
+    if (!intent) return;
+    if (intent.action === 'restart') restartService(intent.service, { confirmed: true });
+    else startAndOpen(intent.service, { confirmed: true });
+  };
+
+  const repoConfirmDialog = repoConfirm && (() => {
+    const service = repoConfirm.service;
+    const environment = service.environment;
+    const install = environment && INSTALL_HINT[environment.profile];
+    return (
+      <div className="absolute inset-0 z-20 flex items-center justify-center p-4" style={{ background: 'rgba(0,0,0,.55)' }} onClick={() => setRepoConfirm(null)}>
+        <div role="dialog" aria-modal="true" aria-labelledby="repo-confirm-title" className="w-full max-w-md rounded-2xl p-4 flex flex-col gap-3" onClick={event => event.stopPropagation()} style={{ background: 'var(--bg-panel)', border: '1px solid var(--border)' }}>
+          <div className="flex items-start gap-2">
+            <AlertTriangle size={15} className="flex-shrink-0 mt-0.5" style={{ color: '#fbbf24' }} />
+            <div>
+              <div id="repo-confirm-title" className="text-xs font-medium">Run a service from the repository?</div>
+              <p className="text-[11px] mt-1 leading-relaxed" style={{ color: 'var(--text-muted)' }}>&quot;{service.title}&quot; was declared in the project&apos;s .legion/services.json. It runs inside this room&apos;s workspace with the room&apos;s variables. Check the command before the first start.</p>
+            </div>
+          </div>
+          <div className="rounded-lg p-2 font-mono text-[11px] break-all" style={{ background: '#0b1020', border: '1px solid var(--border)', color: 'var(--text-secondary)' }}>
+            <div><span style={{ color: 'var(--text-muted)' }}>folder: </span>{service.cwd || '.'}</div>
+            {install && <div><span style={{ color: 'var(--text-muted)' }}>install: </span>{install} {(environment.manifests || []).join(' ')} <span style={{ color: 'var(--text-muted)' }}>(in {environment.root || '.'})</span></div>}
+            <div><span style={{ color: 'var(--text-muted)' }}>command: </span>{(service.argv || []).join(' ')}</div>
+          </div>
+          {service.secrets?.length > 0 && <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>Uses room secrets: {service.secrets.join(', ')}. Add them in the room&apos;s Secrets &amp; variables if they are missing.</p>}
+          <div className="flex justify-end gap-2">
+            <button onClick={() => setRepoConfirm(null)} className="text-[11px] px-3 py-1.5 rounded-lg" style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}>Cancel</button>
+            <button onClick={confirmRepoStart} autoFocus className="flex items-center gap-1 text-[11px] px-3 py-1.5 rounded-lg" style={{ background: 'rgba(52,211,153,.12)', color: '#34d399' }}><Play size={11} />Run it</button>
+          </div>
+        </div>
+      </div>
+    );
+  })();
+
   return (
-    <div className="flex flex-col h-full min-h-0 overflow-hidden">
+    <div className="relative flex flex-col h-full min-h-0 overflow-hidden">
+      {repoConfirmDialog}
       <div className="flex-shrink-0 flex items-center gap-2 px-3 py-2 border-b" style={{ background: 'var(--bg-panel)', borderColor: 'var(--border)' }}>
         <Globe size={14} style={{ color: 'var(--accent-light)', flexShrink: 0 }} />
         <select value={selected?.slug || ''} onChange={event => selectService(event.target.value)} disabled={!services.length} className="min-w-0 max-w-[190px] rounded-xl px-2.5 py-1.5 text-[11px] outline-none" style={{ background: 'var(--bg-hover)', border: '1px solid var(--border)', color: 'var(--text-primary)' }}>
@@ -372,13 +425,13 @@ export function BrowserTab({ room, token, serviceEventVersion = 0, fileEventVers
           <div className="flex items-center justify-between px-1 pt-1"><span className="text-xs font-medium">Services</span><button className="btn-ghost p-1" onClick={loadServices} title="Refresh the catalog"><RefreshCw size={12} /></button></div>
           {servicesLoading && !services.length && <div className="p-3 text-xs flex items-center gap-2" style={{ color: 'var(--text-muted)' }}><Loader2 size={13} style={{ animation: 'spin 1s linear infinite' }} />Loading the catalog…</div>}
           {catalogError && <div className="p-2 text-[11px] rounded-lg" style={{ color: '#fca5a5', background: 'rgba(248,113,113,.1)' }}>{catalogError}</div>}
-          {!servicesLoading && !catalogError && !services.length && <div className="p-3 text-xs leading-relaxed" style={{ color: 'var(--text-muted)' }}>Web, API and worker services declared by the agent will appear here. You don't need to start the Workspace to view the catalog.</div>}
+          {!servicesLoading && !catalogError && !services.length && <div className="p-3 text-xs leading-relaxed" style={{ color: 'var(--text-muted)' }}>Web, API and worker services declared by the agent, or listed in the project's .legion/services.json, will appear here. You don't need to start the Workspace to view the catalog.</div>}
           {services.map(service => {
             const isSelected = service.slug === selected?.slug;
             const busy = busySlug === service.slug;
             const openable = service.kind !== 'worker';
             return <div key={service.slug} className="rounded-xl p-2.5 cursor-pointer" onClick={() => selectService(service.slug)} style={{ background: isSelected ? 'var(--accent-dim)' : 'var(--bg-hover)', border: `1px solid ${isSelected ? 'var(--accent)' : 'var(--border)'}` }}>
-              <div className="flex items-start gap-2"><Globe size={13} className="mt-0.5 flex-shrink-0" style={{ color: service.kind === 'worker' ? 'var(--text-muted)' : 'var(--accent-light)' }} /><div className="min-w-0 flex-1"><div className="text-xs font-medium truncate">{service.title}</div><div className="text-[10px] mt-0.5" style={{ color: 'var(--text-muted)' }}>{service.kind === 'api' ? 'API' : service.kind === 'worker' ? 'Worker' : 'Web'} · <span style={{ color: stateColor(service) }}>{stateLabel(service)}</span></div></div></div>
+              <div className="flex items-start gap-2"><Globe size={13} className="mt-0.5 flex-shrink-0" style={{ color: service.kind === 'worker' ? 'var(--text-muted)' : 'var(--accent-light)' }} /><div className="min-w-0 flex-1"><div className="text-xs font-medium truncate">{service.title}</div><div className="text-[10px] mt-0.5" style={{ color: 'var(--text-muted)' }}>{service.kind === 'api' ? 'API' : service.kind === 'worker' ? 'Worker' : 'Web'} · <span style={{ color: stateColor(service) }}>{stateLabel(service)}</span>{fromRepo(service) && <span title="Declared in the project's .legion/services.json"> · from repository</span>}</div></div></div>
               {service.last_error && <div className="mt-1.5 text-[10px] line-clamp-2" style={{ color: '#fca5a5' }}>{service.last_error}</div>}
               <div className="flex gap-1 mt-2" onClick={event => event.stopPropagation()}>
                 {service.runtime_state === 'ready' && openable ? <button onClick={() => obtainTicket(service, service.slug === selected?.slug ? path : service.default_path)} className="text-[10px] px-2 py-1 rounded-md" style={{ color: '#6ee7b7', background: 'rgba(52,211,153,.12)' }}>Open</button> : <button onClick={() => startAndOpen(service)} disabled={busy || service.runtime_state === 'starting'} className="text-[10px] px-2 py-1 rounded-md flex items-center gap-1" style={{ color: '#6ee7b7', background: 'rgba(52,211,153,.12)', opacity: busy || service.runtime_state === 'starting' ? .6 : 1 }}>{busy ? <Loader2 size={10} style={{ animation: 'spin 1s linear infinite' }} /> : <Play size={10} />}{openable ? 'Start and open' : 'Start'}</button>}

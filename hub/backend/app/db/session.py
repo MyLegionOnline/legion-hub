@@ -1005,6 +1005,27 @@ END $$""",
     )""",
     "CREATE INDEX IF NOT EXISTS ix_promotion_room_created ON promotion(room_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS ix_promotion_room_open ON promotion(room_id) WHERE state = 'waiting_review'",
+    # internal design notes Stage 2.
+    """CREATE TABLE IF NOT EXISTS remote_divergence (
+        id UUID PRIMARY KEY,
+        room_id UUID NOT NULL REFERENCES room(id) ON DELETE CASCADE,
+        branch VARCHAR NOT NULL,
+        remote_ref VARCHAR NOT NULL,
+        local_sha VARCHAR NOT NULL,
+        remote_sha VARCHAR NOT NULL,
+        conflict_files JSON NOT NULL DEFAULT '[]',
+        state VARCHAR NOT NULL DEFAULT 'detected',
+        analysis JSON,
+        decision VARCHAR,
+        rework_task_id UUID REFERENCES task(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        resolved_at TIMESTAMPTZ,
+        CONSTRAINT ck_remote_divergence_state
+            CHECK (state IN ('detected', 'reviewing', 'reviewed', 'resolved', 'stale'))
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_remote_divergence_room_id ON remote_divergence(room_id)",
+    """CREATE UNIQUE INDEX IF NOT EXISTS uq_remote_divergence_open_room_branch
+        ON remote_divergence(room_id, branch) WHERE state <> 'resolved'""",
     # ── internal design notes Stage 6: working branch pushed to remote for CI ──
     # Set when the gate opens under ``ci_provider == "github_actions"`` and the
     # ``dev`` branch was pushed so an external CI can run on it. Additive.

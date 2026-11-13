@@ -797,6 +797,16 @@ async def merge_task_branch(room_id: "UUID | str", task, db) -> dict[str, Any]:
             f"Conflict while merging branch {branch} into {target} — resolve manually"
         )
 
+    if result.get("ok"):
+        from app.core.remote_divergence import close_merged_pull_rework
+
+        # Record the merge on the task for every caller (the ChatMaster
+        # approval path never set it, so its tasks could not be reverted).
+        if result.get("sha"):
+            task.merge_commit = result["sha"]
+
+        await close_merged_pull_rework(room_id, task, target, result.get("sha"), db)
+
     return {**result, "branch": branch, "target": target}
 
 

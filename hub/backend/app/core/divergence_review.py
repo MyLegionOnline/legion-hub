@@ -25,7 +25,7 @@ import json
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -260,40 +260,47 @@ def _fmt_commits(commits: list[dict], limit: int = 20) -> str:
     return "\n".join(rows)
 
 
-def _build_digest(task: Task, report: dict) -> str:
+def build_review_digest(
+    report: dict, *, branch_label: str, base_label: str, context: list[str],
+) -> str:
     mb = report.get("merge_base") or {}
     bh = report.get("base_head") or {}
     nh = report.get("branch_head") or {}
-    lines: list[str] = [f"Task: {task.title}"]
-    if (task.description or "").strip():
-        lines.append(f"Brief: {_clip(task.description, 2000)}")
-    lines += [
-        f"Task branch: {report.get('branch')}",
-        f"Base: {report.get('base')}",
+    lines = [
+        *context,
+        f"{branch_label}: {report.get('branch')}",
+        f"{base_label}: {report.get('base')}",
         "",
-        f"Fork point (merge-base): {mb.get('sha', '')[:8]}  {mb.get('timestamp', '')}  {mb.get('subject', '')}",
-        f"Base HEAD:   {bh.get('sha', '')[:8]}  {bh.get('timestamp', '')}  {bh.get('subject', '')}",
-        f"Branch HEAD: {nh.get('sha', '')[:8]}  {nh.get('timestamp', '')}  {nh.get('subject', '')}",
-        f"The branch is ahead of the base by {report.get('ahead', 0)} commit(s), behind by {report.get('behind', 0)}.",
+        f"Fork point (merge-base): {mb['sha'][:8]}  {mb.get('timestamp', '')}  {mb.get('subject', '')}"
+        if mb.get("sha") else "Fork point: no common ancestor recorded.",
+        f"{base_label} HEAD: {(bh.get('sha') or '')[:8]}  {bh.get('timestamp', '')}  {bh.get('subject', '')}",
+        f"{branch_label} HEAD: {(nh.get('sha') or '')[:8]}  {nh.get('timestamp', '')}  {nh.get('subject', '')}",
+        f"{branch_label} is ahead of {base_label} by {report.get('ahead', 0)} commit(s), behind by {report.get('behind', 0)}.",
         "",
-        "Commits ONLY in the task branch (after the fork):",
+        f"Commits only in {branch_label}:",
         _fmt_commits(report.get("branch_commits") or []),
         "",
-        "Commits that arrived in the BASE after the fork:",
+        f"Commits only in {base_label}:",
         _fmt_commits(report.get("base_commits") or []),
         "",
-        f"Files changed by the branch: {', '.join(report.get('branch_files') or []) or '(none)'}",
-        f"Files changed by the base:   {', '.join(report.get('base_files') or []) or '(none)'}",
+        f"Files changed by {branch_label}: {', '.join(report.get('branch_files') or []) or '(none)'}",
+        f"Files changed by {base_label}: {', '.join(report.get('base_files') or []) or '(none)'}",
         f"Overlapping files:           {', '.join(report.get('overlap_files') or []) or '(none)'}",
         f"Real merge conflict: {'yes' if report.get('conflict') else 'no (overlap without a textual conflict)'}",
         f"Conflicting files: {', '.join(report.get('conflict_files') or []) or '(none)'}",
     ]
+    if report.get("merge_messages"):
+        lines.append(f"Merge messages: {report['merge_messages']}")
+    for side, label in (("base", base_label), ("branch", branch_label)):
+        flagged = report.get(f"{side}_flagged_files") or []
+        if flagged:
+            lines.append(f"Binary or potentially generated files on {label}: {', '.join(flagged)}")
     for d in report.get("conflict_details") or []:
         lines += [
             "",
-            f"── {d.get('path')} — BASE edit (since the fork):",
+            f"── {d.get('path')} — {base_label} edit:",
             (d.get("base_diff") or "(none)").strip()[:6000],
-            f"── {d.get('path')} — BRANCH edit (since the fork):",
+            f"── {d.get('path')} — {branch_label} edit:",
             (d.get("branch_diff") or "(none)").strip()[:6000],
         ]
     return "\n".join(lines)
@@ -330,27 +337,50 @@ async def build_divergence_context(room_id: "UUID | str", task: Task, db: AsyncS
     report = await wsd.git_divergence_workspace(str(room_id), branch, base)
     if not report.get("ok"):
         raise DivergenceReviewError(report.get("error") or "divergence report failed")
-    return {"branch": branch, "base": base, "report": report, "digest": _build_digest(task, report)}
+    context = [f"Task: {task.title}"]
+    if (task.description or "").strip():
+        context.append(f"Brief: {_clip(task.description, 2000)}")
+    digest = build_review_digest(report, branch_label="task branch", base_label="base", context=context)
+    return {"branch": branch, "base": base, "report": report, "digest": digest}
 
 
 # ── Deterministic fallback (no LLM) ─────────────────────────────────────────
 
-def _fallback_analysis(report: dict) -> dict:
+def fallback_report_facts(report: dict, *, branch_label: str, base_label: str) -> dict:
     overlap = report.get("overlap_files") or report.get("conflict_files") or []
     return {
-        "summary": (
-            f"The task branch and {report.get('base')} edit the same files "
-            f"({', '.join(overlap) or 'see below'}) and do not merge automatically."
-        ),
-        "branch_side": f"{len(report.get('branch_commits') or [])} commit(s) in the branch after the fork.",
-        "base_side": f"{len(report.get('base_commits') or [])} commit(s) arrived in the base after the fork.",
+        "branch_side": f"{report.get('ahead', len(report.get('branch_commits') or []))} commit(s) only in {branch_label}.",
+        "base_side": f"{report.get('behind', len(report.get('base_commits') or []))} commit(s) only in {base_label}.",
         "conflict_explanation": (
             report.get("merge_messages")
             or f"Overlapping files: {', '.join(overlap) or 'none'}."
         ),
         "timing": (
             f"Fork: {(report.get('merge_base') or {}).get('timestamp', '?')}. "
-            f"Base HEAD: {(report.get('base_head') or {}).get('timestamp', '?')}."
+            f"{base_label} HEAD: {(report.get('base_head') or {}).get('timestamp', '?')}."
+        ),
+        "_fallback": True,
+    }
+
+
+def degraded_report_facts(reason: str, *, branch_side: str = "Details unavailable.") -> dict:
+    return {
+        "branch_side": branch_side,
+        "base_side": "Details unavailable.",
+        "conflict_explanation": reason,
+        "timing": "",
+        "_fallback": True,
+        "_degraded": True,
+    }
+
+
+def _fallback_analysis(report: dict) -> dict:
+    overlap = report.get("overlap_files") or report.get("conflict_files") or []
+    return {
+        **fallback_report_facts(report, branch_label="the task branch", base_label="the base"),
+        "summary": (
+            f"The task branch and {report.get('base')} edit the same files "
+            f"({', '.join(overlap) or 'see below'}) and do not merge automatically."
         ),
         "recommendation": "rework",
         "recommendation_reason": (
@@ -370,7 +400,6 @@ def _fallback_analysis(report: dict) -> dict:
             f"You must rebase onto {report.get('base')} before working. "
             f"Do not roll back the base's changes in files: {', '.join(overlap) or '(overlap)'}."
         ),
-        "_fallback": True,
     }
 
 
@@ -378,37 +407,81 @@ async def _analyse(room, task: Task, ctx: dict, db: AsyncSession) -> dict:
     # No divergence left to reason about — a rework already folded the work in.
     if (ctx.get("report") or {}).get("redundant"):
         return _redundant_analysis(ctx.get("base"), ctx.get("branch"))
+    return await analyse_with_chatmaster(
+        room, db, digest=ctx["digest"], prompt=_SYSTEM_PROMPT, schema=_ANALYSIS_SCHEMA,
+        default_decision="rework", fallback=lambda: _fallback_analysis(ctx["report"]),
+    )
+
+
+_PLACEHOLDER_TEXTS = {"n/a", "na", "none", "null", "tbd", "todo", "string", "text", "placeholder"}
+_MIN_FREE_TEXT_LENGTH = 8
+
+
+def _is_placeholder(text: str) -> bool:
+    """A filler value such as ``...`` or ``TBD`` instead of an actual explanation."""
+    stripped = text.strip()
+    if not any(ch.isalnum() for ch in stripped):
+        return True
+    return stripped.lower().strip(".… ") in _PLACEHOLDER_TEXTS
+
+
+def _invalid_required_fields(data: Any, schema: dict) -> list[str]:
+    """Required fields that are missing, empty, placeholders or too short to explain anything."""
+    if not isinstance(data, dict):
+        return ["<not an object>"]
+    invalid = []
+    for key in schema["required"]:
+        value = data.get(key)
+        if not isinstance(value, str) or _is_placeholder(value):
+            invalid.append(key)
+        elif "enum" not in schema["properties"].get(key, {}) and len(value.strip()) < _MIN_FREE_TEXT_LENGTH:
+            invalid.append(key)
+    return invalid
+
+
+async def analyse_with_chatmaster(
+    room, db: AsyncSession, *, digest: str, prompt: str, schema: dict,
+    default_decision: str, fallback: Callable[[], dict], validate_required: bool = False,
+) -> dict:
     try:
-        agent, config, secret_value = await _resolve_cm_llm(room, db)
+        _, config, secret_value = await _resolve_cm_llm(room, db)
     except DivergenceReviewError as exc:
         logger.info("divergence_review: no LLM (%s) — deterministic analysis", exc)
-        return _fallback_analysis(ctx["report"])
+        return fallback()
 
     from app.core.chat_master import get_llm_json_completion
 
     messages = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
-        {"role": "user", "content": ctx["digest"]},
+        {"role": "system", "content": prompt},
+        {"role": "user", "content": digest},
     ]
     try:
         await release_db(db, reason="divergence_review/analyse")
         result = await get_llm_json_completion(
-            config, messages, _ANALYSIS_SCHEMA, secret_value=secret_value
+            config, messages, schema, secret_value=secret_value
         )
         data = json.loads(result.text)
-        if data.get("recommendation") not in DECISIONS:
-            data["recommendation"] = "rework"
+        if validate_required:
+            invalid = _invalid_required_fields(data, schema)
+            if invalid:
+                logger.warning(
+                    "divergence_review: rejected the LLM analysis, placeholder or missing fields: %s",
+                    ", ".join(invalid),
+                )
+                return fallback()
+        if data.get("recommendation") not in schema["properties"]["recommendation"]["enum"]:
+            data["recommendation"] = default_decision
         return data
     except Exception as exc:  # noqa: BLE001
         logger.warning("divergence_review: LLM analysis failed: %s", exc)
-        return _fallback_analysis(ctx["report"])
+        return fallback()
     finally:
         secret_value = None
 
 
 # ── Public: run the review ─────────────────────────────────────────────────
 
-def _report_summary(report: dict) -> dict:
+def review_report_summary(report: dict) -> dict:
     """The slice of the raw report the card needs (kept small for the event row)."""
     return {
         "branch": report.get("branch"),
@@ -431,15 +504,14 @@ def _degraded_analysis(reason: str, branch: str | None, base: str | None) -> dic
     """Analysis card shown when the git report or the LLM turn could not run —
     the user still gets the explanation and the three actions."""
     return {
+        **degraded_report_facts(
+            reason, branch_side="Details unavailable — open the Workspace → Diff tab for the task branch.",
+        ),
         "summary": (
             "Could not assemble a detailed divergence analysis "
             f"({reason}). Branch {branch or '?'} still diverges from {base or 'the base'}: "
             "a plain merge will not go through. Choose an action below."
         ),
-        "branch_side": "Details unavailable — open the Workspace → Diff tab for the task branch.",
-        "base_side": "Details unavailable.",
-        "conflict_explanation": reason,
-        "timing": "",
         "recommendation": "rework",
         "recommendation_reason": "Without a detailed analysis it is safer to hand the rework to a separate task.",
         "take_branch_consequence": "The base's changes in overlapping files will be replaced by the branch version — check the Diff before choosing.",
@@ -449,8 +521,6 @@ def _degraded_analysis(reason: str, branch: str | None, base: str | None) -> dic
             f"Carry the edits of branch {branch} over to the current {base or 'dev'}, "
             "without rolling back the base's changes. You must rebase before working."
         ),
-        "_fallback": True,
-        "_degraded": True,
     }
 
 
@@ -482,7 +552,7 @@ async def run_divergence_review(room_id: "UUID | str", task_id: "UUID | str", db
         ctx = await build_divergence_context(rid, task, db)
         return (
             await _analyse(room, task, ctx, db),
-            _report_summary(ctx["report"]),
+            review_report_summary(ctx["report"]),
             ctx["branch"], ctx["base"],
         )
 
@@ -621,6 +691,9 @@ async def resolve_divergence(
             metadata={"task_id": str(task.id), "branch": branch, "target": base,
                       "merge_commit": task.merge_commit, "via": "divergence_take_branch"},
         )
+        from app.core.remote_divergence import close_merged_pull_rework
+
+        await close_merged_pull_rework(rid, task, base, task.merge_commit, db)
         await _maybe_complete_goal(rid, task, db)
         await db.commit()
         return {"ok": True, "decision": decision, "detail": "merged", "merge_commit": task.merge_commit}

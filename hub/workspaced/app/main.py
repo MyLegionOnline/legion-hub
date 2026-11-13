@@ -73,6 +73,10 @@ from app.schemas import (
     GitPushRequest,
     GitPushTagRequest,
     GitReleaseTagRequest,
+    GitPullReworkRequest,
+    GitPullReworkResponse,
+    GitResetBranchRequest,
+    GitResetBranchResponse,
     GitRevertCommitRequest,
     GitRevertRequest,
     ImportRequest,
@@ -532,7 +536,8 @@ async def workspace_write_file(room_id: str, path: str, req: FileWriteRequest):
     try:
         path = normalize_workspace_path(path)
         result = await asyncio.to_thread(
-            _write_file, room_id, path, req.content, commit_message=req.commit_message
+            _write_file, room_id, path, req.content, commit_message=req.commit_message,
+            commit_only_path=req.commit_only_path,
         )
         return FileWriteResponse(**result)
     except ValueError as e:
@@ -980,6 +985,7 @@ async def git_merge_branch_workspace(room_id: str, req: GitMergeRequest):
         target=req.target or "main",
         theirs=req.theirs,
         message=req.message,
+        **req.model_dump(include={"strategy", "expected_tips"}, exclude_unset=True),
     )
     branch = git_current_branch(room_id)
     return GitOpResponse(**result, branch=branch)
@@ -1059,6 +1065,21 @@ async def git_fetch_workspace(room_id: str, req: GitFetchRequest):
 
 
 @app.post(
+    "/workspaces/{room_id}/git/fetch-review",
+    response_model=GitOpResponse,
+    dependencies=[Depends(verify_token)],
+)
+async def git_fetch_review_workspace(room_id: str, req: GitFetchRequest):
+    """Refresh the review's remote ref and read both tips without a checkout."""
+    from app.git_ops import git_fetch
+
+    return GitOpResponse(**git_fetch(
+        room_id, req.remote_url, branch=req.branch, token=req.token,
+        target_branch=req.target_branch, fetch_only=True,
+    ))
+
+
+@app.post(
     "/workspaces/{room_id}/git/apply-patch",
     response_model=GitOpResponse,
     dependencies=[Depends(verify_token)],
@@ -1129,6 +1150,30 @@ async def git_discard_branch_workspace(room_id: str, req: GitDiscardBranchReques
     ``dev`` and the currently checked-out branch."""
     from app.git_ops import git_discard_branch
     return GitDiscardBranchResponse(**git_discard_branch(room_id, req.branch))
+
+
+@app.post(
+    "/workspaces/{room_id}/git/prepare-pull-rework",
+    response_model=GitPullReworkResponse,
+    dependencies=[Depends(verify_token)],
+)
+async def git_prepare_pull_rework_workspace(room_id: str, req: GitPullReworkRequest):
+    from app.git_ops import git_prepare_pull_rework
+
+    return GitPullReworkResponse(**git_prepare_pull_rework(room_id, **req.model_dump()))
+
+
+@app.post(
+    "/workspaces/{room_id}/git/reset-branch",
+    response_model=GitResetBranchResponse,
+    dependencies=[Depends(verify_token)],
+)
+async def git_reset_branch_workspace(room_id: str, req: GitResetBranchRequest):
+    from app.git_ops import git_reset_branch_to
+
+    return GitResetBranchResponse(**git_reset_branch_to(
+        room_id, req.branch, req.ref, expected_tips=req.expected_tips,
+    ))
 
 
 @app.get(

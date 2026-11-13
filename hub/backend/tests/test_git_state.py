@@ -370,30 +370,14 @@ async def test_open_promotion_in_gates_and_dev():
     db = AsyncMock()
     db.get = AsyncMock(return_value=room)
 
-    def execute_fn(stmt):
-        pass
-
-    # Need to handle first() vs all() differently for open_promo vs others
-    call_idx = [0]
-    returns = [
+    db.execute = _db_returning(
         [],     # tasks
         [],     # goals
         [],     # live_sessions
         promo,  # open_promo (first())
         [],     # goal_reviews
-    ]
-    async def execute(_stmt):
-        idx = call_idx[0]
-        call_idx[0] += 1
-        val = returns[idx]
-        scalars_mock = MagicMock()
-        scalars_mock.all.return_value = [val] if val and not isinstance(val, list) else (val or [])
-        scalars_mock.first.return_value = val if not isinstance(val, list) else (val[0] if val else None)
-        mock = MagicMock()
-        mock.scalars.return_value = scalars_mock
-        return mock
-
-    db.execute = execute
+        [],     # remote divergences
+    )
 
     wsd_branches = [
         {"name": "main", "base": None,  "ahead": None, "behind": None, "merged": None},

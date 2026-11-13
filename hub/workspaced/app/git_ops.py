@@ -12,11 +12,14 @@ import logging
 import os
 import shutil
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from tempfile import TemporaryDirectory
+from typing import Literal, Optional
 
 from app.config import LEGION_GIT_EMAIL, LEGION_GIT_NAME, WORKSPACE_DATA_DIR
 from app.file_ops import chown_workspace_tree, ensure_userfiles_dir
+from app.git_exec import auth_env, git_exec, hand_to_git_user, read_repo_file, write_repo_file
 from app.git_lock import GitWorkspaceBusyError, room_git_lock
 from app.path_contract import USERFILES_DIR, normalize_workspace_path
 
@@ -62,6 +65,7 @@ def _serialized(*, busy_dict: bool):
 #   agent / auto commit lands here (or on a task branch that merges here).
 RELEASE_BRANCH = "main"
 INTEGRATION_BRANCH = "dev"
+_REMOTE_REF_PREFIX = "refs/legion/remote/"
 
 
 class MainBranchProtectedError(RuntimeError):
@@ -80,13 +84,13 @@ _BASE_FLAGS = [
     "-c", "core.autocrlf=false",
 ]
 
+# Overlay on ``git_exec``'s minimal environment (never ``os.environ``: git and
+# anything it might start must not see workspaced's own secrets).
 _GIT_ENV = {
-    **os.environ,
     "GIT_AUTHOR_NAME": LEGION_GIT_NAME,
     "GIT_AUTHOR_EMAIL": LEGION_GIT_EMAIL,
     "GIT_COMMITTER_NAME": LEGION_GIT_NAME,
     "GIT_COMMITTER_EMAIL": LEGION_GIT_EMAIL,
-    "GIT_TERMINAL_PROMPT": "0",  # never prompt for credentials
     # workspaced is the one party allowed to move ``main`` and tags; the
     # room's guard hooks (app/release_guard.py) let this git through.
     "LEGION_GIT_TRUSTED": "1",
@@ -195,7 +199,8 @@ def _write_local_excludes(root: Path, extra: str = "") -> bool:
     try:
         if not exclude.parent.is_dir():
             return False
-        existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        # The agent owns .git: never read or write through a link it planted.
+        existing = read_repo_file(root, ".git", "info", "exclude") or ""
         lines = existing.splitlines()
         # The private-files rule is a policy invariant: repair duplicate
         # copies left by interrupted/older backfills while preserving every
@@ -222,18 +227,18 @@ def _write_local_excludes(root: Path, extra: str = "") -> bool:
             return False
         if missing:
             deduped_lines.extend(missing)
-        exclude.write_text("\n".join(deduped_lines) + "\n", encoding="utf-8")
+        write_repo_file(root, (".git", "info", "exclude"), "\n".join(deduped_lines) + "\n")
         return True
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return False
 
 
 def _userfiles_excluded(root: Path) -> bool:
     """Whether ``.git/info/exclude`` currently carries the private-files rule."""
-    exclude = root / ".git" / "info" / "exclude"
     try:
-        return f"{USERFILES_DIR}/" in exclude.read_text(encoding="utf-8").splitlines()
-    except OSError:
+        text = read_repo_file(root, ".git", "info", "exclude") or ""
+        return f"{USERFILES_DIR}/" in text.splitlines()
+    except (OSError, UnicodeDecodeError):
         return False
 
 
@@ -324,9 +329,9 @@ def backfill_local_excludes(room_id: str) -> dict:
 
 def _room_author(cwd: Path) -> Optional[tuple[str, str]]:
     """The (name, email) ``git_set_author`` stored for this repo, if any."""
-    r = subprocess.run(
-        ["git"] + _BASE_FLAGS + ["config", "--get-regexp", r"^legion\.author"],
-        cwd=str(cwd), capture_output=True, text=True, env=_GIT_ENV,
+    r = git_exec(
+        ["config", "--get-regexp", r"^legion\.author"],
+        cwd, env=_GIT_ENV, flags=_BASE_FLAGS,
     )
     found: dict[str, str] = {}
     for line in r.stdout.splitlines():
@@ -354,7 +359,9 @@ def _authored_args(args: list[str], cwd: Path) -> tuple[list[str], dict[str, str
         return args, _GIT_ENV
     env = {**_GIT_ENV, "GIT_AUTHOR_NAME": author[0], "GIT_AUTHOR_EMAIL": author[1]}
     if args[0] == "commit":
-        args = args + ["--trailer", _COAUTHOR_TRAILER]
+        # Options go before a ``--`` pathspec separator, or git reads them as paths.
+        cut = args.index("--") if "--" in args else len(args)
+        args = args[:cut] + ["--trailer", _COAUTHOR_TRAILER] + args[cut:]
     elif args[0] == "merge" and "-m" in args:
         i = args.index("-m") + 1
         if i < len(args):
@@ -363,17 +370,23 @@ def _authored_args(args: list[str], cwd: Path) -> tuple[list[str], dict[str, str
     return args, env
 
 
-def _run(args: list[str], cwd: Path, input: Optional[str] = None) -> subprocess.CompletedProcess:
+def _run(
+    args: list[str],
+    cwd: Path,
+    input: Optional[str] = None,
+    *,
+    auth: Optional[tuple[str, Optional[str]]] = None,
+    timeout: Optional[float] = None,
+) -> subprocess.CompletedProcess:
+    """Run git through ``git_exec`` (hardened flags, config check, timeout).
+
+    ``auth=(remote_url, token)`` sends the token as an auth header for that
+    URL's origin — the URL itself stays token-free.
+    """
     args, env = _authored_args(args, cwd)
-    cmd = ["git"] + _BASE_FLAGS + args
-    return subprocess.run(
-        cmd,
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        env=env,
-        input=input,
-    )
+    if auth is not None:
+        env = {**env, **auth_env(*auth)}
+    return git_exec(args, cwd, input=input, env=env, timeout=timeout, flags=_BASE_FLAGS)
 
 
 # ---------------------------------------------------------------------------
@@ -530,16 +543,16 @@ def ensure_shared_gitignore(
             if _run(["checkout", started_on], cwd=root).returncode == 0:
                 chown_workspace_tree(room_id)
 
-    gitignore = root / ".gitignore"
     try:
-        existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
-    except OSError:
+        # Not through a link the agent planted (app/git_exec.py).
+        existing = read_repo_file(root, ".gitignore") or ""
+    except (OSError, UnicodeDecodeError):
         existing = ""
     body = existing if existing.strip() else _PROJECT_GITIGNORE_DEFAULT
     if not body.endswith("\n"):
         body += "\n"
     try:
-        gitignore.write_text(body, encoding="utf-8")
+        write_repo_file(root, (".gitignore",), body)
     except OSError as exc:
         result["stderr"] = str(exc)
         _restore_head()
@@ -577,8 +590,13 @@ def git_commit(
     room_id: str,
     message: str,
     allow_main_commit: bool = False,
+    only_path: Optional[str] = None,
 ) -> Optional[str]:
     """Stage everything and commit. Returns new HEAD sha, or None if nothing changed.
+
+    ``only_path`` commits just that one workspace-relative file and leaves every
+    other pending change (an agent's half-done edit) staged or not exactly as it
+    was — for Legion's own bookkeeping files such as ``.legion/services.json``.
 
     Raises ``MainBranchProtectedError`` when HEAD is on ``main`` and the
     caller did not pass ``allow_main_commit=True`` — agent and auto commits
@@ -595,9 +613,13 @@ def git_commit(
             "a task branch or `dev` (internal design notes §0.1)"
         )
 
-    _stage_all(root)
-
-    r = _run(["commit", "-m", message], cwd=root)
+    if only_path:
+        rel = normalize_workspace_path(only_path)
+        _run(["add", "-A", "--", rel], cwd=root)
+        r = _run(["commit", "-m", message, "--", rel], cwd=root)
+    else:
+        _stage_all(root)
+        r = _run(["commit", "-m", message], cwd=root)
     if r.returncode != 0:
         output = r.stdout + r.stderr
         if "nothing to commit" in output:
@@ -787,6 +809,11 @@ def git_revert(room_id: str, ref: str, path: Optional[str] = None) -> bool:
 # Branches
 # ---------------------------------------------------------------------------
 
+def _head_sha(root: Path) -> Optional[str]:
+    r = _run(["rev-parse", "HEAD"], cwd=root)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
 def git_current_branch(room_id: str) -> Optional[str]:
     root = _workspace_root(room_id)
     if not (root / ".git").is_dir():
@@ -880,20 +907,38 @@ def git_merge_branch(
     target: str = RELEASE_BRANCH,
     theirs: bool = True,
     message: Optional[str] = None,
+    *,
+    strategy: Literal["ours", "theirs", "legacy"] | None = "legacy",
+    expected_tips: tuple[str, str] | None = None,
 ) -> dict:
-    """Merge ``branch_name`` into ``target`` (no-ff). Returns {ok, conflict, stdout, stderr}.
+    """Merge a source ref into ``target`` with ``--no-ff``.
 
-    internal design notes Stage 1: a task branch merges into its base — ``dev``
-    or a goal branch — not always ``main``. ``theirs=True`` keeps the historic
-    "last writer wins" behaviour for task → dev / task → goal merges; the
-    ``dev → main`` and ``goal → dev`` gates pass ``theirs=False`` for a clean
-    merge that escalates real conflicts to a human (§2.4).
-
-    The working tree is left checked out on ``target``.
+    With no explicit strategy, legacy task merges prefer the incoming side
+    and gates passing ``theirs=False`` leave conflicts unresolved. Explicit
+    ``None`` also leaves conflicts unresolved.
     """
     root = _workspace_root(room_id)
     if not (root / ".git").is_dir():
         return {"ok": False, "conflict": False, "stdout": "", "stderr": "no git repo"}
+
+    if strategy == "legacy":
+        strategy = "theirs" if theirs else None
+
+    remote_source = branch_name.startswith(_REMOTE_REF_PREFIX)
+    if expected_tips is not None and not _review_tips_match(root, target, branch_name, expected_tips):
+        return _stale_review()
+    source = expected_tips[1] if expected_tips is not None else branch_name
+    if remote_source and (
+        git_ls_remote_userfiles(root, source)
+        or git_ls_remote_userfiles(root, target)
+        or git_ls_tracked_userfiles_details(room_id)
+    ):
+        return {
+            "ok": False,
+            "conflict": False,
+            "userfiles_policy_conflict": True,
+            "stderr": f"private-files policy conflict: a merge side or the index tracks {USERFILES_DIR}/",
+        }
 
     # A tracked file with uncommitted edits — or per-volume Legion metadata a
     # legacy room still tracks (``.legion/generation.json`` changes on every
@@ -903,6 +948,7 @@ def git_merge_branch(
     # cannot trip on an untracked-vs-tracked collision. The exclude rules are
     # refreshed first so a room older than a rule (``.legion/bg/``) has the
     # just-untracked files ignored — and therefore expendable — on checkout.
+    head_before = _head_sha(root)
     _write_local_excludes(root)
     park_error = _park_worktree_before_switch(root, room_id, git_current_branch(room_id))
     if park_error:
@@ -930,13 +976,15 @@ def git_merge_branch(
         _run(["commit", "-m", "chore: untrack Legion volume metadata"], cwd=root)
     _drop_volatile_worktree_remnants(root)
 
+    if expected_tips is not None and _head_sha(root) != expected_tips[0]:
+        return _stale_review()
     msg = message or f"merge: {branch_name} → {target}"
     args = ["merge", "--no-ff"]
-    if theirs:
-        # Resolve overlapping hunks in favour of the incoming branch (last
-        # approve wins) — acceptable only for increments of one theme.
-        args += ["-X", "theirs"]
-    args += [branch_name, "-m", msg]
+    if remote_source:
+        args.append("--allow-unrelated-histories")
+    if strategy:
+        args += ["-X", strategy]
+    args += ["-m", msg, "--", source]
     r = _run(args, cwd=root)
     conflict = r.returncode != 0 and "CONFLICT" in (r.stdout + r.stderr)
 
@@ -959,6 +1007,7 @@ def git_merge_branch(
         "stdout": r.stdout[:4096],
         "stderr": r.stderr[:4096],
         "sha": sha,
+        "head_changed": sha is not None and sha != head_before,
     }
 
 
@@ -980,8 +1029,7 @@ def git_archive_branch(room_id: str, ref: str) -> Optional[bytes]:
     root = _workspace_root(room_id)
     if not (root / ".git").is_dir():
         return None
-    cmd = ["git"] + _BASE_FLAGS + ["archive", "--format=tar", ref]
-    r = subprocess.run(cmd, cwd=str(root), capture_output=True, env=_GIT_ENV)
+    r = git_exec(["archive", "--format=tar", ref], root, text=False, env=_GIT_ENV, flags=_BASE_FLAGS)
     if r.returncode != 0:
         logger.warning(
             "git_archive_branch failed for room %s ref %s: %s",
@@ -1110,17 +1158,6 @@ def git_revert_commit(
 # Remote: push / fetch
 # ---------------------------------------------------------------------------
 
-def _inject_token(url: str, token: Optional[str]) -> str:
-    """Embed PAT into an HTTPS remote URL."""
-    if not token or not url.startswith("https://"):
-        return url
-    if "github.com" in url:
-        return url.replace("https://", f"https://x-access-token:{token}@", 1)
-    if "gitlab.com" in url:
-        return url.replace("https://", f"https://oauth2:{token}@", 1)
-    return url.replace("https://", f"https://x-access-token:{token}@", 1)
-
-
 @_serialized(busy_dict=True)
 def git_push(
     room_id: str,
@@ -1172,7 +1209,8 @@ def git_push(
             "userfiles_tracked_details": git_ls_tracked_userfiles_details(room_id),
         }
 
-    push_url = _inject_token(remote_url, token)
+    push_url = remote_url
+    auth = (remote_url, token)
     force = mode == "force"
     refspec = f"refs/heads/{branch}:refs/heads/{branch}"
 
@@ -1189,13 +1227,13 @@ def git_push(
         return True
 
     if force:
-        r = _run(["push", push_url, refspec, "--force"], cwd=root)
+        r = _run(["push", push_url, refspec, "--force"], cwd=root, auth=auth)
         if r.returncode != 0 and _looks_like_missing_upstream(r.stderr):
-            r = _run(["push", "-u", push_url, refspec], cwd=root)
+            r = _run(["push", "-u", push_url, refspec], cwd=root, auth=auth)
     else:
-        r = _run(["push", push_url, refspec], cwd=root)
+        r = _run(["push", push_url, refspec], cwd=root, auth=auth)
         if r.returncode != 0 and _looks_like_missing_upstream(r.stderr):
-            r = _run(["push", "-u", push_url, refspec], cwd=root)
+            r = _run(["push", "-u", push_url, refspec], cwd=root, auth=auth)
 
     return {
         "ok": r.returncode == 0,
@@ -1378,7 +1416,15 @@ def _park_worktree_before_switch(root, room_id: str, current: Optional[str]) -> 
     return None
 
 
-def _seed_gitignore_autoresolvable(root: Path) -> bool:
+def _unmerged_paths(root: Path) -> list[str]:
+    # NUL delimiters preserve filenames with whitespace and avoid Git quoting.
+    result = _run(["diff", "--name-only", "--diff-filter=U", "-z"], cwd=root)
+    if result.returncode != 0 or not result.stdout:
+        return []
+    return result.stdout.rstrip("\0").split("\0")
+
+
+def _seed_gitignore_autoresolvable(root: Path, conflict_files: list[str] | None = None) -> bool:
     """True when the *only* unmerged path is ``.gitignore`` and our side of it
     is byte-for-byte a known Legion seed (internal design notes Stage 4).
 
@@ -1390,11 +1436,9 @@ def _seed_gitignore_autoresolvable(root: Path) -> bool:
     agent or a user who edited ``.gitignore`` fails this check and the conflict
     still goes to manual resolution.
     """
-    u = _run(["diff", "--name-only", "--diff-filter=U"], cwd=root)
-    if u.returncode != 0:
-        return False
-    conflicted = [p for p in u.stdout.splitlines() if p.strip()]
-    if conflicted != [".gitignore"]:
+    if conflict_files is None:
+        conflict_files = _unmerged_paths(root)
+    if conflict_files != [".gitignore"]:
         return False
     ours = _run(["show", ":2:.gitignore"], cwd=root)
     if ours.returncode != 0:
@@ -1405,6 +1449,19 @@ def _seed_gitignore_autoresolvable(root: Path) -> bool:
 def _rev(root: Path, ref: str) -> Optional[str]:
     r = _run(["rev-parse", ref], cwd=root)
     return r.stdout.strip() if r.returncode == 0 else None
+
+
+def _commit_sha(root: Path, ref: str) -> str | None:
+    result = _run(["rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"], cwd=root)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _review_tips_match(root: Path, branch: str, ref: str, expected: tuple[str, str]) -> bool:
+    return (_commit_sha(root, f"refs/heads/{branch}"), _commit_sha(root, ref)) == expected
+
+
+def _stale_review() -> dict:
+    return {"ok": False, "stale": True, "stderr": "A branch tip changed. Review the conflict again."}
 
 
 def _rev_count(root: Path, ref: str) -> Optional[int]:
@@ -1485,11 +1542,12 @@ def git_adopt_remote(
     if not (root / ".git").is_dir():
         git_init(room_id)
 
-    fetch_url = _inject_token(remote_url, token)
+    fetch_url = remote_url
+    auth = (remote_url, token)
     # Plain ``git fetch <url> <branch>`` — no ``:FETCH_HEAD`` dst refspec, which
     # would create ``refs/heads/FETCH_HEAD`` and make every later
     # ``FETCH_HEAD`` an ambiguous ref for ``branch -f`` / ``checkout -B``.
-    r_fetch = _run(["fetch", fetch_url, branch], cwd=root)
+    r_fetch = _run(["fetch", fetch_url, branch], cwd=root, auth=auth)
     if r_fetch.returncode != 0:
         return {
             "ok": False, "adopted": False, "diverged": False,
@@ -1601,6 +1659,8 @@ def git_fetch(
     branch: str = "main",
     token: Optional[str] = None,
     target_branch: Optional[str] = None,
+    *,
+    fetch_only: bool = False,
 ) -> dict:
     """Fetch from remote and merge into ``target_branch`` (default: current HEAD).
 
@@ -1620,8 +1680,10 @@ def git_fetch(
     as ``conflict=True``; on that path the merge is rolled back so the
     workspace stays in a clean, usable state.
 
-    Returns ``{ok, conflict, stdout, stderr, branch, gitignore_autoresolved}``
-    where ``branch`` is the branch the remote was actually merged into and
+    The fetched tip is saved under ``refs/legion/remote/<branch>``. The result
+    includes its ref and SHA, the local target tip, and any unresolved paths.
+    In fetch-only mode no checkout, parking or merge is performed.
+    ``branch`` in the result is the local branch the remote was merged into.
     ``gitignore_autoresolved`` (internal design notes Stage 4) is True when an
     ``add/add`` conflict on an untouched seed ``.gitignore`` was resolved in
     favour of the remote's file instead of being surfaced as a conflict.
@@ -1630,19 +1692,25 @@ def git_fetch(
     if not (root / ".git").is_dir():
         return {"ok": False, "conflict": False, "stdout": "", "stderr": "no git repo in workspace"}
 
-    fetch_url = _inject_token(remote_url, token)
+    fetch_url = remote_url
+    auth = (remote_url, token)
 
     # Clear any stray refs/heads/FETCH_HEAD left by an earlier bad refspec so it
     # does not shadow the pseudo-ref below (or linger in the branch tree).
-    _prune_pseudo_ref_branches(root)
+    if not fetch_only:
+        _prune_pseudo_ref_branches(root)
+    elif _run(["check-ref-format", f"refs/heads/{branch}"], cwd=root).returncode != 0:
+        return {"ok": False, "stderr": "Invalid remote branch"}
 
     # Fetch first: a bad URL or token fails here without having touched the
     # working tree or moved HEAD. Plain ``git fetch <url> <branch>`` populates
-    # the ``.git/FETCH_HEAD`` pseudo-ref that the merges below read — a
-    # ``:FETCH_HEAD`` dst refspec would instead create a real
-    # ``refs/heads/FETCH_HEAD`` branch (see ``git_adopt_remote``).
-    r_fetch = _run(["fetch", fetch_url, branch], cwd=root)
+    # the ``.git/FETCH_HEAD`` pseudo-ref. A ``:FETCH_HEAD`` destination would
+    # create a real ``refs/heads/FETCH_HEAD`` branch (see ``git_adopt_remote``).
+    source = f"refs/heads/{branch}" if fetch_only else branch
+    r_fetch = _run(["fetch", "--", fetch_url, source], cwd=root, auth=auth)
     if r_fetch.returncode != 0:
+        if fetch_only:
+            return {"ok": False, "stderr": "Could not fetch the remote branch. Check the remote and its credentials."}
         return {
             "ok": False,
             "conflict": False,
@@ -1653,14 +1721,24 @@ def git_fetch(
     out = r_fetch.stdout
     err = r_fetch.stderr
 
-    remote_userfiles = git_ls_remote_userfiles(root, "FETCH_HEAD")
+    remote_ref = f"{_REMOTE_REF_PREFIX}{branch}"
+    remote_sha = _commit_sha(root, "FETCH_HEAD")
+    if remote_sha is None:
+        return {"ok": False, "conflict": False, "stdout": out[:4096], "stderr": "FETCH_HEAD is not a commit"}
+    saved = _run(["update-ref", remote_ref, remote_sha], cwd=root)
+    if saved.returncode != 0:
+        return {"ok": False, "conflict": False, "stdout": out[:4096], "stderr": saved.stderr[:4096]}
+    remote = {"remote_ref": remote_ref, "remote_sha": remote_sha}
+
+    remote_userfiles = git_ls_remote_userfiles(root, remote_sha)
     local_userfiles = git_ls_tracked_userfiles_details(room_id)
     if remote_userfiles or local_userfiles:
         # Stop before parking, checkout, or merge. Besides preserving HEAD,
         # this keeps a remote .userfiles tree from replacing room-local files.
-        ensure_userfiles_dir(room_id, root=root)
-        _write_local_excludes(root)
-        chown_workspace_tree(room_id)
+        if not fetch_only:
+            ensure_userfiles_dir(room_id, root=root)
+            _write_local_excludes(root)
+            chown_workspace_tree(room_id)
         entries = remote_userfiles or local_userfiles
         return {
             "ok": False,
@@ -1668,6 +1746,7 @@ def git_fetch(
             "userfiles_policy_conflict": True,
             "userfiles_tracked": [entry["path"] for entry in entries],
             "userfiles_tracked_details": entries,
+            **remote,
             "stdout": out[:4096],
             "stderr": (
                 "private-files policy conflict: the fetched repository tracks "
@@ -1676,12 +1755,22 @@ def git_fetch(
             ),
         }
 
+    if fetch_only:
+        target = target_branch or git_current_branch(room_id)
+        local_sha = _commit_sha(root, f"refs/heads/{target}") if target else None
+        if local_sha is None:
+            return {**_stale_review(), **remote}
+        return {"ok": True, "branch": target, "local_sha": local_sha, **remote}
+
+    # Whether the checked-out tree moved is what tells the caller that
+    # running workspace services now serve stale code and need a restart.
+    head_before = _head_sha(root)
     current = git_current_branch(room_id)
     target = target_branch or current
 
     park_error = _park_worktree_before_switch(root, room_id, current)
     if park_error:
-        return {"ok": False, "conflict": False, "stdout": out[:4096], "stderr": park_error}
+        return {"ok": False, "conflict": False, "stdout": out[:4096], "stderr": park_error, **remote}
     current = git_current_branch(room_id)  # parking may have moved off `main`
     _drop_volatile_worktree_remnants(root)  # legacy `target` may still track them
 
@@ -1702,34 +1791,37 @@ def git_fetch(
                 "stdout": (out + co.stdout)[:4096],
                 "stderr": (err + co.stderr)[:4096],
                 "branch": current,
+                **remote,
             }
         chown_workspace_tree(room_id)
     else:
         target = current
 
+    def success(*, gitignore_autoresolved: bool = False) -> dict:
+        ensure_userfiles_dir(room_id, root=root)
+        _write_local_excludes(root)
+        chown_workspace_tree(room_id)
+        tip = _head_sha(root)
+        return {
+            "ok": True, "conflict": False, "stdout": out[:4096], "stderr": err[:4096],
+            "branch": target, **remote, "local_sha": tip, "head_changed": tip != head_before,
+            "gitignore_autoresolved": gitignore_autoresolved,
+        }
+
+    local_sha = _head_sha(root)
     # Try the cheap path first.
-    r_ff = _run(["merge", "--ff-only", "FETCH_HEAD"], cwd=root)
+    r_ff = _run(["merge", "--ff-only", remote_sha], cwd=root)
     out += r_ff.stdout
     err += r_ff.stderr
-    if r_ff.returncode == 0:
-        ensure_userfiles_dir(room_id, root=root)
-        _write_local_excludes(root)
-        chown_workspace_tree(room_id)
-        return {"ok": True, "conflict": False, "stdout": out[:4096], "stderr": err[:4096], "branch": target}
-
-    # Already up to date — ff-only exits non-zero but there is nothing to do.
-    if "up to date" in (r_ff.stdout + r_ff.stderr).lower():
-        ensure_userfiles_dir(room_id, root=root)
-        _write_local_excludes(root)
-        chown_workspace_tree(room_id)
-        return {"ok": True, "conflict": False, "stdout": out[:4096], "stderr": err[:4096], "branch": target}
+    if r_ff.returncode == 0 or "up to date" in (r_ff.stdout + r_ff.stderr).lower():
+        return success()
 
     # Diverged: create a real merge commit. --allow-unrelated-histories covers
     # a freshly-seeded room repo being pointed at an existing remote.
     r_merge = _run(
         [
             "merge", "--no-ff", "--no-edit", "--allow-unrelated-histories",
-            "-m", f"merge: pull {branch} from remote", "FETCH_HEAD",
+            "-m", f"merge: pull {branch} from remote", remote_sha,
         ],
         cwd=root,
     )
@@ -1737,35 +1829,22 @@ def git_fetch(
     err += r_merge.stderr
 
     if r_merge.returncode == 0:
-        ensure_userfiles_dir(room_id, root=root)
-        _write_local_excludes(root)
-        chown_workspace_tree(room_id)
-        return {"ok": True, "conflict": False, "stdout": out[:4096], "stderr": err[:4096], "branch": target}
+        return success()
 
-    # Genuine conflict (or another merge failure): roll back to a clean tree
-    # and let the caller surface it for manual resolution.
-    conflict = "CONFLICT" in (r_merge.stdout + r_merge.stderr)
+    # Capture conflicts before abort clears the index.
+    conflict_files = _unmerged_paths(root)
+    conflict = bool(conflict_files) or "CONFLICT" in (r_merge.stdout + r_merge.stderr)
 
     # internal design notes Stage 4: the one conflict that has a single right
     # answer is an ``add/add`` on a seed ``.gitignore`` nobody edited — take the
     # remote's file and finish the merge rather than dead-ending "Merge histories".
-    if conflict and _seed_gitignore_autoresolvable(root):
+    if _seed_gitignore_autoresolvable(root, conflict_files):
         picked = _run(["checkout", "--theirs", "--", ".gitignore"], cwd=root)
         staged = _run(["add", "--", ".gitignore"], cwd=root)
         done = _run(["commit", "--no-edit"], cwd=root)
         if picked.returncode == 0 and staged.returncode == 0 and done.returncode == 0:
-            ensure_userfiles_dir(room_id, root=root)
-            _write_local_excludes(root)
-            chown_workspace_tree(room_id)
             out += done.stdout
-            return {
-                "ok": True,
-                "conflict": False,
-                "gitignore_autoresolved": True,
-                "stdout": out[:4096],
-                "stderr": err[:4096],
-                "branch": target,
-            }
+            return success(gitignore_autoresolved=True)
         logger.warning(
             "git_fetch: seed .gitignore auto-resolve failed for room %s: %s",
             room_id, (picked.stderr + staged.stderr + done.stderr)[:300],
@@ -1782,6 +1861,9 @@ def git_fetch(
         "stdout": out[:4096],
         "stderr": err[:4096],
         "branch": target,
+        **remote,
+        "local_sha": local_sha,
+        "conflict_files": conflict_files,
     }
 
 
@@ -1979,17 +2061,26 @@ def git_divergence_report(room_id: str, branch: str, base: str) -> dict:
     if not (root / ".git").is_dir():
         return {"ok": False, "error": "no git repo", "branch": branch, "base": base}
 
-    for ref in (branch, base):
-        if _run(["rev-parse", "--verify", f"{ref}^{{commit}}"], cwd=root).returncode != 0:
-            return {"ok": False, "error": f"ref not found: {ref}", "branch": branch, "base": base}
+    branch_sha = _commit_sha(root, branch)
+    base_sha = _commit_sha(root, base)
+    if not (branch_sha and base_sha):
+        return {"ok": False, "error": f"ref not found: {branch if not branch_sha else base}",
+                "branch": branch, "base": base}
 
-    mb_run = _run(["merge-base", base, branch], cwd=root)
+    remote_review = branch.startswith(_REMOTE_REF_PREFIX)
+    mb_run = _run(["merge-base", base_sha, branch_sha], cwd=root)
     merge_base_sha = mb_run.stdout.strip() if mb_run.returncode == 0 else None
-    if not merge_base_sha:
+    if not merge_base_sha and (not remote_review or mb_run.returncode != 1):
         return {"ok": False, "error": "no common ancestor", "branch": branch, "base": base}
+    diff_base = merge_base_sha
+    if diff_base is None:
+        empty_tree = _run(["hash-object", "-t", "tree", "-w", "--stdin"], cwd=root, input="")
+        if empty_tree.returncode != 0:
+            return {"ok": False, "error": "could not read the empty tree", "branch": branch, "base": base}
+        diff_base = empty_tree.stdout.strip()
 
     ahead = behind = 0
-    ab = _run(["rev-list", "--left-right", "--count", f"{base}...{branch}"], cwd=root)
+    ab = _run(["rev-list", "--left-right", "--count", f"{base_sha}...{branch_sha}"], cwd=root)
     if ab.returncode == 0:
         try:
             behind_s, ahead_s = ab.stdout.split()
@@ -1997,44 +2088,59 @@ def git_divergence_report(room_id: str, branch: str, base: str) -> dict:
         except ValueError:
             pass
 
-    def _changed_files(rev_range: str) -> list[str]:
-        r = _run(["diff", "--name-only", rev_range], cwd=root)
-        return [p for p in r.stdout.splitlines() if p.strip()] if r.returncode == 0 else []
+    def _changed_files(sha: str) -> list[str]:
+        r = _run(["diff", "--name-only", "-z", diff_base, sha, "--"], cwd=root)
+        return r.stdout.rstrip("\0").split("\0") if r.returncode == 0 and r.stdout else []
 
-    branch_files = _changed_files(f"{merge_base_sha}..{branch}")
-    base_files = _changed_files(f"{merge_base_sha}..{base}")
+    def _binary_files(sha: str) -> list[str]:
+        r = _run(["diff", "--numstat", "--no-renames", "-z", diff_base, sha, "--"], cwd=root)
+        return [
+            entry.removeprefix("-\t-\t")
+            for entry in r.stdout.split("\0")
+            if entry.startswith("-\t-\t")
+        ] if r.returncode == 0 else []
+
+    branch_files = _changed_files(branch_sha)
+    base_files = _changed_files(base_sha)
     overlap = sorted(set(branch_files) & set(base_files))
 
     # Merge preview without touching the working tree.
-    mt = _run(
-        ["merge-tree", "--write-tree", "--name-only", "--messages", base, branch],
-        cwd=root,
-    )
+    args = ["merge-tree", "--write-tree", "--name-only", "--messages", "-z"]
+    if not merge_base_sha:
+        args.append("--allow-unrelated-histories")
+    mt = _run([*args, base_sha, branch_sha], cwd=root)
     conflict = mt.returncode == 1
     conflict_files: list[str] = []
     merge_messages = ""
     merge_tree_oid = ""
     if mt.returncode in (0, 1):
-        body = mt.stdout.split("\n\n", 1)
-        head_lines = body[0].splitlines()
-        # line 0 is the tree OID; the rest (when rc==1) are conflicted paths
-        merge_tree_oid = head_lines[0].strip() if head_lines else ""
-        conflict_files = [ln.strip() for ln in head_lines[1:] if ln.strip()]
-        merge_messages = body[1].strip() if len(body) > 1 else ""
+        paths, _, messages = mt.stdout.partition("\0\0")
+        merge_tree_oid, *conflict_files = paths.rstrip("\0").split("\0")
+        fields = messages.rstrip("\0").split("\0")
+        details = []
+        offset = 0
+        while offset < len(fields) and fields[offset].isdigit():
+            # Each message has a path count, paths, a short type and a description.
+            end = offset + int(fields[offset]) + 2
+            if end >= len(fields):
+                break
+            details.append(fields[end].strip())
+            offset = end + 1
+        merge_messages = "\n".join(details)
     else:
         merge_messages = (mt.stderr or "").strip()
 
     # Does the branch still carry anything the base does not already have? After
     # a rework task lands, merging the diverged branch into base would produce
     # exactly base's own tree — nothing to salvage, safe to just delete.
-    base_tree = _run(["rev-parse", f"{base}^{{tree}}"], cwd=root).stdout.strip()
+    base_tree = _run(["rev-parse", f"{base_sha}^{{tree}}"], cwd=root).stdout.strip()
     redundant = bool(merge_tree_oid) and not conflict and merge_tree_oid == base_tree
 
     detail_paths = (conflict_files or overlap)[:_DIVERGENCE_MAX_FILES]
     conflict_details: list[dict] = []
     for path in detail_paths:
-        base_diff = _run(["diff", f"{merge_base_sha}..{base}", "--", path], cwd=root).stdout
-        branch_diff = _run(["diff", f"{merge_base_sha}..{branch}", "--", path], cwd=root).stdout
+        base_diff = _run(["diff", diff_base, base_sha, "--", f":(literal){path}"], cwd=root).stdout
+        branch_diff = _run(["diff", diff_base, branch_sha, "--", f":(literal){path}"], cwd=root).stdout
         conflict_details.append({
             "path": path,
             "base_diff": _truncate_diff(base_diff),
@@ -2046,21 +2152,225 @@ def git_divergence_report(room_id: str, branch: str, base: str) -> dict:
         "error": None,
         "branch": branch,
         "base": base,
-        "merge_base": _commit_meta(root, merge_base_sha),
-        "base_head": _commit_meta(root, base),
-        "branch_head": _commit_meta(root, branch),
+        "merge_base": _commit_meta(root, merge_base_sha) if merge_base_sha else {},
+        "base_head": _commit_meta(root, base_sha),
+        "branch_head": _commit_meta(root, branch_sha),
         "ahead": ahead,
         "behind": behind,
-        "branch_commits": _log_between(root, f"{base}..{branch}"),
-        "base_commits": _log_between(root, f"{branch}..{base}"),
+        "branch_commits": _log_between(root, f"{base_sha}..{branch_sha}"),
+        "base_commits": _log_between(root, f"{branch_sha}..{base_sha}"),
         "branch_files": branch_files,
         "base_files": base_files,
+        "branch_binary_files": _binary_files(branch_sha) if remote_review else [],
+        "base_binary_files": _binary_files(base_sha) if remote_review else [],
         "overlap_files": overlap,
         "conflict": conflict,
         "conflict_files": conflict_files,
         "conflict_details": conflict_details,
         "merge_messages": merge_messages[:4000],
         "redundant": redundant,
+    }
+
+
+@_serialized(busy_dict=True)
+def git_prepare_pull_rework(
+    room_id: str, task_branch: str, branch: str, remote_ref: str,
+    expected_tips: tuple[str, str], conflict_files: list[str],
+) -> dict:
+    """Seed a task branch with both histories without switching the room checkout."""
+    root = _workspace_root(room_id)
+    if not (root / ".git").is_dir():
+        return {"ok": False, "stderr": "no git repo"}
+    task_ref = f"refs/heads/{task_branch}"
+    local_ref = f"refs/heads/{branch}"
+    if (branch == RELEASE_BRANCH or not remote_ref.startswith(_REMOTE_REF_PREFIX)
+            or not task_branch.startswith("task/")
+            or any(_run(["check-ref-format", ref], cwd=root).returncode
+                   for ref in (task_ref, local_ref, remote_ref))):
+        return {"ok": False, "stderr": "Invalid branches for Pull conflict rework."}
+    if not _review_tips_match(root, branch, remote_ref, expected_tips):
+        return _stale_review()
+    local_sha, remote_sha = expected_tips
+    if (git_ls_remote_userfiles(root, local_sha) or git_ls_remote_userfiles(root, remote_sha)
+            or git_ls_tracked_userfiles_details(room_id)):
+        return {
+            "ok": False, "userfiles_policy_conflict": True,
+            "stderr": f"private-files policy conflict: a merge side or the index tracks {USERFILES_DIR}/",
+        }
+
+    with TemporaryDirectory(prefix="legion-pull-rework-") as temp:
+        hand_to_git_user(temp)  # git may run as the room's user (git_exec)
+        checkout = Path(temp) / "merge"
+        result = _run(["worktree", "add", "--detach", str(checkout), local_sha], cwd=root)
+        if result.returncode:
+            return {"ok": False, "stderr": result.stderr[:4096]}
+        try:
+            result = _run([
+                "merge", "--no-ff", "--allow-unrelated-histories", "-X", "ours",
+                "-m", f"Merge {remote_ref} for Pull conflict rework", "--", remote_sha,
+            ], cwd=checkout)
+            remaining = _unmerged_paths(checkout) if result.returncode else []
+            if remaining:
+                # -X ours handles overlapping hunks. For conflicts such as
+                # modify/delete, keep the local file or its local deletion.
+                result = _keep_local_rework_paths(checkout, local_sha, remaining)
+                if not result.returncode:
+                    result = _run(["commit", "--no-edit"], cwd=checkout)
+            if result.returncode:
+                return {
+                    "ok": False, "conflict": bool(remaining),
+                    "stderr": result.stderr[:4096], "stdout": result.stdout[:4096],
+                }
+            sha = _head_sha(checkout)
+            if sha is None:
+                return {"ok": False, "stderr": "Could not read the rework merge commit."}
+        finally:
+            removed = _run(["worktree", "remove", "--force", str(checkout)], cwd=root)
+            if removed.returncode:
+                logger.warning("git_prepare_pull_rework: could not remove temporary checkout for %s", room_id)
+
+    # Pin the diff to the same two commits as the seed merge.
+    merge_base = _run(["merge-base", local_sha, remote_sha], cwd=root)
+    if merge_base.returncode == 1:
+        merge_base = _run(["hash-object", "-t", "tree", "-w", "--stdin"], cwd=root, input="")
+    if merge_base.returncode:
+        return {"ok": False, "stderr": "Could not read the Pull conflict merge base."}
+    diff_base = merge_base.stdout.strip()
+    paths = list(dict.fromkeys([*conflict_files, *remaining]))
+    patches = _pull_rework_patches(root, diff_base, remote_sha, paths)
+
+    if not _review_tips_match(root, branch, remote_ref, expected_tips):
+        return _stale_review()
+    existing = _commit_sha(root, task_ref)
+    if existing:
+        # A previous request may have seeded the ref before the database commit.
+        def signature(commit: str) -> str:
+            return _run(["show", "-s", "--format=%T %P", commit], cwd=root).stdout.strip()
+
+        if signature(existing) != signature(sha):
+            return {"ok": False, "existing_sha": existing,
+                    "stderr": "The rework branch already contains different changes."}
+        sha = existing
+    else:
+        transaction = f"verify {local_ref}\0{local_sha}\0verify {remote_ref}\0{remote_sha}\0create {task_ref}\0{sha}\0"
+        created = _run(["update-ref", "--stdin", "-z"], cwd=root, input=transaction)
+        if created.returncode:
+            if not _review_tips_match(root, branch, remote_ref, expected_tips):
+                return _stale_review()
+            return {"ok": False, "stderr": created.stderr[:4096]}
+    chown_workspace_tree(room_id)
+    return {
+        "ok": True, "sha": sha, "diff_base": diff_base,
+        "remote_patches": patches, "conflict_files": paths,
+    }
+
+
+def _keep_local_rework_paths(
+    checkout: Path, local_sha: str, paths: list[str],
+) -> subprocess.CompletedProcess:
+    pathspecs = [f":(literal){path}" for path in paths]
+    local_files = _run(["ls-tree", "-r", "--name-only", "-z", local_sha, "--", *pathspecs], cwd=checkout)
+    if local_files.returncode:
+        return local_files
+    # Removing the unmerged index entries first also handles files absent on
+    # the local side, which git restore refuses to remove while unmerged.
+    removed = _run(["rm", "-rf", "--ignore-unmatch", "--", *pathspecs], cwd=checkout)
+    if removed.returncode or not local_files.stdout:
+        return removed
+    return _run([
+        "restore", f"--source={local_sha}", "--staged", "--worktree", "--",
+        *(f":(literal){path}" for path in local_files.stdout.rstrip("\0").split("\0")),
+    ], cwd=checkout)
+
+
+def _pull_rework_patches(root: Path, diff_base: str, remote_sha: str, paths: list[str]) -> dict[str, str]:
+    patches = {}
+    budget = 32000
+    for path in paths:
+        if budget <= 0:
+            break
+        diff = _run([
+            "diff", "--no-ext-diff", "--no-textconv", diff_base, remote_sha, "--", f":(literal){path}",
+        ], cwd=root)
+        if diff.returncode:
+            continue
+        patch = _truncate_diff(diff.stdout)
+        limit = min(budget, 8000)
+        patches[path] = patch if len(patch) <= limit else patch[:limit] + "\n[Diff truncated]"
+        budget -= len(patches[path])
+    return patches
+
+
+def _backup_branch_tip(root: Path, branch: str, sha: str) -> tuple[str, subprocess.CompletedProcess]:
+    safe = branch.replace("/", "-").replace("~", "-").replace("^", "-").replace(":", "-")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    backup_ref = f"refs/legion/trash/{safe}@{ts}"
+    # Require a new ref so a retry cannot overwrite a previous backup.
+    return backup_ref, _run(["update-ref", backup_ref, sha, ""], cwd=root)
+
+
+@_serialized(busy_dict=True)
+def git_reset_branch_to(
+    room_id: str, branch: str, ref: str, *, expected_tips: tuple[str, str] | None = None,
+) -> dict:
+    """Move an existing local branch to a commit after saving its current tip."""
+    root = _workspace_root(room_id)
+    if not (root / ".git").is_dir():
+        return {"ok": False, "stderr": "no git repo"}
+
+    if expected_tips is not None and not _review_tips_match(root, branch, ref, expected_tips):
+        return _stale_review()
+    head_before = _head_sha(root)
+    branch_ref = f"refs/heads/{branch}"
+    local = _run(["show-ref", "--verify", "--hash", branch_ref], cwd=root)
+    if local.returncode != 0:
+        return {"ok": False, "stderr": f"local branch does not exist: {branch!r}"}
+    local_sha = local.stdout.strip()
+    destination = _run(["rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"], cwd=root)
+    if destination.returncode != 0:
+        return {"ok": False, "stderr": destination.stderr[:4096]}
+    sha = destination.stdout.strip()
+    if sha == local_sha:
+        return {"ok": True, "branch": branch, "sha": sha}
+
+    if git_ls_remote_userfiles(root, sha) or git_ls_remote_userfiles(root, local_sha):
+        return {"ok": False, "stderr": f"private-files policy conflict: a reset tree tracks {USERFILES_DIR}/"}
+
+    current = git_current_branch(room_id)
+    was_checked_out = branch == current
+    if was_checked_out:
+        if git_ls_tracked_userfiles_details(room_id):
+            return {"ok": False, "stderr": f"private-files policy conflict: the index tracks {USERFILES_DIR}/"}
+        park_error = _park_worktree_before_switch(root, room_id, current)
+        if park_error:
+            return {"ok": False, "stderr": park_error}
+        current = git_current_branch(room_id)  # parking may have moved off main
+        status = _run(["status", "--porcelain"], cwd=root)
+        if status.returncode != 0 or status.stdout:
+            return {"ok": False, "stderr": status.stderr or "could not park local changes"}
+        local_sha = _rev(root, branch_ref)
+        if local_sha is None:
+            return {"ok": False, "stderr": f"local branch disappeared: {branch!r}"}
+
+    if expected_tips is not None and (local_sha, sha) != expected_tips:
+        return _stale_review()
+    backup_ref, saved = _backup_branch_tip(root, branch, local_sha)
+    if saved.returncode != 0:
+        return {"ok": False, "stderr": saved.stderr[:4096]}
+
+    if branch == current:
+        result = _run(["reset", "--hard", sha], cwd=root)
+    else:
+        result = _run(["branch", "-f", "--", branch, sha], cwd=root)
+    if was_checked_out:
+        chown_workspace_tree(room_id)
+    return {
+        "ok": result.returncode == 0,
+        "branch": branch,
+        "sha": sha if result.returncode == 0 else None,
+        "backup_ref": backup_ref,
+        "head_changed": _head_sha(root) != head_before,
+        "stderr": result.stderr[:4096],
     }
 
 
@@ -2108,12 +2418,7 @@ def git_discard_branch(room_id: str, branch: str) -> dict:
             }
         chown_workspace_tree(room_id)  # checkout rewrote worktree files as root
 
-    from datetime import datetime, timezone
-
-    safe = branch.replace("/", "-").replace("~", "-").replace("^", "-").replace(":", "-")
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    backup_ref = f"refs/legion/trash/{safe}@{ts}"
-    tag = _run(["update-ref", backup_ref, branch], cwd=root)
+    backup_ref, tag = _backup_branch_tip(root, branch, f"refs/heads/{branch}")
     if tag.returncode != 0:
         return {"ok": False, "deleted": False, "stderr": tag.stderr[:500]}
 

@@ -68,6 +68,7 @@ function App() {
 
   const [tab, setTab] = useState('chats');
   const [roomTab, setRoomTab] = useState('chat'); // 'chat' | 'sessions' | 'board' | 'workspace' | 'browser'
+  const [pullConflictFocus, setPullConflictFocus] = useState(null);
   const [workspaceDiffBranch, setWorkspaceDiffBranch] = useState(null);
   const [workspaceDiffBase, setWorkspaceDiffBase] = useState(null);
   const [selectedRoom, setSelectedRoom] = useState(null);
@@ -94,7 +95,11 @@ function App() {
   const isMobile = useIsMobile();
   const [mobileList, setMobileList] = useState(false);
   const [roomPanelOpen, setRoomPanelOpen] = useState(false);
-  useEffect(() => { setMobileList(false); setRoomPanelOpen(false); }, [selectedRoom?.id, selectedAgent?.id]);
+  useEffect(() => {
+    setMobileList(false);
+    setRoomPanelOpen(false);
+    setPullConflictFocus(null);
+  }, [selectedRoom?.id, selectedAgent?.id]);
   const selectTab = (id) => {
     if (id === 'chats' || id === 'agents') setMobileList(true);
     setRoomPanelOpen(false);
@@ -985,6 +990,7 @@ function App() {
             onAgentSessionClosed={clearAgentStatusBySession}
             agentStatuses={agentStatuses}
             onGitFlowEvent={() => setGitFlowTick(t => t + 1)}
+            pullConflictFocus={pullConflictFocus?.roomId === selectedRoom.id ? pullConflictFocus : null}
             onRoomClosed={(frame) => handleRoomClosed(frame.room_id, frame.reason, frame.message)}
           />
         </div>
@@ -1051,7 +1057,11 @@ function App() {
   const hasListPane = tab !== 'settings' && tab !== 'skills' && tab !== 'connections';
   const listHiddenOnMobile = !mobileList && ((tab === 'chats' && selectedRoom) || (tab === 'agents' && selectedAgent));
   const roomSidebar = selectedRoom && (
-    <RoomSidebar room={selectedRoom} token={token} user={user} width={isMobile ? '100%' : 256} taskRefreshKey={taskRefreshKey} goalRefreshKey={goalRefreshKey} repoRefreshKey={repoRefreshKey} agentStatuses={agentStatuses} taskStatuses={taskStatuses} onShowDiff={(branch, baseRef) => { setRoomPanelOpen(false); setWorkspaceDiffBranch(branch); setWorkspaceDiffBase(baseRef || null); setRoomTab('workspace'); }} />
+    <RoomSidebar room={selectedRoom} token={token} user={user} width={isMobile ? '100%' : 256} taskRefreshKey={taskRefreshKey} goalRefreshKey={goalRefreshKey} repoRefreshKey={repoRefreshKey} agentStatuses={agentStatuses} taskStatuses={taskStatuses} onReviewPullConflict={(gate, reviewing) => {
+      setRoomPanelOpen(false);
+      setRoomTab('chat');
+      setPullConflictFocus({ roomId: selectedRoom.id, gate, reviewing });
+    }} onShowDiff={(branch, baseRef) => { setRoomPanelOpen(false); setWorkspaceDiffBranch(branch); setWorkspaceDiffBase(baseRef || null); setRoomTab('workspace'); }} />
   );
 
   return (

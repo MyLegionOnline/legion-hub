@@ -133,20 +133,87 @@ def test_two_concurrent_merges_both_complete(isolated_repo):
 # Stale lock
 # ---------------------------------------------------------------------------
 
-def test_stale_lock_file_is_broken(isolated_repo, monkeypatch):
-    room_id, root = isolated_repo
-    lock = root / ".legion" / "git.lock"
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    lock.write_text("999999 2000-01-01T00:00:00+00:00\n", encoding="utf-8")
-    old = time.time() - (git_lock.STALE_TTL + 60)
+def _plant_lock(room_id: str, content: str, age: float = 0.0) -> Path:
     import os
-    os.utime(lock, (old, old))
+
+    lock = git_lock._lock_path(room_id)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text(content, encoding="utf-8")
+    if age:
+        old = time.time() - age
+        os.utime(lock, (old, old))
+    return lock
+
+
+def test_lock_lives_outside_the_room_directory(isolated_repo):
+    room_id, root = isolated_repo
+    lock = git_lock._lock_path(room_id)
+    assert root not in lock.parents
+    with room_git_lock(room_id):
+        assert lock.exists()
+    assert not lock.exists()
+
+
+def test_a_lock_planted_in_the_room_does_not_block(isolated_repo):
+    """The room container can write ``.legion/git.lock``; it means nothing now."""
+    room_id, root = isolated_repo
+    planted = root / ".legion" / "git.lock"
+    planted.parent.mkdir(parents=True, exist_ok=True)
+    planted.write_text("1 x\n", encoding="utf-8")
+    (root / "f.txt").write_text("x\n", encoding="utf-8")
+    with room_git_lock(room_id, timeout=0.5):
+        pass
+
+
+def test_lock_of_a_dead_process_is_broken_at_once(isolated_repo, monkeypatch):
+    room_id, root = isolated_repo
+    monkeypatch.setattr(git_lock, "_pid_alive", lambda pid: False)
+    lock = _plant_lock(room_id, "999999 other-instance tok 2000-01-01T00:00:00+00:00\n")
 
     (root / "after_stale.txt").write_text("x\n", encoding="utf-8")
     sha = git_ops.git_commit(room_id, "commit past a stale lock")
 
     assert sha, "commit should have proceeded after breaking the stale lock"
     assert not lock.exists(), "the lock file must be released after the op"
+
+
+def test_lock_of_an_earlier_run_with_our_pid_is_broken(isolated_repo):
+    import os
+
+    room_id, _ = isolated_repo
+    _plant_lock(room_id, f"{os.getpid()} earlier-instance tok 2000-01-01T00:00:00+00:00\n")
+    with room_git_lock(room_id, timeout=0.5):
+        pass
+
+
+def test_a_live_holder_keeps_the_lock_past_the_old_ttl(isolated_repo, monkeypatch):
+    """A slow push in another live worker must not lose its lock by age."""
+    room_id, _ = isolated_repo
+    monkeypatch.setattr(git_lock, "_pid_alive", lambda pid: True)
+    lock = _plant_lock(
+        room_id, "4242 other-worker tok 2000-01-01T00:00:00+00:00\n",
+        age=git_lock.STALE_TTL + 600,
+    )
+    with pytest.raises(GitWorkspaceBusyError):
+        with room_git_lock(room_id, timeout=0.3):
+            pass
+    assert lock.exists()
+
+
+def test_unidentifiable_lock_falls_back_to_age(isolated_repo):
+    room_id, _ = isolated_repo
+    _plant_lock(room_id, "garbage\n", age=git_lock.STALE_TTL + 60)
+    with room_git_lock(room_id, timeout=0.5):
+        pass
+
+
+def test_release_leaves_a_lock_taken_by_someone_else(isolated_repo):
+    room_id, _ = isolated_repo
+    with room_git_lock(room_id):
+        lock = git_lock._lock_path(room_id)
+        lock.write_text("4242 other tok-other 2026-01-01T00:00:00+00:00\n", encoding="utf-8")
+    assert lock.exists()
+    lock.unlink()
 
 
 def test_fresh_lock_is_respected_until_timeout(isolated_repo, monkeypatch):

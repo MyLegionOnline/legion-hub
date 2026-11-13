@@ -21,6 +21,7 @@ from .room_variable import RoomVariable  # noqa: F401 — internal design notes 
 from .provider_connection import ProviderConnection  # noqa: F401 — Settings → Providers, per account
 from .room_environment import RoomEnvironmentConfig, RoomEnvironmentUnlock  # noqa: F401 — Stage 12
 from .promotion import Promotion  # noqa: F401 — internal design notes Stage 4 (Gate 2)
+from .remote_divergence import RemoteDivergence
 from .goal_plan import GoalPlan, GoalPlanStep, GoalPlanStatus, PlanStepStatus
 from .session import (  # noqa: F401 — must import to register with SQLModel.metadata
     Session,
@@ -104,6 +105,7 @@ __all__ = [
     "RoomGoal", "GoalStatus",
     "RoomVariable",
     "RoomEnvironmentConfig", "RoomEnvironmentUnlock",
+    "RemoteDivergence",
     "GoalPlan", "GoalPlanStep", "GoalPlanStatus", "PlanStepStatus",
     "Session",
     "UserAgentSession", "UserAgentSessionP2",

@@ -119,6 +119,8 @@ class FileReadResponse(BaseModel):
 class FileWriteRequest(BaseModel):
     content: str  # text, or data-URI for binary
     commit_message: Optional[str] = None
+    # Commit only the written file, never other pending changes in the tree.
+    commit_only_path: bool = False
 
 
 class FileWriteResponse(BaseModel):
@@ -252,6 +254,8 @@ class GitMergeRequest(BaseModel):
     # theirs=True (default) auto-resolves overlapping hunks for task→dev/goal
     # merges; the dev→main / goal→dev gates pass False for a clean merge.
     theirs: bool = True
+    strategy: Literal["ours", "theirs"] | None = None
+    expected_tips: tuple[str, str] | None = None
 
 
 class GitRevertCommitRequest(BaseModel):
@@ -282,6 +286,7 @@ class GitArchiveResponse(BaseModel):
 class GitOpResponse(BaseModel):
     ok: bool
     conflict: bool = False
+    stale: bool = False
     # internal design notes §5 — the room's single working tree was
     # locked by another git operation and this one timed out waiting. Distinct
     # from a plain failure: the caller should retry, not treat it as done.
@@ -290,6 +295,13 @@ class GitOpResponse(BaseModel):
     # conflict on an untouched seed ``.gitignore`` and resolved it in favour of
     # the remote's file instead of aborting. Only ever True on a ``git_fetch``.
     gitignore_autoresolved: bool = False
+    remote_ref: Optional[str] = None
+    remote_sha: Optional[str] = None
+    local_sha: Optional[str] = None
+    conflict_files: list[str] = Field(default_factory=list)
+    # The checked-out commit moved, so running workspace
+    # services serve code that is no longer on disk until they restart.
+    head_changed: bool = False
     stdout: str = ""
     stderr: str = ""
     sha: Optional[str] = None
@@ -421,12 +433,45 @@ class GitDivergenceResponse(BaseModel):
     base_commits: list[dict] = Field(default_factory=list)
     branch_files: list[str] = Field(default_factory=list)
     base_files: list[str] = Field(default_factory=list)
+    branch_binary_files: list[str] = Field(default_factory=list)
+    base_binary_files: list[str] = Field(default_factory=list)
     overlap_files: list[str] = Field(default_factory=list)
     conflict: bool = False
     conflict_files: list[str] = Field(default_factory=list)
     conflict_details: list[dict] = Field(default_factory=list)
     merge_messages: str = ""
     redundant: bool = False
+
+
+class GitPullReworkRequest(BaseModel):
+    task_branch: str
+    branch: str
+    remote_ref: str
+    expected_tips: tuple[str, str]
+    conflict_files: list[str] = Field(default_factory=list)
+
+
+class GitPullReworkResponse(GitOpResponse):
+    diff_base: str | None = None
+    remote_patches: dict[str, str] = Field(default_factory=dict)
+    existing_sha: str | None = None
+
+
+class GitResetBranchRequest(BaseModel):
+    branch: str
+    ref: str
+    expected_tips: tuple[str, str] | None = None
+
+
+class GitResetBranchResponse(BaseModel):
+    ok: bool
+    busy: bool = False
+    stale: bool = False
+    head_changed: bool = False
+    branch: Optional[str] = None
+    sha: Optional[str] = None
+    backup_ref: Optional[str] = None
+    stderr: str = ""
 
 
 class GitDiscardBranchRequest(BaseModel):

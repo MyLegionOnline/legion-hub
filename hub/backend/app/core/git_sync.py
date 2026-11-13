@@ -29,6 +29,40 @@ from app.core.git_author import sync_from_token
 logger = logging.getLogger(__name__)
 
 
+async def import_pulled_services(room_id: UUID, db: AsyncSession, *, source: str) -> dict[str, list[str]]:
+    """Recreate Browser services listed in the checked-out manifest."""
+    from app.core.workspace_lifecycle import _get_or_create_workspace
+    from app.core.workspace_services import services_enabled
+    from app.core.workspace_services_manifest import import_services_manifest
+
+    if not services_enabled():
+        return {}
+    try:
+        workspace = await _get_or_create_workspace(room_id, db)
+        return await import_services_manifest(db, room_id, workspace.id, source=source)
+    except Exception:
+        await db.rollback()
+        logger.warning("services manifest import failed for room %s", room_id, exc_info=True)
+        return {}
+
+
+async def refresh_services_after_pull(
+    room_id: UUID, db: AsyncSession, current_user, *, source: str, head_changed: bool,
+) -> tuple[dict[str, list[str]], list[str]]:
+    """Import service declarations and restart running services if HEAD moved."""
+    imported = await import_pulled_services(room_id, db, source=source)
+    restarted = []
+    if head_changed:
+        from app.api.v1.workspace import restart_running_services
+
+        try:
+            restarted = await restart_running_services(room_id, db, current_user, source=source)
+        except Exception:
+            await db.rollback()
+            logger.warning("restarting services after pull failed for room %s", room_id, exc_info=True)
+    return imported, restarted
+
+
 class GitTreeTruncatedError(RuntimeError):
     """Raised when the provider's recursive tree listing was truncated.
 
@@ -255,6 +289,7 @@ async def fetch_workspace_from_git(
             "conflict": False,
             "branch": result.get("branch") or landing,
             "gitignore_autoresolved": gitignore_autoresolved,
+            "head_changed": bool(result.get("head_changed")),
         }
     return {
         "synced": 0,
@@ -264,6 +299,10 @@ async def fetch_workspace_from_git(
         "userfiles_tracked": result.get("userfiles_tracked") or [],
         "userfiles_tracked_details": result.get("userfiles_tracked_details") or [],
         "branch": result.get("branch") or landing,
+        "remote_ref": result.get("remote_ref"),
+        "local_sha": result.get("local_sha"),
+        "remote_sha": result.get("remote_sha"),
+        "conflict_files": result.get("conflict_files") or [],
         "gitignore_autoresolved": gitignore_autoresolved,
     }
 

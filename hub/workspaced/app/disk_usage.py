@@ -108,11 +108,16 @@ def _tracked_dirs(root: Path) -> set[str] | None:
     None when the room is not a git repository."""
     if not (root / ".git").exists():
         return None
+    from app.git_exec import git_exec
+
     try:
-        out = subprocess.run(
-            ["git", "-c", f"safe.directory={root}", "-C", str(root), "ls-files", "-z"],
-            capture_output=True, timeout=60, check=True,
-        ).stdout
+        r = git_exec(
+            ["ls-files", "-z"], root, text=False, timeout=60,
+            flags=["-c", f"safe.directory={root}"],
+        )
+        if r.returncode != 0:
+            raise subprocess.CalledProcessError(r.returncode, r.args, r.stdout, r.stderr)
+        out = r.stdout
     except (OSError, subprocess.SubprocessError) as exc:
         # Unknown tracking: refuse to guess, keep everything.
         logger.warning("clean deps: git ls-files failed in %s: %s", root, exc)

@@ -200,6 +200,7 @@ services:
       WORKSPACE_VOLUME_NAME: legion_workspace_data
       ROOM_ARCHIVE_DIR: /var/lib/workspaced/archive
       IDLE_REAPER_ENABLED: "false"
+      GIT_RUN_AS_WORKSPACE_USER: ${GIT_RUN_AS_WORKSPACE_USER:-false}
     volumes:
       - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
       - workspace_data:/var/lib/workspaced/data

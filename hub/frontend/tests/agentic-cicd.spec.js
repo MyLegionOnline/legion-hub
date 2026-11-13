@@ -595,3 +595,222 @@ test('successful promotion does not open release tag form', async ({ page }) => 
   await expect.poll(() => state.resolveBodies).toHaveLength(1);
   await expect(page.getByTestId('release-tag-form')).toHaveCount(0);
 });
+
+
+const PULL_CONFLICT_ID = '77777777-7777-4777-8777-777777777777';
+const REWORK_AGENT = '88888888-8888-4888-8888-888888888888';
+const ANOTHER_AGENT = '99999999-9999-4999-8999-999999999999';
+
+function pullReview(branch = 'dev', overrides = {}) {
+  const decisions = ['take_remote', 'keep_local', 'reset_to_remote'];
+  if (branch !== 'main') decisions.push('rework');
+  return {
+    id: 'pull-review',
+    event_type: 'REMOTE_DIVERGENCE_REVIEW',
+    sender_type: 'system',
+    timestamp: '2026-11-13T10:00:00Z',
+    content: 'Both branches edit the hero.',
+    metadata: {
+      remote_divergence_id: PULL_CONFLICT_ID, branch, remote_ref: 'refs/legion/remote/main',
+      local_sha: 'local-1', remote_sha: 'remote-1', conflict_files: ['style.css'], decisions,
+      analysis: {
+        summary: 'Both branches edit the hero.',
+        recommendation: branch === 'main' ? 'keep_local' : 'rework',
+        recommendation_reason: 'Preserve the local hero layout.',
+        rework_brief: branch === 'main' ? '' : 'Keep the remote gap and local width.',
+        suggested_agent: REWORK_AGENT,
+      },
+      report: { ahead: 2, behind: 1, branch_flagged_files: ['core'] },
+    },
+    ...overrides,
+  };
+}
+
+function pullConflictSignal() {
+  return {
+    id: 'pull-conflict',
+    event_type: 'GIT_CONFLICT',
+    sender_type: 'system',
+    timestamp: '2026-11-13T09:55:00Z',
+    content: 'Pull hit a conflict',
+    metadata: { remote_divergence_id: PULL_CONFLICT_ID, branch: 'dev', conflict_files: ['style.css'] },
+  };
+}
+
+async function sendPullEvent(page, message) {
+  await page.evaluate(event => {
+    window.__sockets.at(-1).onmessage({ data: JSON.stringify({ ...event, type: 'message' }) });
+  }, message);
+}
+
+test('both Pull controls direct conflicts to the Git gate and open a single chat review', async ({ page }) => {
+  const signal = pullConflictSignal();
+  const review = pullReview();
+  let phase = 'detected';
+  let gateOpen = false;
+  let reviewsRequested = 0;
+  const pullBodies = [];
+  await installHarness(page, {
+    gitState: () => makeGitState({ gates: gateOpen ? [{
+      id: PULL_CONFLICT_ID, kind: 'remote_divergence', branch: 'dev', state: phase, conflict_files: ['style.css'],
+    }] : [] }),
+  });
+  await page.route('**/git/sync', route => {
+    pullBodies.push(route.request().postDataJSON());
+    gateOpen = true;
+    return route.fulfill({ json: { ok: false, conflict: true } });
+  });
+  await page.route(`**/git/remote-divergence/${PULL_CONFLICT_ID}`, route => route.fulfill({
+    json: { ...review.metadata, state: phase, analysis: phase === 'reviewed' ? review.metadata.analysis : null },
+  }));
+  await page.route(`**/git/remote-divergence/${PULL_CONFLICT_ID}/review`, route => {
+    reviewsRequested += 1;
+    phase = 'reviewing';
+    return route.fulfill({ status: 202, json: { state: phase } });
+  });
+
+  await openRoom(page);
+  await page.getByTitle('Pull from Git', { exact: true }).click();
+  const copy = page.getByText('Conflict with the remote — review it in the chat.', { exact: true });
+  await expect(copy).toHaveCount(1);
+  const dev = page.getByTestId('git-branch-row').filter({ hasText: 'dev' }).last();
+  await dev.hover();
+  await dev.getByTestId('git-branch-pull').click();
+  await expect(copy).toHaveCount(2);
+  expect(pullBodies).toEqual([null, { branch: 'dev' }]);
+
+  await page.getByRole('button', { name: 'Sessions', exact: true }).click();
+  const gate = page.getByTestId('git-gate-queue').filter({ hasText: 'Pull conflict' });
+  await gate.getByRole('button', { name: 'Review conflict' }).click();
+  const card = page.getByTestId('pull-conflict-card');
+  await expect(card).toContainText('Reviewing conflict');
+  expect(reviewsRequested).toBe(1);
+
+  await sendPullEvent(page, signal);
+  phase = 'reviewed';
+  await sendPullEvent(page, review);
+  await sendPullEvent(page, review);
+  await expect(card).toHaveCount(1);
+  await expect(card).toContainText('Both branches edit the hero.');
+  await expect(card).toContainText('Remote binary or generated files · core');
+  await expect(card.getByRole('button', { name: 'Keep local' })).toBeEnabled();
+});
+
+test('a stale Pull decision can be re-reviewed and rework stays open until a resolution event', async ({ page }) => {
+  const original = pullReview('dev', { id: 'pull-review-old' });
+  const fresh = pullReview();
+  let snapshot = { ...original.metadata, state: 'reviewed', rework_task_id: null };
+  const bodies = [];
+  await installHarness(page, { history: [pullConflictSignal(), original] });
+  await page.route('**/members', route => route.fulfill({
+    json: {
+      agents: [{ id: REWORK_AGENT, name: 'Layout' }, { id: ANOTHER_AGENT, name: 'CSS' },
+        { id: 'chatmaster', name: 'ChatMaster', is_master: true }],
+      users: [],
+    },
+  }));
+  await page.route(`**/git/remote-divergence/${PULL_CONFLICT_ID}`, route => route.fulfill({ json: snapshot }));
+  await page.route(`**/git/remote-divergence/${PULL_CONFLICT_ID}/review`, route => {
+    snapshot = { ...snapshot, state: 'reviewing' };
+    return route.fulfill({ status: 202, json: { state: 'reviewing' } });
+  });
+  await page.route(`**/git/remote-divergence/${PULL_CONFLICT_ID}/resolve`, route => {
+    const body = route.request().postDataJSON();
+    bodies.push(body);
+    if (body.decision === 'keep_local') {
+      snapshot = { ...snapshot, state: 'stale', analysis: null, report: null };
+      return route.fulfill({ status: 409, json: { detail: { code: 'stale', message: 'A branch tip changed.' } } });
+    }
+    snapshot = { ...snapshot, decision: 'rework', rework_task_id: TERMINAL_TASK };
+    return route.fulfill({ json: { ok: true, decision: 'rework', rework_task_id: TERMINAL_TASK } });
+  });
+
+  await openRoom(page);
+  const card = page.getByTestId('pull-conflict-card');
+  await card.getByRole('button', { name: 'Keep local' }).click();
+  await expect(card.getByText('A branch tip changed', { exact: false })).toHaveCount(1);
+  await expect(card.getByRole('alert')).toHaveCount(0);
+  await card.getByRole('button', { name: 'Re-review' }).click();
+  await expect(card).toContainText('Reviewing conflict');
+  fresh.metadata.local_sha = 'local-2';
+  snapshot = { ...fresh.metadata, state: 'reviewed', rework_task_id: null };
+  await sendPullEvent(page, fresh);
+  await expect(card).toHaveCount(1);
+  await card.getByRole('button', { name: 'Rework as a task' }).click();
+  const select = card.getByRole('combobox', { name: 'Rework agent' });
+  await expect(select).toHaveValue(REWORK_AGENT);
+  await expect(select.locator('option', { hasText: 'ChatMaster' })).toHaveCount(0);
+  await select.selectOption(ANOTHER_AGENT);
+  await card.getByLabel('Note for the rework agent').fill('Preserve the mobile spacing.');
+  await card.getByRole('button', { name: 'Create rework task' }).click();
+  await expect(card).toContainText('The conflict stays open until the task is merged.');
+  expect(bodies).toEqual([{ decision: 'keep_local' },
+    { decision: 'rework', agent_id: ANOTHER_AGENT, note: 'Preserve the mobile spacing.' }]);
+  await expect(card).not.toContainText('Now Push');
+
+  await sendPullEvent(page, {
+    id: 'pull-resolved', event_type: 'REMOTE_DIVERGENCE_RESOLVED', sender_type: 'system',
+    content: 'Rework merged.', timestamp: '2026-11-13T10:01:00Z', task_id: TERMINAL_TASK,
+    metadata: { remote_divergence_id: PULL_CONFLICT_ID, decision: 'rework', branch: 'dev', remote_ref: 'refs/legion/remote/main' },
+  });
+  await expect(card).toContainText('Now publish dev to main, then Push main.');
+  await expect(card.getByRole('button', { name: 'Keep local' })).toHaveCount(0);
+});
+
+test('a fallback Pull review offers Re-review and polls until ChatMaster answers', async ({ page }) => {
+  const original = pullReview();
+  original.metadata.analysis = { ...original.metadata.analysis, _fallback: true };
+  let snapshot = { ...original.metadata, state: 'reviewed', rework_task_id: null, decision: null };
+  let reviews = 0;
+  await installHarness(page, { history: [pullConflictSignal(), original] });
+  await page.route(`**/git/remote-divergence/${PULL_CONFLICT_ID}`, route => {
+    const current = snapshot;
+    // The background job marks the row reviewing only after the 202 is sent.
+    if (reviews && current.state === 'reviewed' && current.analysis._fallback) snapshot = { ...current, state: 'reviewing' };
+    else if (current.state === 'reviewing') {
+      snapshot = { ...current, state: 'reviewed', analysis: { ...pullReview().metadata.analysis, summary: 'ChatMaster analysis.' } };
+    }
+    return route.fulfill({ json: current });
+  });
+  await page.route(`**/git/remote-divergence/${PULL_CONFLICT_ID}/review`, route => {
+    reviews += 1;
+    return route.fulfill({ status: 202, json: { state: 'reviewing' } });
+  });
+
+  await openRoom(page);
+  const card = page.getByTestId('pull-conflict-card');
+  await expect(card).toContainText('ChatMaster’s analysis is unavailable');
+  await card.getByRole('button', { name: 'Re-review' }).click();
+  await expect(card).toContainText('ChatMaster analysis.', { timeout: 15_000 });
+  await expect(card).not.toContainText('ChatMaster’s analysis is unavailable');
+  await expect(card.getByRole('button', { name: 'Re-review' })).toHaveCount(0);
+  expect(reviews).toBe(1);
+});
+
+test('release-branch Pull review hides rework and confirms take and reset', async ({ page }) => {
+  const review = pullReview('main');
+  const bodies = [];
+  await installHarness(page, { history: [review] });
+  await page.route(`**/git/remote-divergence/${PULL_CONFLICT_ID}`, route => route.fulfill({
+    json: { ...review.metadata, state: 'reviewed' },
+  }));
+  await page.route(`**/git/remote-divergence/${PULL_CONFLICT_ID}/resolve`, route => {
+    bodies.push(route.request().postDataJSON());
+    return route.fulfill({ json: { ok: true, decision: 'reset_to_remote', branch: 'main', backup_ref: 'refs/legion/trash/main@123' } });
+  });
+
+  await openRoom(page);
+  const card = page.getByTestId('pull-conflict-card');
+  const confirm = page.getByTestId('confirm-dialog');
+  await card.getByRole('button', { name: 'Take remote', exact: true }).click();
+  await expect(card.getByRole('button', { name: 'Rework as a task' })).toHaveCount(0);
+  await expect(confirm).toContainText('Remote edits will replace local edits');
+  await confirm.getByRole('button', { name: 'Cancel' }).click();
+  expect(bodies).toEqual([]);
+  await card.getByRole('button', { name: 'Reset to remote' }).click();
+  await expect(confirm).toContainText('saved in a backup ref');
+  await confirm.getByRole('button', { name: 'Reset to remote' }).click();
+  await expect(card).toContainText('refs/legion/trash/main@123');
+  await expect(card).toContainText('Now Push main if you have new commits');
+  expect(bodies).toEqual([{ decision: 'reset_to_remote' }]);
+});

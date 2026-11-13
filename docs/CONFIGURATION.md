@@ -62,6 +62,7 @@ encrypted with the keyring.
 | `LEGION_OWNER_EMAIL` | – | For a database that had users before owners existed: the account that becomes the owner |
 | `LEGION_SOURCE_URL` | the public repository | The "Source code" link. If you run a modified Hub, point it at your source (AGPL-3.0 section 13) |
 | `LEGION_BROWSER_PREVIEW` | `false` | `true` opens apps started in a room in its Browser tab, at `http://svc-<id>.preview.localhost:<LEGION_PORT>`. Browsers resolve `*.localhost` themselves, so no DNS is needed, but only a browser on the Hub's machine can open these addresses. Needs v0.1.6 or newer. A preview on your own domain (wildcard DNS and certificate) is a compose change, see [BROWSER_SERVICES_REFERENCE.md](../hub/BROWSER_SERVICES_REFERENCE.md) section 7 |
+| `GIT_RUN_AS_WORKSPACE_USER` | `false` | `true` runs the room daemon's git as the workspace user instead of root and hands the room's files to that user on first use. A Pull from a local `file://` remote owned by another user is then refused by git's `safe.directory` check. Needs v0.1.7 or newer |
 | `MARKET_ENABLED` | `false` | See [Legion Market](#legion-market) |
 | `DOCKER_SOCKET` | `/var/run/docker.sock` | The socket the room daemon and MCP supervisor use |
 | `WORKSPACE_TMP_MB` | `512` | Size of `/tmp` in each room container |

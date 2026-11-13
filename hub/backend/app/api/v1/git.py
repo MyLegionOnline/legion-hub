@@ -26,22 +26,27 @@ import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from pydantic import BaseModel
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import case, func, or_, select, update
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.api import deps
+from app.core import remote_divergence
 from app.core import workspaced_client as wsd
+from app.core.divergence_review import DivergenceReviewError
 from app.core.events import emit_event
 from app.core.git_sync import (
     adopt_remote_repository,
     fetch_workspace_from_git,
+    import_pulled_services,
     push_workspace_to_git,
+    refresh_services_after_pull,
 )
 from app.core.userfiles_policy import apply_userfiles_policy
 from app.core.git_webhook import verify_git_webhook_signature
@@ -60,9 +65,11 @@ from app.core.secrets.runtime import binding_id_from_config, legacy_secret_value
 from app.core.secrets.service import SecretResourceAccessDenied
 from app.core.secrets.store import SecretAccessDenied, SecretUnavailable
 from app.models.secret import SecretPurpose, SecretResourceType
-from app.db.session import get_session
+from app.db.session import engine, get_session
 from app.models.goal import RoomGoal
+from app.models.message import Message
 from app.models.promotion import Promotion
+from app.models.remote_divergence import OPEN_REMOTE_DIVERGENCE, RemoteDivergence
 from app.models.room import Room, RoomUserLink
 from app.models.session.base import Session as SessionRow
 from app.models.task import Task, TaskState
@@ -155,7 +162,7 @@ class GitFlowOut(BaseModel):
 
 
 class GitGateOut(BaseModel):
-    kind: str        # goal_review | promotion
+    kind: str        # goal_review | promotion | remote_divergence
     id: str
     title: str
     branch: str
@@ -163,6 +170,8 @@ class GitGateOut(BaseModel):
     diff_stat: Optional[str] = None
     can_publish: bool = False
     pr_url: Optional[str] = None
+    state: Optional[str] = None
+    conflict_files: list[str] = []
 
 
 class GitStateOut(BaseModel):
@@ -294,6 +303,12 @@ async def build_git_state(room_id: UUID, db: AsyncSession) -> GitStateOut:
             RoomGoal.room_id == room_id,
             RoomGoal.review_state == "waiting_review",
         )
+    )).scalars().all()
+
+    remote_divergences = (await db.execute(
+        select(RemoteDivergence)
+        .where(RemoteDivergence.room_id == room_id, OPEN_REMOTE_DIVERGENCE)
+        .order_by(RemoteDivergence.branch)
     )).scalars().all()
 
     # ── Entity lookup dicts ───────────────────────────────────────────────
@@ -442,6 +457,16 @@ async def build_git_state(room_id: UUID, db: AsyncSession) -> GitStateOut:
             diff_stat=open_promo.diff_stat or None,
             can_publish=bool(gc.get("repo_url")),
             pr_url=open_promo.pr_url,
+        ))
+
+    for divergence in remote_divergences:
+        gates.append(GitGateOut(
+            kind="remote_divergence",
+            id=str(divergence.id),
+            title="Pull conflict",
+            branch=divergence.branch,
+            state=divergence.state,
+            conflict_files=divergence.conflict_files,
         ))
 
     # ── Connection ────────────────────────────────────────────────────────
@@ -713,6 +738,13 @@ async def git_webhook(
                 db,
                 source="remote_webhook",
             )
+        if result.get("conflict") and not result.get("userfiles_policy_conflict"):
+            await _record_pull_conflict(
+                room_id,
+                result,
+                {"remote_url": config.get("repo_url"), "branch": config.get("branch", "main")},
+                db,
+            )
         if not result.get("errors"):
             return {"ok": True, "synced": 1, "errors": []}
         return {
@@ -748,6 +780,12 @@ class GitSyncResponse(BaseModel):
     gitignore_autoresolved: bool = False
     # The local branch the remote was merged into.
     branch: Optional[str] = None
+    # Slugs of running workspace services restarted because the pull moved the
+    # checked-out commit (they would otherwise keep serving the old code).
+    services_restarted: list[str] = []
+    # Slugs of Browser services newly declared from the pulled
+    # .legion/services.json (they wait for the user's first start).
+    services_added: list[str] = []
     userfiles_policy_conflict: bool = False
     userfiles_tracked: list[str] = []
     userfiles_tracked_details: list[dict[str, Any]] = []
@@ -757,6 +795,85 @@ class GitSyncBody(BaseModel):
     # Per-branch Pull from the Git panel: fetch remote ``<branch>`` into the
     # local ``<branch>``. Omitted → the configured branch into working_branch.
     branch: Optional[str] = None
+
+
+async def _export_services_manifest(room_id: UUID, db: AsyncSession) -> None:
+    from app.core.workspace_lifecycle import _get_or_create_workspace
+    from app.core.workspace_services import services_enabled
+    from app.core.workspace_services_manifest import export_services_manifest
+
+    if not services_enabled():
+        return
+    try:
+        workspace = await _get_or_create_workspace(room_id, db)
+        await export_services_manifest(db, room_id, workspace.id)
+    except Exception:
+        logger.warning("services manifest export failed for room %s", room_id, exc_info=True)
+
+
+async def _record_pull_conflict(
+    room_id: UUID,
+    result: dict[str, Any],
+    metadata: dict[str, Any],
+    db: AsyncSession,
+) -> None:
+    branch = result.get("branch")
+    remote_ref = result.get("remote_ref")
+    local_sha = result.get("local_sha")
+    remote_sha = result.get("remote_sha")
+    if not (branch and remote_ref and local_sha and remote_sha):
+        # Older workspaced versions cannot identify the two tips for review.
+        await emit_event(
+            room_id=room_id,
+            event_type="GIT_CONFLICT",
+            content="Conflict during git fetch. Resolve it manually.",
+            db=db,
+            metadata=metadata,
+        )
+        return
+
+    new_id = uuid4()
+    statement = insert(RemoteDivergence).values(
+        id=new_id,
+        room_id=room_id,
+        branch=branch,
+        remote_ref=remote_ref,
+        local_sha=local_sha,
+        remote_sha=remote_sha,
+        conflict_files=result.get("conflict_files") or [],
+    )
+    incoming = statement.excluded
+    tips_changed = or_(
+        RemoteDivergence.remote_ref != incoming.remote_ref,
+        RemoteDivergence.local_sha != incoming.local_sha,
+        RemoteDivergence.remote_sha != incoming.remote_sha,
+    )
+    statement = statement.on_conflict_do_update(
+        index_elements=[RemoteDivergence.room_id, RemoteDivergence.branch],
+        index_where=OPEN_REMOTE_DIVERGENCE,
+        set_={
+            "remote_ref": incoming.remote_ref,
+            "local_sha": incoming.local_sha,
+            "remote_sha": incoming.remote_sha,
+            "conflict_files": incoming.conflict_files,
+            "state": case((tips_changed, "detected"), else_=RemoteDivergence.state),
+            "analysis": case((tips_changed, None), else_=RemoteDivergence.analysis),
+            "decision": case((tips_changed, None), else_=RemoteDivergence.decision),
+            "rework_task_id": case((tips_changed, None), else_=RemoteDivergence.rework_task_id),
+        },
+    ).returning(RemoteDivergence.id)
+    divergence_id = (await db.execute(statement)).scalar_one()
+    if divergence_id == new_id:
+        # emit_event commits the new conflict and its chat message together.
+        await emit_event(
+            room_id=room_id,
+            event_type="GIT_CONFLICT",
+            content="Pull hit a conflict — review it",
+            db=db,
+            metadata={**metadata, "branch": branch, "remote_divergence_id": str(divergence_id)},
+        )
+    else:
+        await db.commit()
 
 
 @router.post("/rooms/{room_id}/git/sync", response_model=GitSyncResponse)
@@ -770,10 +887,9 @@ async def git_sync(
     """
     Manually sync from the configured branch into the room.
 
-    A native ``git fetch`` + fast-forward merge on the workspace volume (one
-    operation, full history). On a non-fast-forward conflict a
-    ``GIT_CONFLICT`` event is emitted to the room chat so the user can
-    resolve manually.
+    Fetch and merge on the workspace volume. A conflicting Pull opens or
+    updates a review for the local branch. The first conflict in each review
+    emits a ``GIT_CONFLICT`` chat event.
 
     An optional body ``{"branch": "dev"}`` pulls that same-named branch from
     the remote into the local one instead — for when a branch was edited on
@@ -811,26 +927,28 @@ async def git_sync(
                 db,
                 source="remote_pull",
             )
-        if conflict:
-            try:
-                await emit_event(
-                    room_id=room_id,
-                    event_type="GIT_CONFLICT",
-                    content=(
-                        "Conflict during git fetch — the history diverges from remote, "
-                        "resolve it manually"
-                    ),
-                    db=db,
-                    metadata={
+        if not result.get("userfiles_policy_conflict"):
+            if conflict:
+                await _record_pull_conflict(
+                    room_id,
+                    result,
+                    {
                         "remote_url": room.git_config.get("repo_url"),
                         "branch": pull_branch or room.git_config.get("branch", "main"),
                     },
+                    db,
                 )
-            except Exception:
-                logger.warning(
-                    "git_sync: failed to emit GIT_CONFLICT for room %s",
-                    room_id, exc_info=True,
+            elif not result.get("errors") and result.get("synced") and result.get("branch"):
+                await db.execute(
+                    update(RemoteDivergence)
+                    .where(
+                        RemoteDivergence.room_id == room_id,
+                        RemoteDivergence.branch == result["branch"],
+                        OPEN_REMOTE_DIVERGENCE,
+                    )
+                    .values(state="resolved", resolved_at=func.now())
                 )
+                await db.commit()
         gitignore_autoresolved = bool(result.get("gitignore_autoresolved"))
         if gitignore_autoresolved:
             try:
@@ -851,6 +969,13 @@ async def git_sync(
                     "git_sync: failed to emit GITIGNORE_RECONCILED for room %s",
                     room_id, exc_info=True,
                 )
+        services_imported: dict[str, list[str]] = {}
+        services_restarted: list[str] = []
+        if not result.get("errors"):
+            services_imported, services_restarted = await refresh_services_after_pull(
+                room_id, db, current_user, source=f"git_pull:{current_user.id}",
+                head_changed=bool(result.get("head_changed")),
+            )
         return GitSyncResponse(
             ok=not result.get("errors"),
             synced=result.get("synced", 0),
@@ -858,12 +983,169 @@ async def git_sync(
             conflict=conflict,
             gitignore_autoresolved=gitignore_autoresolved,
             branch=result.get("branch"),
+            services_restarted=services_restarted,
+            services_added=services_imported.get("added", []),
             userfiles_policy_conflict=bool(result.get("userfiles_policy_conflict")),
             userfiles_tracked=result.get("userfiles_tracked") or [],
             userfiles_tracked_details=result.get("userfiles_tracked_details") or [],
         )
     finally:
         token_value = None
+
+
+# ── Pull conflict review ────────────────────────────────────────────────────
+
+class GitRemoteDivergenceOut(BaseModel):
+    id: UUID
+    room_id: UUID
+    branch: str
+    remote_ref: str
+    local_sha: str
+    remote_sha: str
+    conflict_files: list[str]
+    state: str
+    analysis: dict[str, Any] | None
+    report: dict[str, Any] | None
+    decision: str | None
+    rework_task_id: UUID | None
+    created_at: datetime
+    resolved_at: datetime | None
+
+
+class GitRemoteDivergenceReviewOut(BaseModel):
+    id: UUID
+    state: str
+
+
+class GitRemoteDivergenceResolveBody(BaseModel):
+    decision: str
+    note: str | None = None
+    agent_id: UUID | None = None
+
+
+async def _get_remote_divergence(
+    room_id: UUID, did: UUID, current_user: User, db: AsyncSession,
+) -> RemoteDivergence:
+    await _verify_membership(room_id, current_user, db)
+    row = (await db.execute(
+        select(RemoteDivergence).where(RemoteDivergence.room_id == room_id, RemoteDivergence.id == did)
+    )).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Pull conflict not found")
+    return row
+
+
+async def _remote_divergence_access_token(
+    room_id: UUID, current_user: User, request: Request, db: AsyncSession,
+) -> str | None:
+    room = await _get_room_with_git(room_id, db)
+    try:
+        token = await _resolve_git_access_token(room, current_user, request, db)
+    except (SecretAccessDenied, SecretResourceAccessDenied, SecretUnavailable):
+        raise HTTPException(status_code=403, detail="Git credential is unavailable") from None
+    return token.reveal() if token else None
+
+
+@router.get("/rooms/{room_id}/git/remote-divergence/{did}", response_model=GitRemoteDivergenceOut)
+async def get_remote_divergence(
+    room_id: UUID,
+    did: UUID,
+    db: AsyncSession = Depends(get_session),
+    current_user: User = Depends(deps.get_current_user),
+) -> GitRemoteDivergenceOut:
+    row = await _get_remote_divergence(room_id, did, current_user, db)
+    report = None
+    if row.analysis is not None:
+        metadata = Message.event_metadata
+        report = await db.scalar(
+            select(metadata["report"])
+            .where(
+                Message.room_id == room_id, Message.event_type == "REMOTE_DIVERGENCE_REVIEW",
+                metadata["remote_divergence_id"].as_string() == str(did),
+                metadata["remote_ref"].as_string() == row.remote_ref,
+                metadata["local_sha"].as_string() == row.local_sha,
+                metadata["remote_sha"].as_string() == row.remote_sha,
+            )
+            .order_by(Message.timestamp.desc())
+            .limit(1)
+        )
+    return GitRemoteDivergenceOut(**row.model_dump(), report=report or None)
+
+
+async def _run_remote_divergence_review(room_id: UUID, did: UUID, access_token: str | None) -> None:
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with sessions() as db:
+            await remote_divergence.run_remote_divergence_review(room_id, did, db, access_token=access_token)
+    except DivergenceReviewError:
+        logger.info("Pull conflict %s disappeared before its review completed", did)
+    except Exception:
+        logger.exception("Pull conflict review %s failed", did)
+
+
+@router.post(
+    "/rooms/{room_id}/git/remote-divergence/{did}/review",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=GitRemoteDivergenceReviewOut,
+)
+async def request_remote_divergence_review(
+    room_id: UUID,
+    did: UUID,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_session),
+    current_user: User = Depends(deps.get_current_user),
+) -> GitRemoteDivergenceReviewOut:
+    row = await _get_remote_divergence(room_id, did, current_user, db)
+    if row.state == "resolved":
+        raise HTTPException(status_code=409, detail="The conflict is already resolved.")
+    if row.state == "reviewing" or (row.state == "reviewed" and not remote_divergence.can_rereview(row)):
+        return GitRemoteDivergenceReviewOut(id=did, state=row.state)
+
+    access_token = None
+    if row.state == "stale":
+        access_token = await _remote_divergence_access_token(room_id, current_user, request, db)
+    await db.commit()
+    background_tasks.add_task(_run_remote_divergence_review, room_id, did, access_token)
+    return GitRemoteDivergenceReviewOut(id=did, state="reviewing")
+
+
+@router.post("/rooms/{room_id}/git/remote-divergence/{did}/resolve")
+async def resolve_remote_divergence(
+    room_id: UUID,
+    did: UUID,
+    request: Request,
+    body: GitRemoteDivergenceResolveBody,
+    db: AsyncSession = Depends(get_session),
+    current_user: User = Depends(deps.get_current_user),
+) -> dict[str, Any]:
+    row = await _get_remote_divergence(room_id, did, current_user, db)
+    if body.decision not in remote_divergence.DECISIONS:
+        raise HTTPException(status_code=422, detail="Unknown Pull conflict decision.")
+    if row.state not in {"reviewed", "resolved"}:
+        raise HTTPException(status_code=409, detail={
+            "code": "stale" if row.state == "stale" else "review_required",
+            "message": "Review the conflict first.",
+        })
+    access_token = None
+    if row.state == "reviewed":
+        access_token = await _remote_divergence_access_token(room_id, current_user, request, db)
+    try:
+        result = await remote_divergence.resolve_remote_divergence(
+            room_id, did, db, body.decision, note=body.note, agent_id=body.agent_id,
+            current_user=current_user, access_token=access_token,
+        )
+    except DivergenceReviewError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from None
+    if result.get("ok"):
+        return result
+
+    code = "resolution_failed"
+    if result.get("stale"):
+        code = "stale"
+    elif result.get("busy"):
+        code = "busy"
+    raise HTTPException(status_code=409, detail={"code": code, "message": result["detail"]})
 
 
 # ── POST /rooms/{room_id}/git/adopt ──────────────────────────────────────────
@@ -938,6 +1220,7 @@ async def git_adopt(
         )
 
     if result.get("adopted"):
+        await import_pulled_services(room_id, db, source=f"git_adopt:{current_user.id}")
         room.git_config = {
             **(room.git_config or {}),
             "adopted_at": datetime.now(timezone.utc).isoformat(),
@@ -1097,6 +1380,10 @@ async def git_push(
     except (SecretAccessDenied, SecretResourceAccessDenied, SecretUnavailable):
         raise HTTPException(status_code=403, detail="Git credential is unavailable") from None
     token_str = token_value.reveal() if token_value else None
+    # Bring .legion/services.json up to date first. It commits on the checked-out
+    # working branch, so it travels with this push when that branch is pushed
+    # and with the next promotion otherwise.
+    await _export_services_manifest(room_id, db)
     try:
         result = await push_workspace_to_git(
             room_id=room_id,

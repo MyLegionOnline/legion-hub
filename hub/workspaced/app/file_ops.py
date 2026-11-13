@@ -448,8 +448,12 @@ def write_file(
     path: str,
     content: str,
     commit_message: Optional[str] = None,
+    commit_only_path: bool = False,
 ) -> dict[str, Any]:
-    """Write content to the workspace volume. Returns {path, size, commit_sha}."""
+    """Write content to the workspace volume. Returns {path, size, commit_sha}.
+
+    ``commit_only_path`` commits just this file instead of the whole tree.
+    """
     from app.git_ops import git_commit, git_init, is_git_repo
 
     ensure_generation(room_id)
@@ -460,7 +464,10 @@ def write_file(
     if commit_message and not _is_userfiles_path(result["path"]):
         if not is_git_repo(room_id):
             git_init(room_id)
-        sha = git_commit(room_id, commit_message)
+        sha = git_commit(
+            room_id, commit_message,
+            only_path=result["path"].lstrip("/") if commit_only_path else None,
+        )
         result["commit_sha"] = sha
 
     result["generation"] = sync_generation(room_id)

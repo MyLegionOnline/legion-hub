@@ -92,6 +92,7 @@ HANDLED_TABLES: dict[str, tuple[str, str]] = {
     "room_variable": (ERASE, "room variables; go with the room"),
     "room_environment_unlock": (ERASE, "go with the room"),
     "promotion": (ERASE, "go with the room"),
+    "remote_divergence": (ERASE, "Pull conflict reviews; cascade with the room"),
     "task_interjection": (ERASE, "go with the task"),
     "user_agent_session": (ERASE, "agent conversation sessions; go with the room"),
     "user_cm_session": (ERASE, "Chat Master conversation sessions; go with the room"),

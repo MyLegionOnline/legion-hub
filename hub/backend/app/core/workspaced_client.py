@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Literal, Optional
 
 import httpx
 from app.core.secret_config import configured_secret
@@ -449,11 +449,15 @@ async def write_workspace_file(
     path: str,
     content: str,
     commit_message: Optional[str] = None,
+    *,
+    commit_only_path: bool = False,
 ) -> dict[str, Any]:
     path = normalize_workspace_path(path)
     body: dict[str, Any] = {"content": content}
     if commit_message:
         body["commit_message"] = commit_message
+    if commit_only_path:
+        body["commit_only_path"] = True
     async with _client() as c:
         r = await c.put(
             f"/workspaces/{room_id}/file",
@@ -704,14 +708,21 @@ async def merge_workspace_branch(
     message: Optional[str] = None,
     target: Optional[str] = None,
     theirs: bool = True,
+    *,
+    strategy: Literal["ours", "theirs", "legacy"] | None = "legacy",
+    expected_tips: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {"name": name}
     if message:
         body["message"] = message
     if target:
         body["target"] = target
-    if not theirs:
+    if strategy != "legacy":
+        body["strategy"] = strategy
+    elif not theirs:
         body["theirs"] = False
+    if expected_tips is not None:
+        body["expected_tips"] = expected_tips
     async with _client() as c:
         r = await c.post(f"/workspaces/{room_id}/merge", json=body)
         _raise_if_busy(r)
@@ -775,6 +786,37 @@ async def git_discard_branch_workspace(
         r = await c.post(
             f"/workspaces/{room_id}/git/discard-branch",
             json={"branch": branch},
+        )
+        _raise_if_busy(r)
+        r.raise_for_status()
+        return r.json()
+
+
+async def git_prepare_pull_rework_workspace(
+    room_id: str, task_branch: str, branch: str, remote_ref: str,
+    *, expected_tips: tuple[str, str], conflict_files: list[str],
+) -> dict[str, Any]:
+    async with _client() as c:
+        r = await c.post(f"/workspaces/{room_id}/git/prepare-pull-rework", json={
+            "task_branch": task_branch, "branch": branch, "remote_ref": remote_ref,
+            "expected_tips": expected_tips, "conflict_files": conflict_files,
+        })
+        _raise_if_busy(r)
+        r.raise_for_status()
+        return r.json()
+
+
+async def git_reset_branch_workspace(
+    room_id: str, branch: str, ref: str, *, expected_tips: tuple[str, str] | None = None,
+) -> dict[str, Any]:
+    """Move a local branch to a commit after workspaced saves a backup ref."""
+    body: dict[str, Any] = {"branch": branch, "ref": ref}
+    if expected_tips is not None:
+        body["expected_tips"] = expected_tips
+    async with _client() as c:
+        r = await c.post(
+            f"/workspaces/{room_id}/git/reset-branch",
+            json=body,
         )
         _raise_if_busy(r)
         r.raise_for_status()
@@ -882,20 +924,27 @@ async def git_fetch_workspace(
     branch: str = "main",
     token: Optional[str] = None,
     target_branch: Optional[str] = None,
+    *,
+    fetch_only: bool = False,
 ) -> dict[str, Any]:
     """Fetch ``branch`` from the remote and merge it into ``target_branch``.
 
     ``target_branch`` pins the landing branch (internal design notes §0.1) so a
     sync fired while a task session holds ``task/<id>`` checked out cannot land
     the remote on that task branch. None keeps the historic behaviour.
+    The response includes the fetched ref and SHA, the local tip, and
+    unresolved paths if the merge conflicts.
     """
     body: dict[str, Any] = {"remote_url": remote_url, "branch": branch}
     if token:
         body["token"] = token
     if target_branch:
         body["target_branch"] = target_branch
+    # A distinct route makes old workspaced versions fail safely. They must
+    # never silently run a normal Pull in place of a fetch-only recheck.
+    endpoint = "fetch-review" if fetch_only else "fetch"
     async with _client() as c:
-        r = await c.post(f"/workspaces/{room_id}/git/fetch", json=body)
+        r = await c.post(f"/workspaces/{room_id}/git/{endpoint}", json=body)
         _raise_if_busy(r)
         r.raise_for_status()
         return r.json()

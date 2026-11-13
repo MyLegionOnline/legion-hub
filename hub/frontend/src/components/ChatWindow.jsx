@@ -11,6 +11,9 @@ import { retryTaskRequest, describeInterruption, interruptionTitle } from './Tas
 import { GitFlowReviewCard, isGitFlowCheckpoint } from './GitFlowCards';
 import { startMcpOAuthPopup } from '../api/mcp';
 import { ConfirmDialog } from './ConfirmDialog';
+import { RemoteDivergenceCard } from './RemoteDivergenceCard';
+import { isPullConflictCard, pullConflictPushHint } from '../lib/remoteDivergence';
+import { useGitState } from '../context/GitStateContext';
 // Message senders, typing indicators and status chips identify an agent by
 // nickname; the slot resolves it against the directory published in App.jsx
 // and renders the uploaded avatar, falling back to the initials circle.
@@ -2289,6 +2292,20 @@ function Message({ msg, prevMsg, tokenMap, taskActions, onPlanAccepted, onPlanEd
       />
     );
   }
+  if (isPullConflictCard(msg.eventType, msg.metadata)) {
+    const focus = taskActions.pullConflictFocus;
+    return (
+      <RemoteDivergenceCard
+        msg={msg}
+        token={taskActions.token}
+        roomId={taskActions.roomId}
+        onDone={taskActions.onDone}
+        agents={taskActions.reworkAgents}
+        readOnly={taskActions.readOnly}
+        focus={focus?.gate.id === msg.metadata.remote_divergence_id ? focus : null}
+      />
+    );
+  }
   if (msg.eventType === 'PLAN_PROPOSED') {
     return (
       <PlanConfirmCard
@@ -3344,6 +3361,8 @@ const EVENT_ICONS = {
   DIVERGENCE_REVIEW_STARTED: <GitCompare size={11} style={{ color: '#fbbf24' }} />,
   DIVERGENCE_REVIEW:    <GitCompare size={11} style={{ color: '#fbbf24' }} />,
   DIVERGENCE_RESOLVED:  <GitCompare size={11} style={{ color: '#22c55e' }} />,
+  REMOTE_DIVERGENCE_REVIEW: <GitCompare size={11} style={{ color: '#fbbf24' }} />,
+  REMOTE_DIVERGENCE_RESOLVED: <GitCompare size={11} style={{ color: '#22c55e' }} />,
   // internal design notes Stage 4 — a seed .gitignore add/add conflict auto-reconciled.
   GITIGNORE_RECONCILED: <GitMerge size={11} style={{ color: 'var(--text-muted)' }} />,
   TASK_AUTO_MERGED:     <GitMerge size={11} style={{ color: '#22c55e' }} />,
@@ -3370,6 +3389,11 @@ const EVENT_ICONS = {
   AGENT_QUESTION_ANSWERED: <CheckCircle size={11} style={{ color: '#22c55e' }} />,
 };
 
+function RemoteDivergencePushHint({ metadata }) {
+  const { state } = useGitState();
+  return <span>· {pullConflictPushHint(metadata.branch, metadata.remote_ref, metadata.decision, state?.flow)}</span>;
+}
+
 function SystemEventLine({ msg, hideRetryHint }) {
   const icon = EVENT_ICONS[msg.eventType];
   const isStalled = msg.eventType === 'TASK_STALLED';
@@ -3378,7 +3402,8 @@ function SystemEventLine({ msg, hideRetryHint }) {
   const isImageFailed = msg.eventType === 'IMAGE_GENERATION_FAILED';
   const isWarn = ['PLAN_DECOMPOSITION_INCOMPLETE', 'TASKS_UNASSIGNED'].includes(msg.eventType);
   const isCicdError = ['CI_FAILED', 'GIT_CONFLICT'].includes(msg.eventType);
-  const isCicdOk = ['PROMOTED_TO_MAIN', 'CI_PASSED', 'TASK_AUTO_MERGED', 'GOAL_PROMOTED_TO_DEV'].includes(msg.eventType);
+  const isCicdOk = ['PROMOTED_TO_MAIN', 'CI_PASSED', 'TASK_AUTO_MERGED', 'GOAL_PROMOTED_TO_DEV',
+    'REMOTE_DIVERGENCE_RESOLVED'].includes(msg.eventType);
   const borderColor = isStalled ? 'rgba(249,115,22,0.4)'
     : isRetried ? 'rgba(167,139,250,0.35)'
     : isDispatchFailed || isImageFailed || isCicdError ? 'rgba(239,68,68,0.4)'
@@ -3401,6 +3426,9 @@ function SystemEventLine({ msg, hideRetryHint }) {
       >
         {icon}
         <span>{msg.content}</span>
+        {msg.eventType === 'REMOTE_DIVERGENCE_RESOLVED' && msg.metadata?.decision && (
+          <RemoteDivergencePushHint metadata={msg.metadata} />
+        )}
         {!hideRetryHint && (isStalled || isDispatchFailed) && (
           <span style={{ color: 'var(--text-muted)' }}>· Retry on the task board</span>
         )}
@@ -3425,6 +3453,8 @@ function buildGroupedMessages(rawMsgs, currentUserId) {
   // DIVERGENCE_RESOLVED for the same task follows.
   const divergenceLatest = new Map();
   const divergenceResolutions = new Map();
+  const pullConflictLatest = new Map();
+  const pullConflictResolutions = new Map();
   // Questions an external agent asked that the owner answered by typing.
   const questionsAnsweredInChat = new Set();
   for (const message of rawMsgs) {
@@ -3446,6 +3476,15 @@ function buildGroupedMessages(rawMsgs, currentUserId) {
     }
     if (eventType === 'DIVERGENCE_RESOLVED' && message.task_id) {
       divergenceResolutions.set(String(message.task_id), message.metadata || {});
+    }
+    const conflictId = message.metadata?.remote_divergence_id;
+    if (isPullConflictCard(eventType, message.metadata)) {
+      if (eventType === 'REMOTE_DIVERGENCE_REVIEW' || !pullConflictLatest.has(conflictId)) {
+        pullConflictLatest.set(conflictId, message.id);
+      }
+    }
+    if (eventType === 'REMOTE_DIVERGENCE_RESOLVED' && conflictId) {
+      pullConflictResolutions.set(conflictId, message.metadata);
     }
     if (!TASK_CHANGE_EVENT_TYPES.has(eventType) || eventType === 'TASK_CHANGE_PROPOSED') continue;
     const proposalId = message.metadata?.proposal_id;
@@ -3495,6 +3534,16 @@ function buildGroupedMessages(rawMsgs, currentUserId) {
       result.push(entry);
       continue;
     }
+    const conflictId = m.metadata?.remote_divergence_id;
+    if (isPullConflictCard(eventType, m.metadata)) {
+      if (pullConflictLatest.get(conflictId) !== m.id) continue;
+      const entry = toMsgEntry(m, currentUserId);
+      const resolution = pullConflictResolutions.get(conflictId);
+      if (resolution) entry.metadata = { ...entry.metadata, remote_divergence_resolution: resolution };
+      result.push(entry);
+      continue;
+    }
+    if (eventType === 'REMOTE_DIVERGENCE_RESOLVED' && pullConflictLatest.has(conflictId)) continue;
     if (eventType === 'DIVERGENCE_REVIEW') {
       if (m.task_id && divergenceLatest.get(String(m.task_id)) !== m.id) continue;
       const entry = toMsgEntry(m, currentUserId);
@@ -3760,7 +3809,7 @@ function decodeJwtSub(token) {
   try { return JSON.parse(atob(token.split('.')[1])).sub; } catch { return null; }
 }
 
-function RoomChat({ room, token, onDelete, onRoomStateChange, taskRefreshKey, onTaskEvent, onGoalEvent, onFileEvent, onConnectedChange, onAgentStatus, onAgentSessionClosed, onWorkspaceStatus, onWorkspaceServiceEvent, onRoomActivity, agentStatuses, onGitFlowEvent, onRoomClosed }) {
+function RoomChat({ room, token, pullConflictFocus, onDelete, onRoomStateChange, taskRefreshKey, onTaskEvent, onGoalEvent, onFileEvent, onConnectedChange, onAgentStatus, onAgentSessionClosed, onWorkspaceStatus, onWorkspaceServiceEvent, onRoomActivity, agentStatuses, onGitFlowEvent, onRoomClosed }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [draftAttachments, setDraftAttachments] = useState([]);
@@ -3787,6 +3836,8 @@ function RoomChat({ room, token, onDelete, onRoomStateChange, taskRefreshKey, on
   const [planningPhase, setPlanningPhase] = useState(null);
   const [mentions, setMentions] = useState([]);
   const [agentNames, setAgentNames] = useState({});
+  const [reworkAgents, setReworkAgents] = useState([]);
+  const { bumpWorkspace } = useGitState();
   const [sessionTokenMap, setSessionTokenMap] = useState({});
   const wsRef = useRef(null);
   const bottomRef = useRef(null);
@@ -4007,6 +4058,9 @@ function RoomChat({ room, token, onDelete, onRoomStateChange, taskRefreshKey, on
       (membersData.former_agents || []).forEach(a => { names[a.id] = `${a.name || a.id?.slice(0, 8)} (${NOT_IN_ROOM_LABEL})`; });
       (membersData.agents || []).forEach(a => { names[a.id] = a.name || a.id?.slice(0, 8); });
       setAgentNames(names);
+      const config = membersData.coordinator_config || {};
+      const masterId = config.agent_id || config.chat_master_agent_id || config.master_agent_id;
+      setReworkAgents((membersData.agents || []).filter(agent => agent.id !== masterId && !agent.is_master));
       const memberItems = [
         ...(membersData.agents || []).map(a => ({ type: 'user', name: a.name || a.id, label: a.is_master ? '· master' : '' })),
         ...(membersData.users || []).map(u => ({ type: 'user', name: u.name || u.id, label: '' })),
@@ -4593,11 +4647,52 @@ function RoomChat({ room, token, onDelete, onRoomStateChange, taskRefreshKey, on
             eventType === 'GOAL_BRANCH_PUBLISHED' ||
             eventType === 'GOAL_PROMOTED_TO_DEV' || eventType === 'GIT_CONFLICT' ||
             eventType === 'DIVERGENCE_REVIEW_STARTED' || eventType === 'DIVERGENCE_REVIEW' ||
-            eventType === 'DIVERGENCE_RESOLVED' ||
+            eventType === 'DIVERGENCE_RESOLVED' || eventType === 'REMOTE_DIVERGENCE_REVIEW' ||
+            eventType === 'REMOTE_DIVERGENCE_RESOLVED' ||
             eventType === 'CI_PASSED' || eventType === 'CI_FAILED' || eventType === 'CI_STATUS') {
           onGitFlowEvent?.();
         }
         if (eventType === 'DIVERGENCE_RESOLVED') { onTaskEvent?.(); onGoalEvent?.(); }
+        const conflictId = data.metadata?.remote_divergence_id;
+        if (isPullConflictCard(eventType, data.metadata)) {
+          setMessages(prev => {
+            const match = prev.find(message => message.metadata?.remote_divergence_id === conflictId &&
+              isPullConflictCard(message.eventType, message.metadata));
+            if (match && (match.id === data.id || eventType === 'GIT_CONFLICT')) return prev;
+            const entry = toMsgEntry(data, currentUserId);
+            const resolution = match?.metadata.remote_divergence_resolution ||
+              prev.find(message => message.eventType === 'REMOTE_DIVERGENCE_RESOLVED' &&
+                message.metadata?.remote_divergence_id === conflictId)?.metadata;
+            if (resolution) entry.metadata = { ...entry.metadata, remote_divergence_resolution: resolution };
+            return [...prev.filter(message => message !== match && !(message.eventType === 'REMOTE_DIVERGENCE_RESOLVED' &&
+              message.metadata?.remote_divergence_id === conflictId)), entry];
+          });
+          return;
+        }
+        if (eventType === 'REMOTE_DIVERGENCE_RESOLVED' && conflictId) {
+          bumpWorkspace();
+          onFileEventWrapped();
+          onTaskEvent?.();
+          onGoalEvent?.();
+          setMessages(prev => {
+            const hasCard = prev.some(message => message.metadata?.remote_divergence_id === conflictId &&
+              isPullConflictCard(message.eventType, message.metadata));
+            if (!hasCard) {
+              return prev.some(message => message.id === data.id) ? prev : [...prev, toMsgEntry(data, currentUserId)];
+            }
+            return prev.map(message => message.metadata?.remote_divergence_id === conflictId &&
+              isPullConflictCard(message.eventType, message.metadata)
+              ? { ...message, metadata: { ...message.metadata, remote_divergence_resolution: data.metadata } }
+              : message);
+          });
+          return;
+        }
+        if (eventType === 'TASK_CREATED' && conflictId) {
+          setMessages(prev => prev.map(message => message.metadata?.remote_divergence_id === conflictId &&
+            isPullConflictCard(message.eventType, message.metadata)
+            ? { ...message, metadata: { ...message.metadata, remote_rework_task_id: data.task_id } }
+            : message));
+        }
         // DIVERGENCE_REVIEW — durable interactive card, deduplicated by task id
         // (a reconnect replays the row; a re-review supersedes the old card).
         if (eventType === 'DIVERGENCE_REVIEW') {
@@ -5022,10 +5117,31 @@ function RoomChat({ room, token, onDelete, onRoomStateChange, taskRefreshKey, on
   const taskActions = useMemo(
     () => ({
       roomId: room.id, token, agentNames, onAttachmentDeleted, onDone: onTaskDone,
+      reworkAgents, pullConflictFocus,
       autoRetryByMessage, resolvedRetryMessages, autoRetryMax: room.auto_retry_max, readOnly,
     }),
-    [room.id, token, agentNames, onAttachmentDeleted, onTaskDone, autoRetryByMessage, resolvedRetryMessages, room.auto_retry_max, readOnly],
+    [room.id, token, agentNames, onAttachmentDeleted, onTaskDone, reworkAgents, pullConflictFocus,
+      autoRetryByMessage, resolvedRetryMessages, room.auto_retry_max, readOnly],
   );
+
+  // The conflict may predate the retained chat history.
+  const focusedGate = pullConflictFocus?.gate;
+  const focusedCardMissing = focusedGate && !messages.some(message =>
+    message.metadata?.remote_divergence_id === focusedGate.id && isPullConflictCard(message.eventType, message.metadata));
+  let chatMessages = messages;
+  if (focusedCardMissing) {
+    const resolution = messages.find(message => message.eventType === 'REMOTE_DIVERGENCE_RESOLVED' &&
+      message.metadata?.remote_divergence_id === focusedGate.id);
+    chatMessages = [...messages.filter(message => message !== resolution), {
+      id: `pull-conflict-${focusedGate.id}`,
+      type: 'system',
+      eventType: 'GIT_CONFLICT',
+      metadata: {
+        remote_divergence_id: focusedGate.id, branch: focusedGate.branch, conflict_files: focusedGate.conflict_files,
+        remote_divergence_resolution: resolution?.metadata,
+      },
+    }];
+  }
 
   return (
     <>
@@ -5041,7 +5157,7 @@ function RoomChat({ room, token, onDelete, onRoomStateChange, taskRefreshKey, on
       showHeader={false}
       token={token}
       readOnly={readOnly}
-      messages={messages}
+      messages={chatMessages}
       thinking={false}
       planningPhase={planningPhase}
       input={input}
@@ -5477,7 +5593,7 @@ function ChatLayout({
 }
 
 /* ─── Entry point ─── */
-export function ChatWindow({ room, token, onDelete, onRoomStateChange, taskRefreshKey, onTaskEvent, onGoalEvent, onFileEvent, onConnectedChange, onAgentStatus, onAgentSessionClosed, onWorkspaceStatus, onWorkspaceServiceEvent, onRoomActivity, agentStatuses, onGitFlowEvent, onRoomClosed }) {
+export function ChatWindow({ room, token, pullConflictFocus, onDelete, onRoomStateChange, taskRefreshKey, onTaskEvent, onGoalEvent, onFileEvent, onConnectedChange, onAgentStatus, onAgentSessionClosed, onWorkspaceStatus, onWorkspaceServiceEvent, onRoomActivity, agentStatuses, onGitFlowEvent, onRoomClosed }) {
   if (room.type === 'dm' && room.agent?.agent_type === 'internal') {
     return <InternalAgentChat room={room} token={token} />;
   }
@@ -5494,5 +5610,5 @@ export function ChatWindow({ room, token, onDelete, onRoomStateChange, taskRefre
     );
   }
 
-  return <RoomChat room={room} token={token} onDelete={onDelete} onRoomStateChange={onRoomStateChange} taskRefreshKey={taskRefreshKey} onTaskEvent={onTaskEvent} onGoalEvent={onGoalEvent} onFileEvent={onFileEvent} onConnectedChange={onConnectedChange} onAgentStatus={onAgentStatus} onAgentSessionClosed={onAgentSessionClosed} onWorkspaceStatus={onWorkspaceStatus} onWorkspaceServiceEvent={onWorkspaceServiceEvent} onRoomActivity={onRoomActivity} agentStatuses={agentStatuses} onGitFlowEvent={onGitFlowEvent} onRoomClosed={onRoomClosed} />;
+  return <RoomChat room={room} token={token} pullConflictFocus={pullConflictFocus} onDelete={onDelete} onRoomStateChange={onRoomStateChange} taskRefreshKey={taskRefreshKey} onTaskEvent={onTaskEvent} onGoalEvent={onGoalEvent} onFileEvent={onFileEvent} onConnectedChange={onConnectedChange} onAgentStatus={onAgentStatus} onAgentSessionClosed={onAgentSessionClosed} onWorkspaceStatus={onWorkspaceStatus} onWorkspaceServiceEvent={onWorkspaceServiceEvent} onRoomActivity={onRoomActivity} agentStatuses={agentStatuses} onGitFlowEvent={onGitFlowEvent} onRoomClosed={onRoomClosed} />;
 }

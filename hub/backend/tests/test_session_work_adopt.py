@@ -140,7 +140,9 @@ async def test_branch_without_commits_records_nothing(monkeypatch):
     commit.assert_awaited_once()  # bash-only work folded in before the check
     rename.assert_not_awaited()
     events.assert_not_awaited()
-    discard.assert_awaited_once_with(str(session.room_id), f"session/{session.id}")
+    discard.assert_awaited_once_with(
+        str(session.room_id), f"session/{session.id}", working_branch="dev"
+    )
     assert session_work.SNAPSHOT_WORK_BRANCH not in session.context_snapshot
 
 

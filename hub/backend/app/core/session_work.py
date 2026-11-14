@@ -410,7 +410,7 @@ async def _branch_has_work(room_id, base: str, branch: str) -> bool | None:
     return bool(str(stat).strip())
 
 
-async def _discard_empty_branch(session, db, room_id, branch: str) -> None:
+async def _discard_empty_branch(session, db, room_id, branch: str, working_branch: str) -> None:
     """Drop a ``session/<id>`` branch that ended up with no commits of its own.
 
     Such a branch is only ever created just-in-time before a tool that *could*
@@ -423,7 +423,9 @@ async def _discard_empty_branch(session, db, room_id, branch: str) -> None:
     from app.core import workspaced_client as wsd
 
     try:
-        res = await wsd.git_discard_branch_workspace(str(room_id), branch)
+        res = await wsd.git_discard_branch_workspace(
+            str(room_id), branch, working_branch=working_branch
+        )
         discarded = not isinstance(res, Mapping) or res.get("ok") is not False
     except Exception as exc:
         logger.warning(
@@ -504,7 +506,7 @@ async def adopt_session_branch_as_task(
         # ``None`` = the diff itself failed: the branch may well hold work, so
         # it is only dropped when git positively said it is empty.
         if has_work is False:
-            await _discard_empty_branch(session, db, room_id, branch)
+            await _discard_empty_branch(session, db, room_id, branch, cfg.working_branch)
         return None
 
     from app.core import workspaced_client as wsd

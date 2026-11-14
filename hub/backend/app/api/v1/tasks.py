@@ -2018,7 +2018,8 @@ async def promotion_preview(
         from app.core import workspaced_client as wsd
 
         resp = await wsd.git_diff_workspace(
-            str(room_id), from_ref=cfg.release_branch, to_ref=cfg.working_branch, stat=True
+            str(room_id), from_ref=cfg.release_branch, to_ref=cfg.working_branch, stat=True,
+            merge_base=True,
         )
         if isinstance(resp, dict):
             diff_stat = str(resp.get("diff", "") or "")
@@ -2040,27 +2041,36 @@ async def promotion_preview(
 @router.post("/{room_id}/promotions", response_model=PromotionOut)
 async def open_promotion_endpoint(
     room_id: UUID,
+    request: Request,
     db: AsyncSession = Depends(get_session),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
     """Open a Gate 2 promotion (``dev → main``) for human review.
 
-    409 when a promotion is already awaiting review or ``dev`` has nothing
-    ``main`` does not already have.
+    409 when a promotion is already awaiting review, the working branch has
+    nothing ``main`` does not already have, or a Pull has to come first (the
+    room's ``main`` diverged from the remote, or the working branch conflicts
+    with it).
     """
     await _verify_membership(room_id, current_user, db)
-    await _get_room(room_id, db)
+    room = await _get_room(room_id, db)
 
+    from app.core.git_forge import resolve_forge_token
     from app.core.room_git_flow import (
         PromotionAlreadyOpen,
         PromotionEmpty,
         PromotionError,
+        PromotionNeedsPull,
         open_promotion,
     )
 
+    # The remote `main` is fetched first (internal design notes Stage 5).
+    git_token = await resolve_forge_token(db, room, request=request)
     try:
-        promo = await open_promotion(str(room_id), db, initiated_by=current_user.id)
-    except (PromotionAlreadyOpen, PromotionEmpty) as exc:
+        promo = await open_promotion(
+            str(room_id), db, initiated_by=current_user.id, access_token=git_token
+        )
+    except (PromotionAlreadyOpen, PromotionEmpty, PromotionNeedsPull) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
     except PromotionError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from None
@@ -2101,15 +2111,19 @@ async def resolve_promotion_endpoint(
     if body.decision not in {"approve", "reject"}:
         raise HTTPException(status_code=422, detail="decision must be 'approve' or 'reject'")
 
-    # Stage 7: a PR-backed promotion is merged through the forge API on approve.
+    # Stage 7: a PR-backed promotion is merged through the forge API on approve;
+    # a local one first fetches `main` (internal design notes Stage 5).
     git_token: Optional[str] = None
-    if body.decision == "approve" and promo.pr_url:
+    if body.decision == "approve":
         room = await _get_room(room_id, db)
         from app.core.git_forge import resolve_forge_token
 
         git_token = await resolve_forge_token(db, room, request=request)
 
     from app.core.room_git_flow import resolve_promotion
+
+    # Read before the commit below expires the row.
+    from_branch, to_branch = promo.from_branch, promo.to_branch
 
     result = await resolve_promotion(
         str(room_id), promo, db,
@@ -2124,12 +2138,20 @@ async def resolve_promotion_endpoint(
     if result.get("blocked"):
         raise HTTPException(
             status_code=409,
-            detail=f"CI on dev is {result.get('ci_status')!r} — pass force=true to promote anyway",
+            detail=(
+                f"CI on {from_branch} is {result.get('ci_status')!r} — pass force=true "
+                "to promote anyway"
+            ),
         )
+    if result.get("needs_pull"):
+        raise HTTPException(status_code=409, detail=result.get("error"))
     if result.get("conflict"):
         raise HTTPException(
             status_code=409,
-            detail="dev → main did not merge cleanly — resolve the conflict manually (GIT_CONFLICT emitted)",
+            detail=(
+                f"{from_branch} → {to_branch} did not merge cleanly — resolve the "
+                "conflict manually (GIT_CONFLICT emitted)"
+            ),
         )
     if not result.get("ok"):
         raise HTTPException(status_code=502, detail=f"Promotion failed: {result.get('error')}")

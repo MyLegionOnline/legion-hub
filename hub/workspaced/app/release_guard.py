@@ -1,6 +1,6 @@
 """Keep ``main`` and release tags out of an agent's reach.
 
-workspaced is the only party that may move ``main`` (the ``dev → main``
+workspaced is the only party that may move ``main`` (the working branch → ``main``
 promotion, a restore, a Pull) — ``git_commit`` already refuses an agent's
 write there. An agent's bash runs git directly in the room container, though,
 and nothing stopped ``git checkout main && git commit`` or ``git push origin
@@ -30,12 +30,18 @@ from pathlib import Path
 from typing import Optional
 
 from app.git_exec import read_repo_file, write_repo_file
-from app.git_ops import _run, _serialized, _workspace_root
+from app.git_ops import (
+    _run,
+    _serialized,
+    _workspace_root,
+    valid_working_branch_name,
+    working_branch_of,
+)
 
 logger = logging.getLogger("workspaced.release_guard")
 
 TRUSTED_ENV = "LEGION_GIT_TRUSTED"
-_HOOK_MARKER = "# legion-ref-guard v1"
+_HOOK_MARKER = "# legion-ref-guard v2"
 
 _REFERENCE_TRANSACTION = f"""#!/bin/sh
 {_HOOK_MARKER} - installed by Legion; keeps main and release tags safe.
@@ -49,8 +55,8 @@ while read -r old new ref; do
   [ "$old" = "$new" ] && [ $deleting = 0 ] && continue
   case "$ref" in
     refs/heads/main)
-      echo "legion: branch 'main' moves only through the dev -> main promotion in Legion; agents never commit, merge or reset it." >&2
-      echo "legion: switch back to your task branch (git checkout task/<task id>, or dev) and commit there. To bring in changes from the remote repository, ask the user to press Pull on the Git tab." >&2
+      echo "legion: branch 'main' moves only through the promotion to main in Legion; agents never commit, merge or reset it." >&2
+      echo "legion: switch back to your task branch (git checkout task/<task id>, or the room's working branch: git config legion.workingBranch) and commit there. To bring in changes from the remote repository, ask the user to press Pull on the Git tab." >&2
       status=1
       ;;
     refs/tags/*)
@@ -73,7 +79,7 @@ status=0
 while read -r local_ref local_sha remote_ref remote_sha; do
   case "$remote_ref" in
     refs/heads/main)
-      echo "legion: 'main' is published only by the publish_for_deploy tool, after the dev -> main promotion. Do not push it with git." >&2
+      echo "legion: 'main' is published only by the publish_for_deploy tool, after the promotion to main. Do not push it with git." >&2
       status=1
       ;;
     refs/tags/*)
@@ -90,7 +96,6 @@ HOOKS = {"reference-transaction": _REFERENCE_TRANSACTION, "pre-push": _PRE_PUSH}
 #: ``v1.2.3`` with an optional pre-release suffix (``v1.2.3-rc.1``).
 RELEASE_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?$")
 RELEASE_BRANCH = "main"
-INTEGRATION_BRANCH = "dev"
 
 
 def _hook_current(root: Path, name: str, script: str) -> bool:
@@ -144,10 +149,17 @@ def _resolve(root: Path, rev: str) -> Optional[str]:
     return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
 
 
-def main_bypass_commits(room_id: str, exclude: Optional[list[str]] = None, limit: int = 20) -> dict:
+def main_bypass_commits(
+    room_id: str,
+    exclude: Optional[list[str]] = None,
+    limit: int = 20,
+    integration_branch: Optional[str] = None,
+) -> dict:
     """Commits on ``main`` that did not come through the promotion.
 
-    Every legitimate commit on ``main`` is either reachable from ``dev`` (the
+    Every legitimate commit on ``main`` is either reachable from the room's
+    integration branch (``integration_branch``; omitted → the one the repo
+    records, default ``dev``) (the
     promotion merges it in), already on the forge (a Pull brought it) or a
     merge commit (the promotion / Pull merge itself). What is left — a
     non-merge commit that only ``main`` has — was made on ``main`` directly:
@@ -161,8 +173,13 @@ def main_bypass_commits(room_id: str, exclude: Optional[list[str]] = None, limit
     if _resolve(root, f"refs/heads/{RELEASE_BRANCH}") is None:
         return {"ok": True, "commits": []}
     nots = [f"^{sha}" for sha in (_resolve(root, x) for x in (exclude or [])) if sha]
-    if _resolve(root, f"refs/heads/{INTEGRATION_BRANCH}"):
-        nots.append(f"^refs/heads/{INTEGRATION_BRANCH}")
+    integration = (
+        integration_branch
+        if valid_working_branch_name(integration_branch)
+        else working_branch_of(root)
+    )
+    if _resolve(root, f"refs/heads/{integration}"):
+        nots.append(f"^refs/heads/{integration}")
     fmt = "%H%x1f%s%x1f%an%x1f%aI"
     r = _run(
         ["log", "--no-merges", f"--max-count={max(1, min(limit, 200))}", f"--format={fmt}",
@@ -220,7 +237,7 @@ def check_release_tag(room_id: str, tag: str, ref: str = RELEASE_BRANCH) -> dict
     if on_main.returncode != 0:
         return {"ok": False, "code": "not_on_main",
                 "error": f"{sha[:10]} is not on '{RELEASE_BRANCH}'; release tags go on {RELEASE_BRANCH} "
-                         "only, after the dev -> main promotion"}
+                         "only, after the promotion to main"}
     existing = _resolve(root, f"refs/tags/{tag}")
     if existing is not None and existing != sha:
         return {"ok": False, "code": "tag_exists",

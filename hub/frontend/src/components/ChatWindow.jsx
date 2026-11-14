@@ -3379,6 +3379,9 @@ const EVENT_ICONS = {
   GOAL_REVIEW_REJECTED: <AlertTriangle size={11} style={{ color: '#f97316' }} />,
   GOAL_BRANCH_PUBLISHED: <ExternalLink size={11} style={{ color: '#06b6d4' }} />,
   GOAL_PROMOTED_TO_DEV: <GitMerge size={11} style={{ color: '#22c55e' }} />,
+  WORKING_BRANCH_RENAMED: <GitMerge size={11} style={{ color: '#06b6d4' }} />,
+  // internal design notes Stage 5 — a Pull has to come before publishing.
+  PROMOTION_NEEDS_PULL: <AlertTriangle size={11} style={{ color: '#f97316' }} />,
   // plan_session fallback: ChatMaster never called close_session, tasks were
   // created straight from the plan steps — worth a visible amber pill.
   PLAN_DECOMPOSITION_INCOMPLETE: <AlertTriangle size={11} style={{ color: '#f97316' }} />,
@@ -4648,7 +4651,8 @@ function RoomChat({ room, token, pullConflictFocus, onDelete, onRoomStateChange,
             eventType === 'GOAL_PROMOTED_TO_DEV' || eventType === 'GIT_CONFLICT' ||
             eventType === 'DIVERGENCE_REVIEW_STARTED' || eventType === 'DIVERGENCE_REVIEW' ||
             eventType === 'DIVERGENCE_RESOLVED' || eventType === 'REMOTE_DIVERGENCE_REVIEW' ||
-            eventType === 'REMOTE_DIVERGENCE_RESOLVED' ||
+            eventType === 'REMOTE_DIVERGENCE_RESOLVED' || eventType === 'WORKING_BRANCH_RENAMED' ||
+            eventType === 'PROMOTION_NEEDS_PULL' ||
             eventType === 'CI_PASSED' || eventType === 'CI_FAILED' || eventType === 'CI_STATUS') {
           onGitFlowEvent?.();
         }

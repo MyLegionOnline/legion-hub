@@ -518,8 +518,10 @@ export function GitLinkModal({ roomId, token, gitConfig, onClose, onConfigSaved,
           provider,
           repo_url: repoUrl,
           branch,
-          ...(accessBinding ? { access_token_secret_binding_id: accessBinding.id } : {}),
-          ...(webhookBinding ? { webhook_secret_binding_id: webhookBinding.id } : {}),
+          // The server merges this into the stored config, so an emptied
+          // selector has to say so explicitly with null.
+          access_token_secret_binding_id: accessBinding ? accessBinding.id : null,
+          webhook_secret_binding_id: webhookBinding ? webhookBinding.id : null,
         } }),
       });
       if (res.ok) {
@@ -613,7 +615,7 @@ export function GitLinkModal({ roomId, token, gitConfig, onClose, onConfigSaved,
       if (res.ok && data.ok) {
         setStatus({ type: 'ok', msg: `Pushed ${data.pushed} file(s) to git.` });
       } else if (res.ok && data.hint === 'sync_then_promote') {
-        setStatus({ type: 'err', msg: 'Push rejected — the remote branch has moved on. Pull from Git, promote dev → main, then push again (avoid force unless you mean to overwrite the remote).' });
+        setStatus({ type: 'err', msg: `Push rejected — the remote branch has moved on. Pull from Git, promote ${cfg.working_branch || 'dev'} → main, then push again (avoid force unless you mean to overwrite the remote).` });
       } else if (res.ok) {
         setStatus({ type: 'err', msg: `Push failed.${data.errors?.length ? ' ' + data.errors.slice(0, 2).join('; ') : ''}` });
       } else {

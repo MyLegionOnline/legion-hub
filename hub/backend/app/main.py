@@ -236,9 +236,9 @@ async def on_startup():
     logger.info("auth mode: %s", legion_auth.AUTH_MODE)
     from app.core.skill_legacy_migration import migrate_legacy_skill_ids
     await migrate_legacy_skill_ids(engine)
-    from app.core.room_git_flow import backfill_dev_branches, backfill_userfiles
+    from app.core.room_git_flow import backfill_base_branches, backfill_userfiles
     await backfill_userfiles(engine)
-    await backfill_dev_branches(engine)
+    await backfill_base_branches(engine)
     await _warm_reasoning_capabilities()
     from app.core.log_cleanup import run_cleanup_loop
     _cleanup_task = asyncio.create_task(run_cleanup_loop(engine))

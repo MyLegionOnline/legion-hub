@@ -843,7 +843,9 @@ async def update_room(
         db_obj.coordinator_config = room_in.coordinator_config
         flag_modified(db_obj, 'coordinator_config')
     if room_in.git_config is not None:
-        db_obj.git_config = room_in.git_config
+        from app.core.room_git_flow import merge_git_config
+
+        db_obj.git_config = merge_git_config(db_obj.git_config, room_in.git_config)
         flag_modified(db_obj, 'git_config')
     if room_in.vps_access_mode is not None:
         db_obj.vps_access_mode = room_in.vps_access_mode

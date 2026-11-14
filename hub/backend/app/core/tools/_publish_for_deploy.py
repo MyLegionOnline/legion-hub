@@ -76,11 +76,14 @@ class PublishForDeployTool(Tool):
                         ctx.db, room_id=ctx.room_id, session_id=ctx.session_id, commits=exc.commits
                     )
                     if not approved:
+                        from app.core.room_git_flow import room_working_branch
+
+                        working = await room_working_branch(ctx.room_id, ctx.db)
                         return (
                             f"Error: [main_needs_approval] {exc}, and the person did not approve "
                             "publishing them. Do not retry and do not commit to main yourself: put "
-                            "the change on your task branch so it reaches main through dev and "
-                            "the promotion"
+                            f"the change on your task branch so it reaches main through {working} "
+                            "and the promotion"
                         )
                     published = await _publish(False, allow_main_bypass=True)
                 elif exc.code == "deploy_needs_approval":

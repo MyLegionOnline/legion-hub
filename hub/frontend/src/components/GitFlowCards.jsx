@@ -146,7 +146,7 @@ export function RevertMergeButton({ roomId, taskId, token, onDone }) {
 
   const revert = async () => {
     if (busy) return;
-    if (!window.confirm('Revert this task\'s merge into dev? A revert commit will be created.')) return;
+    if (!window.confirm('Revert this task\'s merge into its base branch? A revert commit will be created.')) return;
     setBusy(true); setError(null);
     try {
       const res = await fetch(`${API}/api/v1/rooms/${roomId}/tasks/${taskId}/revert-merge`, {
@@ -216,6 +216,8 @@ export function isGitFlowCheckpoint(metadata) {
 export function GitFlowReviewCard({ msg, token, roomId, onDone }) {
   const metadata = msg.metadata || {};
   const isGoal = Boolean(metadata.goal_review);
+  // Older cards carry no target; the room's working branch was `dev` then.
+  const mergeTarget = metadata.target || 'dev';
   const promotionId = metadata.promotion_id;
   const goalId = metadata.goal_id;
   const taskTitles = Array.isArray(metadata.task_titles) ? metadata.task_titles : [];
@@ -376,7 +378,7 @@ export function GitFlowReviewCard({ msg, token, roomId, onDone }) {
             className="pl-7 text-[11px]"
             style={{ color: resolution === 'approved' ? '#22c55e' : resolution === 'conflict' ? '#f87171' : 'var(--text-muted)' }}
           >
-            {resolution === 'approved' && (isGoal ? '✓ Goal merged into dev' : '✓ Published to main')}
+            {resolution === 'approved' && (isGoal ? `✓ Goal merged into ${mergeTarget}` : '✓ Published to main')}
             {resolution === 'rejected' && '✗ Rejected'}
             {resolution === 'conflict' && '⚠ Merge conflict — resolve manually (see GIT_CONFLICT in the chat)'}
           </div>
@@ -444,7 +446,7 @@ export function GitFlowReviewCard({ msg, token, roomId, onDone }) {
                 onClick={() => handleResolve('approve')}
                 disabled={Boolean(pending) || approveBlocked}
               >
-                {isGoal ? '✓ Merge into dev' : '✓ Publish to main'}
+                {isGoal ? `✓ Merge into ${mergeTarget}` : '✓ Publish to main'}
               </button>
               <button
                 type="button"

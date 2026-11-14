@@ -193,6 +193,41 @@ or the storage quota are used up. The card then keeps its manual actions.
 **Resume** is refused after a stop on the prompt cap or the model's context
 limit, because the saved conversation is itself over the limit. Use **Retry**.
 
+## Room working branch
+
+Agents in a room never commit to `main`. Their work collects on the room's
+**working branch**, and reaches `main` only when you approve a publication on
+the Git tab. The working branch is called `dev` unless you rename it.
+
+Rename it when several people bring the same repository into their own rooms.
+Each room then publishes its own branch (for example `core`, `transport`,
+`frontend`) instead of all of them pushing to one shared `dev`. On the Git tab,
+hover the working branch and choose **Rename**. The new name:
+
+- uses ASCII letters, digits, `.`, `_`, `-` and `/`, is not `main` or `HEAD`,
+  does not start with `task/`, `goal/` or `session/`, and is not the name of
+  another branch in the room;
+- applies to everything that follows: task, goal and dialogue branches start
+  from it and merge back into it, the checks run on it, it is pushed under its
+  new name, and a publication merges it into `main`.
+
+The rename is refused while work is moving through the branch: a publication
+or a goal waiting for review, a running task, an open Pull conflict, or an
+agent answering in a dialogue. If the remote already has a branch with the new
+name, the Hub asks before using it, because your next push would go to that
+branch.
+
+The old branch stays on the remote; the Hub does not delete it. If your CI on
+GitHub (or another forge) lists branch names, add the new name, or trigger on
+every branch except `main` (`branches-ignore: [main]`). Branch protection rules
+that name the old branch do not follow the rename either.
+
+When another room has already published to `main`, the Hub first brings your
+local `main` up to date with the remote. If your working branch conflicts with
+the new `main`, the publication is not opened: the Git tab shows how many
+commits `main` on the remote has that your branch does not, with a **Pull**
+button. Pull, resolve the conflict, then publish again.
+
 ## Legion Market
 
 `MARKET_ENABLED=false` (the default) means this Hub never contacts Legion: the

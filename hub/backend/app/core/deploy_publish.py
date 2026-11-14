@@ -52,7 +52,7 @@ class DeployPublishError(Exception):
     ``deploy_publication_unverified``  the forge could not be asked; nothing is
                                    assumed in either direction.
     ``main_needs_approval``        ``main`` carries commits that skipped the
-                                   ``dev -> main`` promotion — a person has to say yes.
+                                   promotion to ``main`` — a person has to say yes.
     ``tag_*``                      a release tag that must not be created or pushed.
     """
 
@@ -209,10 +209,13 @@ async def unmerged_commits(room_id: UUID, branch: str, base: str) -> list[dict[s
 RELEASE_BRANCH = "main"
 
 
-async def main_bypass_commits(room_id: UUID, remote_sha: Optional[str]) -> list[dict[str, Any]]:
+async def main_bypass_commits(
+    room_id: UUID, remote_sha: Optional[str], working_branch: Optional[str] = None
+) -> list[dict[str, Any]]:
     """Commits a push of ``main`` would carry that did not come through the promotion.
 
-    Non-merge commits on ``main`` that neither ``dev`` nor the forge
+    Non-merge commits on ``main`` that neither the room's integration branch
+    (``working_branch``) nor the forge
     (``remote_sha``) has: an agent got round the room's guard hooks, or a
     person restored a file on ``main`` from the Git tab. Best effort (``[]``
     when workspaced cannot tell) — the hooks are the first line.
@@ -221,7 +224,9 @@ async def main_bypass_commits(room_id: UUID, remote_sha: Optional[str]) -> list[
 
     try:
         report = await wsd.git_main_bypass_workspace(
-            str(room_id), exclude=[remote_sha] if remote_sha else []
+            str(room_id),
+            exclude=[remote_sha] if remote_sha else [],
+            integration_branch=working_branch,
         )
     except Exception:
         logger.warning("deploy_publish: main bypass check failed for %s", room_id, exc_info=True)
@@ -353,7 +358,7 @@ async def ensure_published(
     of the publication branch raises ``deploy_needs_approval`` (with the
     commits) unless the caller has already got a person's yes — pushing it is
     harmless, but it is the first step of putting unreviewed work on a server.
-    ``main`` carrying commits that skipped the ``dev -> main`` promotion raises
+    ``main`` carrying commits that skipped the promotion to ``main`` raises
     ``main_needs_approval`` the same way (``allow_main_bypass`` is the yes).
     """
     from app.core import git_forge, vps_deploy_key
@@ -391,12 +396,20 @@ async def ensure_published(
         return PublishedCommit(local, branch, pushed=False, publication_branch=publication)
 
     if branch == RELEASE_BRANCH and not allow_main_bypass:
-        bypass = await main_bypass_commits(room_id, remote if state == "found" else None)
+        from types import SimpleNamespace
+
+        from app.core.room_git_flow import get_flow_config
+
+        bypass = await main_bypass_commits(
+            room_id,
+            remote if state == "found" else None,
+            get_flow_config(SimpleNamespace(git_config=git_config or {})).working_branch,
+        )
         if bypass:
             raise DeployPublishError(
                 "main_needs_approval",
                 f"'{branch}' carries {len(bypass)} commit(s) that did not come through the "
-                "dev -> main promotion",
+                "promotion to main",
                 commits=bypass,
             )
 
@@ -527,7 +540,7 @@ async def confirm_main_bypass_publish(
     lines = [
         f"An agent is about to publish '{RELEASE_BRANCH}' to the Room's repository, and "
         f"'{RELEASE_BRANCH}' has {len(commits)} commit(s) that did not come through the "
-        "dev -> main promotion:",
+        "promotion to main:",
         *_commit_lines(commits),
         "They were made on main directly — by an agent going round the rule, or by a restore "
         "from the Git tab.",
@@ -539,7 +552,7 @@ async def confirm_main_bypass_publish(
         header="Publish main",
         lines=lines,
         allow="Publish main with these commits. The permission is not saved.",
-        deny="Do not publish. The agent is told to bring the work in through dev and the promotion.",
+        deny="Do not publish. The agent is told to bring the work in through the working branch and the promotion.",
     )
 
 

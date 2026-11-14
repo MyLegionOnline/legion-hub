@@ -7,7 +7,8 @@ The room declares CI commands under a ``checks`` key in ``.legion/run.json``::
 ``run_checks`` executes them synchronously inside the room container (the
 container's own CPU / memory / disk limits already bound the blast radius)
 and returns a plain verdict. ``quick`` commands run at Gate 1 (task branch →
-``dev``); the full set runs at Gate 2 (``dev`` → ``main``).
+the room's working branch, ``dev`` by default); the full set runs at Gate 2
+(working branch → ``main``).
 """
 from __future__ import annotations
 

@@ -103,14 +103,15 @@ def test_ensure_base_branches_backfills_dev(isolated_repo):
     assert _branches(root) == {"main"}
 
     result = git_ops.ensure_base_branches(room_id)
-    assert result == {"ok": True, "created_dev": True}
+    assert result["ok"] is True and result["created_dev"] is True
+    assert result["working_branch"] == "dev"
     assert _branches(root) == {"main", "dev"}
     # HEAD untouched
     assert git_ops.git_current_branch(room_id) == "main"
 
     # idempotent
     again = git_ops.ensure_base_branches(room_id)
-    assert again == {"ok": True, "created_dev": False}
+    assert again["ok"] is True and again["created_dev"] is False
 
 
 def test_ensure_base_branches_no_repo(isolated_repo):

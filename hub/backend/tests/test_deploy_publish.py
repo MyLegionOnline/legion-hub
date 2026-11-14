@@ -124,7 +124,7 @@ class _World:
         async def unmerged(room_id, branch, base):
             return self.unmerged if branch != base else []
 
-        async def main_bypass(room_id, remote_sha):
+        async def main_bypass(room_id, remote_sha, working_branch=None):
             self.bypass_excluded.append(remote_sha)
             return self.bypass
 
@@ -631,3 +631,17 @@ def test_the_tool_is_offered_to_agents_only():
 
     tool = REGISTRY.get("publish_for_deploy")
     assert tool is not None and tool.roles == frozenset({"agent"}) and tool.mutating
+
+
+@pytest.mark.asyncio
+async def test_main_bypass_is_measured_against_the_room_working_branch():
+    # internal design notes Stage 1: a room working on
+    # `core` must not have its promoted commits flagged because `dev` is gone.
+    from unittest.mock import AsyncMock, patch
+
+    with patch(
+        "app.core.workspaced_client.git_main_bypass_workspace",
+        new=AsyncMock(return_value={"ok": True, "commits": []}),
+    ) as call:
+        assert await deploy_publish.main_bypass_commits(ROOM, "abc", "core") == []
+    call.assert_awaited_once_with(str(ROOM), exclude=["abc"], integration_branch="core")

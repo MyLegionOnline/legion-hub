@@ -159,6 +159,12 @@ class GitFlowOut(BaseModel):
     working_branch: str
     release_branch: str
     promote_policy: str
+    # internal design notes Stage 5 — against the last
+    # fetched remote `main` (a Pull or a publication fetches it; no network
+    # here): commits it has that the working branch / the local `main` lack.
+    # None when the room has no remote or never fetched `main`.
+    release_remote_ahead: Optional[int] = None
+    release_local_behind: Optional[int] = None
 
 
 class GitGateOut(BaseModel):
@@ -289,6 +295,10 @@ async def build_git_state(room_id: UUID, db: AsyncSession) -> GitStateOut:
             )
         except Exception:
             pass
+
+    release_remote: Optional[dict] = None
+    if gc.get("repo_url"):
+        release_remote = await wsd.git_release_remote_status(str(room_id), cfg.working_branch)
 
     # ── Open gates ────────────────────────────────────────────────────────
     open_promo: Optional[Promotion] = (await db.execute(
@@ -490,6 +500,8 @@ async def build_git_state(room_id: UUID, db: AsyncSession) -> GitStateOut:
             working_branch=cfg.working_branch,
             release_branch=cfg.release_branch,
             promote_policy=cfg.promote_policy,
+            release_remote_ahead=(release_remote or {}).get("working_behind"),
+            release_local_behind=(release_remote or {}).get("main_behind"),
         ),
         branches=roots,
         gates=gates,
@@ -1366,12 +1378,13 @@ async def git_push(
     push_branch = branch or (room.git_config or {}).get("branch") or "main"
 
     if not await _branch_has_content(room_id, push_branch):
+        working = get_flow_config(room).working_branch
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
                 f"Branch `{push_branch}` has no changes yet — pushing it would "
                 f"overwrite the remote with an empty tree. Promote "
-                f"dev → main first, or push `dev` if you only need a backup."
+                f"{working} → main first, or push `{working}` if you only need a backup."
             ),
         )
 
@@ -1439,6 +1452,87 @@ async def get_git_state(
 
 
 # ── DELETE /rooms/{room_id}/git/branch ───────────────────────────────────────
+
+class WorkingBranchRenameBody(BaseModel):
+    name: str
+    # The remote already has a branch of that name and the user agreed to use it.
+    confirm_remote_exists: bool = False
+
+
+class WorkingBranchRenameResponse(BaseModel):
+    ok: bool
+    changed: bool = False
+    from_branch: str
+    to_branch: str
+    remote_exists: bool = False
+    remote_checked: bool = False
+    head: Optional[str] = None
+    notes: list[str] = []
+
+
+@router.post(
+    "/rooms/{room_id}/git/working-branch/rename",
+    response_model=WorkingBranchRenameResponse,
+)
+async def rename_working_branch(
+    room_id: UUID,
+    body: WorkingBranchRenameBody,
+    request: Request,
+    db: AsyncSession = Depends(get_session),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    """Rename the room's working branch (internal design notes Stage 3).
+
+    ``git branch -m`` in the room repo, then ``git_config.working_branch``.
+    422 — a name that cannot be the working branch; 409 — work is moving
+    through the branch (``detail.blockers``), or a branch of that name exists
+    in the room. ``remote_exists=true`` with ``ok=false``: the remote already
+    has that branch and nothing was changed — repeat with
+    ``confirm_remote_exists`` to go ahead. The old branch on the remote stays.
+    """
+    from app.core import working_branch_rename as wbr
+
+    await _verify_membership(room_id, current_user, db)
+    room = await db.get(Room, room_id)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+
+    token_str: Optional[str] = None
+    if (room.git_config or {}).get("repo_url"):
+        try:
+            token_value = await _resolve_git_access_token(room, current_user, request, db)
+        except (SecretAccessDenied, SecretResourceAccessDenied, SecretUnavailable):
+            token_value = None  # the remote probe goes without; a public repo still answers
+        token_str = token_value.reveal() if token_value else None
+        token_value = None
+
+    try:
+        outcome = await wbr.rename_working_branch(
+            room_id,
+            body.name,
+            db,
+            access_token=token_str,
+            confirm_remote_exists=body.confirm_remote_exists,
+            user_id=current_user.id,
+        )
+    except wbr.RenameRefused as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail()) from None
+    except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+        raise _map_workspaced_error(exc) from None
+    finally:
+        token_str = None
+
+    return WorkingBranchRenameResponse(
+        ok=outcome.ok,
+        changed=outcome.changed,
+        from_branch=outcome.from_branch,
+        to_branch=outcome.to_branch,
+        remote_exists=outcome.remote_exists,
+        remote_checked=outcome.remote_checked,
+        head=outcome.head,
+        notes=outcome.notes,
+    )
+
 
 class GitDeleteBranchResponse(BaseModel):
     ok: bool
@@ -1509,7 +1603,9 @@ async def delete_git_branch(
         )
 
     try:
-        res = await wsd.git_discard_branch_workspace(str(room_id), branch)
+        res = await wsd.git_discard_branch_workspace(
+            str(room_id), branch, working_branch=cfg.working_branch
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("delete_git_branch: workspaced failed for %s: %s", branch, exc)
         raise HTTPException(status_code=502, detail=f"workspaced unavailable: {exc}") from None

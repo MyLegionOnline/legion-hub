@@ -543,16 +543,84 @@ async def set_git_author(room_id: str, name: Optional[str], email: Optional[str]
         return r.json()
 
 
-async def ensure_base_branches(room_id: str) -> dict[str, Any]:
-    """Guarantee the room repo has both `main` and `dev` (idempotent).
+async def ensure_base_branches(room_id: str, working_branch: str) -> dict[str, Any]:
+    """Guarantee the room repo has `main` and ``working_branch`` (idempotent),
+    and record ``working_branch`` as the repo's integration branch.
 
     Backfill for repos created before internal design notes Stage 0; a fresh
-    ``git_init`` already creates both.
+    ``git_init`` already creates both. ``error="working branch mismatch"``:
+    the repo works on another branch that has commits — nothing was changed.
     """
     async with _client() as c:
-        r = await c.post(f"/workspaces/{room_id}/git/ensure-base-branches")
+        r = await c.post(
+            f"/workspaces/{room_id}/git/ensure-base-branches",
+            json={"working_branch": working_branch},
+        )
         r.raise_for_status()
         return r.json()
+
+
+async def rename_working_branch(room_id: str, from_branch: str, to_branch: str) -> dict[str, Any]:
+    """``git branch -m from_branch to_branch`` under the room lock and record
+    ``to_branch`` as the repo's integration branch (a room without a repo gets
+    one on the new name). ``code``: ``invalid_name`` / ``branch_exists``;
+    ``busy``: the room lock was held."""
+    async with _client() as c:
+        r = await c.post(
+            f"/workspaces/{room_id}/git/rename-working-branch",
+            json={"from_branch": from_branch, "to_branch": to_branch},
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+async def remote_branch_exists(
+    room_id: str, remote_url: str, branch: str, token: str | None = None
+) -> dict[str, Any]:
+    """``{ok, exists, error}`` — whether the remote has ``refs/heads/<branch>``."""
+    async with _client() as c:
+        r = await c.post(
+            f"/workspaces/{room_id}/git/remote-branch-exists",
+            json={"remote_url": remote_url, "branch": branch, "token": token},
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+async def git_catch_up_release(
+    room_id: str, remote_url: str, token: str | None = None
+) -> dict[str, Any]:
+    """Fast-forward the room's ``main`` to the remote's ``main`` (never a merge).
+
+    ``{ok, state, local_sha, main_sha, remote_sha, error}``; ``state`` is one of
+    ``up_to_date`` / ``fast_forwarded`` / ``ahead`` / ``diverged`` /
+    ``userfiles_conflict`` / ``no_local_main`` / ``fetch_failed`` / ``ff_failed``.
+    Raises ``WorkspaceGitBusyError`` when the room lock was held.
+    """
+    body: dict[str, Any] = {"remote_url": remote_url}
+    if token:
+        body["token"] = token
+    async with _client() as c:
+        r = await c.post(f"/workspaces/{room_id}/git/catch-up-release", json=body)
+        _raise_if_busy(r)
+        r.raise_for_status()
+        return r.json()
+
+
+async def git_release_remote_status(room_id: str, working_branch: str) -> dict[str, Any] | None:
+    """``{remote_sha, main_behind, working_behind}`` against the last fetched
+    remote ``main`` — no network. ``None`` when unknown or on any error."""
+    try:
+        async with _client() as c:
+            r = await c.get(
+                f"/workspaces/{room_id}/git/release-remote-status",
+                params={"working_branch": working_branch},
+            )
+            r.raise_for_status()
+            data = r.json()
+            return data if data.get("ok") else None
+    except Exception:
+        return None
 
 
 async def backfill_local_excludes(room_id: str) -> dict[str, Any]:
@@ -656,7 +724,7 @@ async def git_revert_commit_workspace(
     mainline: int = 1,
 ) -> dict[str, Any]:
     """internal design notes Stage 3 — revert a ``trivial`` auto-merge commit
-    on ``target`` (``dev`` by default) with a fresh revert commit."""
+    on ``target`` (the room's integration branch by default) with a fresh revert commit."""
     body: dict[str, Any] = {"sha": sha, "mainline": mainline}
     if target:
         body["target"] = target
@@ -780,12 +848,21 @@ async def git_divergence_workspace(
 async def git_discard_branch_workspace(
     room_id: str,
     branch: str,
+    *,
+    working_branch: Optional[str] = None,
 ) -> dict[str, Any]:
-    """internal design notes Stage 2 — tag-backup then delete ``branch``."""
+    """internal design notes Stage 2 — tag-backup then delete ``branch``.
+
+    ``working_branch`` (the room's integration branch) is never deleted and is
+    where the tree steps to when ``branch`` is checked out; omitted →
+    the one the repo records."""
+    body: dict[str, Any] = {"branch": branch}
+    if working_branch:
+        body["working_branch"] = working_branch
     async with _client() as c:
         r = await c.post(
             f"/workspaces/{room_id}/git/discard-branch",
-            json={"branch": branch},
+            json=body,
         )
         _raise_if_busy(r)
         r.raise_for_status()
@@ -867,14 +944,22 @@ async def git_push_workspace(
 
 
 async def git_main_bypass_workspace(
-    room_id: str, exclude: Optional[list[str]] = None, limit: int = 20
+    room_id: str,
+    exclude: Optional[list[str]] = None,
+    limit: int = 20,
+    *,
+    integration_branch: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Non-merge commits on ``main`` that neither ``dev`` nor ``exclude`` (the
-    forge's ``main`` head) has — work that skipped the promotion. Pure read."""
+    """Non-merge commits on ``main`` that neither the integration branch nor
+    ``exclude`` (the forge's ``main`` head) has — work that skipped the
+    promotion. Pure read."""
+    body: dict[str, Any] = {"exclude": list(exclude or []), "limit": limit}
+    if integration_branch:
+        body["integration_branch"] = integration_branch
     async with _client() as c:
         r = await c.post(
             f"/workspaces/{room_id}/git/main-bypass",
-            json={"exclude": list(exclude or []), "limit": limit},
+            json=body,
         )
         r.raise_for_status()
         return r.json()
@@ -997,7 +1082,8 @@ async def git_adopt_workspace(
     remote_url: str,
     branch: str = "main",
     token: Optional[str] = None,
-    working_branch: str = "dev",
+    *,
+    working_branch: str,
     force: bool = False,
 ) -> dict[str, Any]:
     """internal design notes §3 — adopt an external repo as the room base.
@@ -1023,7 +1109,7 @@ async def git_adopt_workspace(
 
 
 async def git_ensure_shared_gitignore(
-    room_id: str, integration_branch: str = "dev"
+    room_id: str, integration_branch: str
 ) -> dict[str, Any]:
     """internal design notes Stage 2 — commit a shared ``.gitignore`` on
     ``integration_branch`` once, for a repo Legion itself publishes (greenfield

@@ -3,7 +3,7 @@
 Covers ``room_git_flow``:
   * ``get_flow_config`` defaults, overrides, and clamping of bad values;
   * ``ensure_base_branches`` delegates to ``workspaced``;
-  * ``backfill_dev_branches`` only touches rooms that already have a repo bound.
+  * ``backfill_base_branches`` only touches rooms that already have a repo bound.
 """
 from __future__ import annotations
 
@@ -64,8 +64,8 @@ async def test_ensure_base_branches_delegates_to_workspaced():
     with patch("app.core.workspaced_client.ensure_base_branches", new=AsyncMock(
         return_value={"ok": True, "created_dev": True},
     )) as mock:
-        out = await room_git_flow.ensure_base_branches("room-123")
-    mock.assert_awaited_once_with("room-123")
+        out = await room_git_flow.ensure_base_branches("room-123", "core")
+    mock.assert_awaited_once_with("room-123", "core")
     assert out == {"ok": True, "created_dev": True}
 
 
@@ -79,7 +79,7 @@ async def test_backfill_local_excludes_delegates_to_workspaced():
     assert out == {"ok": True, "updated": True}
 
 
-# ── backfill_dev_branches ───────────────────────────────────────────────────
+# ── backfill_base_branches ──────────────────────────────────────────────────
 
 class _FakeResult:
     def __init__(self, rows):
@@ -107,6 +107,7 @@ class _FakeSession:
 async def test_backfill_only_touches_rooms_with_repo(monkeypatch):
     rows = [
         ("room-with-repo", {"repo_url": "https://github.com/o/r"}),
+        ("room-core", {"repo_url": "https://github.com/o/r", "working_branch": "core"}),
         ("room-no-repo", {}),
         ("room-null-config", None),
     ]
@@ -115,11 +116,11 @@ async def test_backfill_only_touches_rooms_with_repo(monkeypatch):
         lambda *a, **k: (lambda: _FakeSession(rows)),
     )
 
-    seen: list[str] = []
+    seen: list[tuple[str, str]] = []
     excludes_seen: list[str] = []
 
-    async def _fake_ensure(room_id):
-        seen.append(str(room_id))
+    async def _fake_ensure(room_id, working_branch):
+        seen.append((str(room_id), working_branch))
         return {"ok": True, "created_dev": True}
 
     async def _fake_excludes(room_id):
@@ -129,8 +130,9 @@ async def test_backfill_only_touches_rooms_with_repo(monkeypatch):
     monkeypatch.setattr(room_git_flow, "ensure_base_branches", _fake_ensure)
     monkeypatch.setattr(room_git_flow, "backfill_local_excludes", _fake_excludes)
 
-    await room_git_flow.backfill_dev_branches(engine=object())
+    await room_git_flow.backfill_base_branches(engine=object())
 
-    assert seen == ["room-with-repo"]
+    # Each room gets its own working branch, never a hard-coded `dev`.
+    assert seen == [("room-with-repo", "dev"), ("room-core", "core")]
     # internal design notes §3.2 — local excludes are backfilled in the same pass.
-    assert excludes_seen == ["room-with-repo"]
+    assert excludes_seen == ["room-with-repo", "room-core"]

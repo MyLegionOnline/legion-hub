@@ -138,11 +138,14 @@ class EditFileTool(Tool):
                 str(ctx.room_id), boundary_path, new_content, commit_message=commit_msg
             )
         except wsd.WorkspaceMainProtectedError:
+            from app.core.room_git_flow import room_working_branch
             from app.core.tools._write_file import main_protected_error
 
             # The edit is on disk; only the commit was refused.
             mark_read(str(ctx.session_id), path, fingerprint(new_content))
-            return main_protected_error(path, ctx.task_id)
+            return main_protected_error(
+                path, ctx.task_id, await room_working_branch(ctx.room_id, ctx.db)
+            )
         mark_read(str(ctx.session_id), path, fingerprint(new_content))
         try:
             from app.core.context_observations import invalidate_path

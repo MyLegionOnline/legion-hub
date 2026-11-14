@@ -25,7 +25,7 @@ from app.core.events import emit_event
 from app.core.git_sync import _clone_url, refresh_services_after_pull
 from app.core.room_coordinator import get_cm_agent_id
 from app.core.room_git_flow import (
-    DEFAULT_WORKING_BRANCH, GOAL_BRANCH_PREFIX, _load_room, get_flow_config, task_branch_name,
+    GOAL_BRANCH_PREFIX, _load_room, get_flow_config, task_branch_name,
 )
 from app.core.room_members import agent_in_room
 from app.db.release import release_db
@@ -227,9 +227,15 @@ async def run_remote_divergence_review(
     await db.commit()
 
     report: dict = {}
+    # The room's own rules apply even when the review fails before it loads
+    # the room again below: the working branch may not be called `dev`.
     decisions = _DIRECT_DECISIONS
-    if branch == DEFAULT_WORKING_BRANCH or branch.startswith(GOAL_BRANCH_PREFIX):
-        decisions = DECISIONS
+    try:
+        early_room = await _load_room(room_id, db)
+        if early_room is not None:
+            decisions = _allowed_decisions(early_room, branch)
+    except Exception:
+        logger.debug("remote divergence: room %s not loaded for decisions", room_id, exc_info=True)
     stale = False
     try:
         async with asyncio.timeout(180):

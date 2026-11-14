@@ -83,6 +83,7 @@ import re
 import time
 from datetime import datetime, timezone
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Mapping
 from uuid import UUID
 
@@ -130,6 +131,45 @@ class FlowConfig:
     promote_policy: str
     direct_session_mode: str = DEFAULT_DIRECT_SESSION_MODE
     direct_session_auto_merge: str = DEFAULT_DIRECT_SESSION_AUTO_MERGE
+
+
+# internal design notes Stage 0 — keys only the server
+# writes. A client ``PUT /rooms/{id}`` cannot set or clear them: they record what
+# happened to the repo (adopted, first pushed), or — ``working_branch`` — must
+# move together with the repo (Stage 3: ``POST .../git/working-branch/rename``).
+SERVER_OWNED_GIT_KEYS = frozenset({"adopted_at", "first_pushed_at", "working_branch"})
+# Markers of the bound repository: a different ``repo_url`` is a new repo, so
+# they no longer hold and the new one is adopted afresh.
+_REPO_BOUND_GIT_KEYS = ("adopted_at", "first_pushed_at")
+
+
+def merge_git_config(
+    current: "Mapping[str, Any] | None", update: "Mapping[str, Any]"
+) -> dict[str, Any]:
+    """Fold a client ``git_config`` update into the stored one.
+
+    The settings form sends only the fields it edits; replacing the whole
+    mapping used to drop the flow settings (``working_branch``,
+    ``ci_provider``, …) and the ``adopted_at`` marker on every save. Here a key
+    in ``update`` overrides, a ``None`` value removes the key, keys absent from
+    ``update`` are kept, and :data:`SERVER_OWNED_GIT_KEYS` are never taken from
+    the client. A changed ``repo_url`` drops the markers of the old repository.
+    """
+    old = dict(current) if isinstance(current, Mapping) else {}
+    merged = dict(old)
+    for key, value in update.items():
+        if key in SERVER_OWNED_GIT_KEYS:
+            continue
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+    old_url = str(old.get("repo_url") or "").strip()
+    new_url = str(merged.get("repo_url") or "").strip()
+    if old_url != new_url:
+        for key in _REPO_BOUND_GIT_KEYS:
+            merged.pop(key, None)
+    return merged
 
 
 def get_flow_config(room: Any) -> FlowConfig:
@@ -185,15 +225,16 @@ def get_flow_config(room: Any) -> FlowConfig:
 
 # ── Base branches ────────────────────────────────────────────────────────────
 
-async def ensure_base_branches(room_id: "UUID | str") -> dict[str, Any]:
-    """Guarantee the room repo has both ``main`` and ``dev`` (idempotent).
+async def ensure_base_branches(room_id: "UUID | str", working_branch: str) -> dict[str, Any]:
+    """Guarantee the room repo has ``main`` and ``working_branch`` (idempotent)
+    and record ``working_branch`` as its integration branch in workspaced.
 
     Thin wrapper over ``workspaced``; safe to call whether or not the repo
     already has the branches. Never changes HEAD.
     """
     from app.core import workspaced_client as wsd
 
-    return await wsd.ensure_base_branches(str(room_id))
+    return await wsd.ensure_base_branches(str(room_id), working_branch)
 
 
 def is_non_fast_forward(errors: "list[str]") -> bool:
@@ -294,11 +335,14 @@ async def backfill_userfiles(engine) -> None:
         logger.info("backfill_userfiles: ensured private directory for %d room(s)", created_or_ready)
 
 
-async def backfill_dev_branches(engine) -> None:
+async def backfill_base_branches(engine) -> None:
     """Startup backfill for every room that already has a repo bound:
 
-    * create ``dev`` for repos whose ``git_init`` predates internal design notes
-      Stage 0;
+    * create the room's ``working_branch`` for repos whose ``git_init``
+      predates internal design notes Stage 0, and record its name in
+      the repo so workspaced's own fallbacks (parking a dirty ``main``,
+      stepping off a discarded branch) land on it — the Hub's
+      ``git_config.working_branch`` stays the source of truth;
     * write the local excludes (project ignores + ``.legion/git.lock``) into
       ``.git/info/exclude`` for repos that predate internal design notes
       Stage 1 — done in the same pass (internal design notes §3.2).
@@ -317,38 +361,44 @@ async def backfill_dev_branches(engine) -> None:
         async with maker() as db:
             rows = (await db.execute(select(Room.id, Room.git_config))).all()
     except Exception:
-        logger.exception("backfill_dev_branches: could not list rooms")
+        logger.exception("backfill_base_branches: could not list rooms")
         return
 
-    room_ids = [
-        rid
+    rooms = [
+        (rid, get_flow_config(SimpleNamespace(git_config=git_config)).working_branch)
         for (rid, git_config) in rows
         if isinstance(git_config, Mapping) and git_config.get("repo_url")
     ]
 
     created = 0
     excludes_updated = 0
-    for rid in room_ids:
+    for rid, working_branch in rooms:
         try:
-            result = await ensure_base_branches(rid)
+            result = await ensure_base_branches(rid, working_branch)
             if result.get("created_dev"):
                 created += 1
+            elif result.get("error") == "working branch mismatch":
+                logger.warning(
+                    "backfill_base_branches: room %s works on %s, the Hub names %s; "
+                    "left as is",
+                    rid, result.get("working_branch"), working_branch,
+                )
         except Exception as exc:
-            logger.warning("backfill_dev_branches: room %s skipped: %s", rid, exc)
+            logger.warning("backfill_base_branches: room %s skipped: %s", rid, exc)
         try:
             ex = await backfill_local_excludes(rid)
             if ex.get("updated"):
                 excludes_updated += 1
         except Exception as exc:
             logger.warning(
-                "backfill_dev_branches: room %s local-excludes skipped: %s", rid, exc
+                "backfill_base_branches: room %s local-excludes skipped: %s", rid, exc
             )
 
     if created:
-        logger.info("backfill_dev_branches: created `dev` for %d room(s)", created)
+        logger.info("backfill_base_branches: created the working branch for %d room(s)", created)
     if excludes_updated:
         logger.info(
-            "backfill_dev_branches: backfilled local excludes for %d room(s)",
+            "backfill_base_branches: backfilled local excludes for %d room(s)",
             excludes_updated,
         )
 
@@ -394,6 +444,19 @@ async def _working_branch(room_id: "UUID | str", db) -> str:
         await db.execute(select(Room).where(Room.id == room_id))
     ).scalar_one_or_none()
     return get_flow_config(room).working_branch if room is not None else DEFAULT_WORKING_BRANCH
+
+
+async def room_working_branch(room_id: "UUID | str", db) -> str:
+    """The room's working branch for text shown to an agent or a person.
+
+    Never raises: a lookup failure falls back to the default name, so a
+    message is never lost over a wording detail.
+    """
+    try:
+        return await _working_branch(room_id, db)
+    except Exception:
+        logger.debug("room_working_branch: lookup failed for room %s", room_id, exc_info=True)
+        return DEFAULT_WORKING_BRANCH
 
 
 async def _load_room(room_id: "UUID | str", db):
@@ -1317,7 +1380,7 @@ async def finalize_task_gate1(
         )
         return result
 
-    # Fold the branch into its base (`dev` or the goal branch) — never `main`.
+    # Fold the branch into its base (the working branch or the goal branch) — never `main`.
     # GIT_CONFLICT is emitted by merge_task_branch itself.
     merge_result: dict[str, Any] = {}
     try:
@@ -1372,7 +1435,7 @@ async def finalize_task_gate1(
     await emit_event(
         room_id=rid,
         event_type="TASK_AUTO_MERGED",
-        content=f"Task auto-merged into dev ({risk}): {title}",
+        content=f"Task auto-merged into {merge_result.get('target') or 'the working branch'} ({risk}): {title}",
         db=db,
         task_id=task.id,
         sender_type=sender_type,
@@ -1461,6 +1524,142 @@ class PromotionEmpty(PromotionError):
 
 class PromotionAlreadyOpen(PromotionError):
     """A ``waiting_review`` promotion already exists for the room (409)."""
+
+
+class PromotionNeedsPull(PromotionError):
+    """The publication would not go through until the user Pulls (409).
+
+    ``reason``: ``main_diverged`` — the room's ``main`` and the remote's both
+    have their own commits, so the merged ``main`` could not be pushed;
+    ``conflict`` — the working branch conflicts with the current ``main``
+    (another room published first). ``conflict_files`` names the paths."""
+
+    def __init__(self, message: str, *, reason: str, conflict_files: list[str] | None = None):
+        super().__init__(message)
+        self.reason = reason
+        self.conflict_files = list(conflict_files or [])
+
+
+# internal design notes Stage 5 — several rooms (one
+# working branch each) publish into one remote ``main``.
+PROMOTION_NEEDS_PULL_EVENT = "PROMOTION_NEEDS_PULL"
+_NEEDS_PULL_FILES_CAP = 20
+
+
+async def catch_up_release_branch(
+    room_id: "UUID | str", room, db, access_token: str | None = None
+) -> dict[str, Any]:
+    """Fast-forward the room's ``main`` to the remote's before a publication.
+
+    Another room may have published into the shared remote ``main`` since this
+    room last fetched it; merging the working branch into a stale ``main``
+    would give a ``main`` that cannot be pushed. Best-effort: no remote, a
+    failed fetch or a busy room return a ``state`` and the caller carries on
+    with the local ``main`` as before. Never raises.
+    """
+    from app.core import workspaced_client as wsd
+    from app.core.git_sync import _clone_url
+
+    git_config = getattr(room, "git_config", None)
+    repo_url = _clone_url(str((git_config or {}).get("repo_url") or "")) if isinstance(
+        git_config, Mapping
+    ) else ""
+    if not repo_url:
+        return {"ok": True, "state": "no_remote"}
+
+    token = access_token
+    if token is None:
+        try:
+            from app.core.git_forge import resolve_forge_token
+
+            token = await resolve_forge_token(db, room, request=None)
+        except Exception:
+            token = None
+
+    from app.db.release import release_db
+
+    await release_db(db, reason="git/catch_up_release")
+    try:
+        result = await wsd.git_catch_up_release(str(room_id), repo_url, token)
+    except Exception as exc:
+        logger.warning("catch_up_release_branch: room %s skipped: %s", room_id, exc)
+        return {"ok": False, "state": "unavailable", "error": str(exc)[:300]}
+    if result.get("busy"):
+        return {"ok": False, "state": "busy"}
+    state = result.get("state")
+    if state == "fast_forwarded":
+        logger.info(
+            "catch_up_release_branch: room %s main fast-forwarded to %s",
+            room_id, str(result.get("remote_sha") or "")[:8],
+        )
+    elif not result.get("ok"):
+        logger.warning(
+            "catch_up_release_branch: room %s: %s (%s)", room_id, state, result.get("error")
+        )
+    return result
+
+
+async def _needs_pull(
+    room_id: "UUID | str", db, cfg: "FlowConfig", *, reason: str, files: list[str]
+) -> PromotionNeedsPull:
+    """Emit ``PROMOTION_NEEDS_PULL`` and build the matching exception."""
+    from app.core.events import emit_event
+
+    rid = room_id if isinstance(room_id, UUID) else UUID(str(room_id))
+    files = files[:_NEEDS_PULL_FILES_CAP]
+    if reason == "main_diverged":
+        message = (
+            f"{cfg.release_branch} in this room and {cfg.release_branch} on the remote "
+            f"have diverged, so the publication could not be pushed. Pull "
+            f"{cfg.release_branch} on the Git tab first, then publish again."
+        )
+    else:
+        message = (
+            f"{cfg.working_branch} conflicts with the current {cfg.release_branch} "
+            f"(it has moved since {cfg.working_branch} last took it in). Press Pull on "
+            f"the Git tab to bring {cfg.release_branch} into {cfg.working_branch}, "
+            f"resolve the conflict, then publish again."
+            + (f" Conflicting files: {', '.join(files)}." if files else "")
+        )
+    await emit_event(
+        room_id=rid,
+        event_type=PROMOTION_NEEDS_PULL_EVENT,
+        content=message,
+        db=db,
+        metadata={
+            "reason": reason,
+            "conflict_files": files,
+            "working_branch": cfg.working_branch,
+            "release_branch": cfg.release_branch,
+        },
+    )
+    return PromotionNeedsPull(message, reason=reason, conflict_files=files)
+
+
+async def _check_publishable(
+    room_id: "UUID | str", room, db, cfg: "FlowConfig", access_token: str | None
+) -> dict[str, Any]:
+    """Catch ``main`` up and make sure the working branch merges into it.
+
+    Raises ``PromotionNeedsPull`` (after emitting ``PROMOTION_NEEDS_PULL``)
+    when the room's ``main`` diverged from the remote or when the working
+    branch conflicts with ``main``. Returns the catch-up result otherwise.
+    """
+    from app.core import workspaced_client as wsd
+
+    catch_up = await catch_up_release_branch(room_id, room, db, access_token)
+    if catch_up.get("state") == "diverged":
+        raise await _needs_pull(room_id, db, cfg, reason="main_diverged", files=[])
+
+    report = await wsd.git_divergence_workspace(
+        str(room_id), branch=cfg.working_branch, base=cfg.release_branch
+    )
+    if report.get("ok") and report.get("behind") and report.get("conflict"):
+        raise await _needs_pull(
+            room_id, db, cfg, reason="conflict",
+            files=[str(f) for f in report.get("conflict_files") or []],
+        )
+    return catch_up
 
 
 async def _open_promotion_row(room_id: "UUID | str", db):
@@ -1848,7 +2047,12 @@ async def _apply_external_ci_status_to_goal(
 
 
 async def open_promotion(
-    room_id: "UUID | str", db, initiated_by: "UUID | str | None" = None, *, run_checks: bool = True
+    room_id: "UUID | str",
+    db,
+    initiated_by: "UUID | str | None" = None,
+    *,
+    run_checks: bool = True,
+    access_token: str | None = None,
 ):
     """Open a Gate 2 promotion for ``dev → main``.
 
@@ -1857,8 +2061,14 @@ async def open_promotion(
     full check suite on ``dev`` and parks a ``Promotion`` in ``waiting_review``
     (published as ``CHECKPOINT_REQUEST`` + ``PROMOTION_OPENED``).
 
+    Stage 5 of internal design notes: ``main`` is
+    first fast-forwarded to the remote's (another room may have published),
+    and the bundle diff is taken from the merge base, so commits another room
+    put on ``main`` never show up as reverse changes.
+
     Raises ``PromotionAlreadyOpen`` if a gate is already open, ``PromotionEmpty``
-    if there is nothing to publish, ``PromotionError`` on a transport failure.
+    if there is nothing to publish, ``PromotionNeedsPull`` when a Pull has to
+    come first, ``PromotionError`` on a transport failure.
     """
     from app.core import workspaced_client as wsd
     from app.core.events import emit_event
@@ -1873,9 +2083,12 @@ async def open_promotion(
     room = await _load_room(room_id, db)
     cfg = get_flow_config(room)
 
+    catch_up = await _check_publishable(room_id, room, db, cfg, access_token)
+
     try:
         resp = await wsd.git_diff_workspace(
-            str(room_id), from_ref=cfg.release_branch, to_ref=cfg.working_branch, stat=True
+            str(room_id), from_ref=cfg.release_branch, to_ref=cfg.working_branch, stat=True,
+            merge_base=True,
         )
         diff_stat = resp.get("diff", "") if isinstance(resp, Mapping) else str(resp)
     except Exception as exc:
@@ -1958,6 +2171,7 @@ async def open_promotion(
             "ci_status": ci_status,
             "dev_pushed": promo.dev_pushed,
             "pr_url": promo.pr_url,
+            "release_catch_up": catch_up.get("state"),
         },
     )
     await emit_event(
@@ -2262,6 +2476,24 @@ async def resolve_promotion(
 
     n = len(promotion.task_ids or [])
 
+    if not getattr(promotion, "pr_url", None):
+        # Stage 5 (internal design notes): another room may have
+        # published into the shared remote `main` since the gate opened. Catch
+        # up first so the merged `main` can be pushed; a conflict with the new
+        # `main` keeps the gate open until the user Pulls instead of ending it
+        # in `conflict`. A PR-backed promotion merges on the forge instead.
+        room = await _load_room(room_id, db)
+        try:
+            await _check_publishable(room_id, room, db, get_flow_config(room), git_token)
+        except PromotionNeedsPull as exc:
+            return {
+                "ok": False,
+                "needs_pull": True,
+                "reason": exc.reason,
+                "conflict_files": exc.conflict_files,
+                "error": str(exc),
+            }
+
     # Snapshot the promoted commits before the merge — afterwards ``main..dev``
     # resolves to nothing (Stage 9 deploy-hook payload).
     promoted_commits = await _collect_promoted_commits(
@@ -2540,6 +2772,7 @@ async def open_goal_review(room_id: "UUID | str", goal, db, *, run_checks: bool 
             "goal_review": True,
             "goal_id": str(goal.id),
             "branch": goal.branch_name,
+            "target": cfg.working_branch,
             "diff_stat": (diff_stat or "")[:_DIFF_STAT_CAP],
             "task_titles": titles,
             "ci_status": ci_status,

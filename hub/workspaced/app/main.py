@@ -58,7 +58,16 @@ from app.schemas import (
     GitDiscardBranchRequest,
     GitDiscardBranchResponse,
     GitDivergenceResponse,
+    GitEnsureBaseBranchesRequest,
+    GitRemoteBranchExistsRequest,
+    GitCatchUpReleaseRequest,
+    GitCatchUpReleaseResponse,
+    GitReleaseRemoteStatusResponse,
+    GitRemoteBranchExistsResponse,
+    GitRenameWorkingBranchRequest,
+    GitRenameWorkingBranchResponse,
     GitEnsureBaseBranchesResponse,
+    GitInitRequest,
     GitEnsureSharedGitignoreRequest,
     GitEnsureSharedGitignoreResponse,
     GitFetchRequest,
@@ -767,9 +776,9 @@ async def host_stats():
     "/workspaces/{room_id}/git/init",
     dependencies=[Depends(verify_token)],
 )
-async def git_init_workspace(room_id: str):
+async def git_init_workspace(room_id: str, req: GitInitRequest | None = None):
     from app.git_ops import git_init
-    git_init(room_id)
+    git_init(room_id, req.working_branch if req else None)
     return {"ok": True, "room_id": room_id}
 
 
@@ -810,12 +819,69 @@ async def git_set_author_workspace(room_id: str, req: GitAuthorRequest):
     response_model=GitEnsureBaseBranchesResponse,
     dependencies=[Depends(verify_token)],
 )
-async def git_ensure_base_branches_workspace(room_id: str):
-    """Backfill `main` + `dev` for a repo that predates internal design notes
-    Stage 0. Idempotent; never changes HEAD."""
+async def git_ensure_base_branches_workspace(
+    room_id: str, req: GitEnsureBaseBranchesRequest | None = None
+):
+    """Guarantee `main` + the integration branch (backfill for repos that
+    predate internal design notes Stage 0) and record the
+    integration branch name the Hub has. Idempotent; never changes HEAD."""
     from app.git_ops import ensure_base_branches
-    result = ensure_base_branches(room_id)
+    result = ensure_base_branches(room_id, req.working_branch if req else None)
     return GitEnsureBaseBranchesResponse(**result)
+
+
+@app.post(
+    "/workspaces/{room_id}/git/rename-working-branch",
+    response_model=GitRenameWorkingBranchResponse,
+    dependencies=[Depends(verify_token)],
+)
+async def git_rename_working_branch_workspace(room_id: str, req: GitRenameWorkingBranchRequest):
+    """Rename the room's integration branch (``git branch -m``) and record the
+    new name (internal design notes Stage 3)."""
+    from app.git_ops import rename_working_branch
+    result = await asyncio.to_thread(
+        rename_working_branch, room_id, req.from_branch, req.to_branch
+    )
+    return GitRenameWorkingBranchResponse(**result)
+
+
+@app.post(
+    "/workspaces/{room_id}/git/remote-branch-exists",
+    response_model=GitRemoteBranchExistsResponse,
+    dependencies=[Depends(verify_token)],
+)
+async def git_remote_branch_exists_workspace(room_id: str, req: GitRemoteBranchExistsRequest):
+    """Whether the remote already has a branch of that name (``ls-remote``)."""
+    from app.git_ops import remote_branch_exists
+    result = await asyncio.to_thread(
+        remote_branch_exists, room_id, req.remote_url, req.branch, req.token
+    )
+    return GitRemoteBranchExistsResponse(**result)
+
+
+@app.post(
+    "/workspaces/{room_id}/git/catch-up-release",
+    response_model=GitCatchUpReleaseResponse,
+    dependencies=[Depends(verify_token)],
+)
+async def git_catch_up_release_workspace(room_id: str, req: GitCatchUpReleaseRequest):
+    """Fast-forward the local ``main`` to the remote's, never merging
+    (internal design notes Stage 5)."""
+    from app.git_ops import git_catch_up_release
+    result = await asyncio.to_thread(git_catch_up_release, room_id, req.remote_url, req.token)
+    return GitCatchUpReleaseResponse(**result)
+
+
+@app.get(
+    "/workspaces/{room_id}/git/release-remote-status",
+    response_model=GitReleaseRemoteStatusResponse,
+    dependencies=[Depends(verify_token)],
+)
+async def git_release_remote_status_workspace(room_id: str, working_branch: str):
+    """What the last fetched remote ``main`` has that the room lacks — no network."""
+    from app.git_ops import release_remote_status
+    result = await asyncio.to_thread(release_remote_status, room_id, working_branch)
+    return GitReleaseRemoteStatusResponse(**result)
 
 
 @app.post(
@@ -939,10 +1005,10 @@ async def git_revert_workspace(room_id: str, req: GitRevertRequest):
     dependencies=[Depends(verify_token)],
 )
 async def git_revert_commit_workspace(room_id: str, req: GitRevertCommitRequest):
-    from app.git_ops import git_revert_commit, git_current_branch, INTEGRATION_BRANCH
+    from app.git_ops import git_revert_commit, git_current_branch
     result = git_revert_commit(
         room_id, req.sha,
-        target=req.target or INTEGRATION_BRANCH,
+        target=req.target or None,
         mainline=req.mainline,
     )
     branch = git_current_branch(room_id)
@@ -1007,10 +1073,10 @@ async def git_push_workspace(room_id: str, req: GitPushRequest):
     dependencies=[Depends(verify_token)],
 )
 async def git_main_bypass_workspace(room_id: str, req: GitMainBypassRequest):
-    """Non-merge commits on ``main`` that neither ``dev`` nor the forge has —
-    work that skipped the ``dev -> main`` promotion. Pure read."""
+    """Non-merge commits on ``main`` that neither the integration branch nor
+    the forge has — work that skipped the promotion to ``main``. Pure read."""
     from app.release_guard import main_bypass_commits
-    return main_bypass_commits(room_id, req.exclude, req.limit)
+    return main_bypass_commits(room_id, req.exclude, req.limit, req.integration_branch)
 
 
 @app.get("/workspaces/{room_id}/git/release-tags", dependencies=[Depends(verify_token)])
@@ -1100,8 +1166,8 @@ async def git_apply_patch_workspace(room_id: str, req: GitApplyPatchRequest):
 async def git_archive_workspace(room_id: str, ref: str | None = None):
     """Tar snapshot of ``ref`` for a mode=worker dispatch."""
     import base64
-    from app.git_ops import INTEGRATION_BRANCH, git_archive_branch
-    ref = ref or INTEGRATION_BRANCH
+    from app.git_ops import _workspace_root, git_archive_branch, working_branch_of
+    ref = ref or working_branch_of(_workspace_root(room_id))
     content = git_archive_branch(room_id, ref)
     if content is None:
         return GitArchiveResponse(ok=False, ref=ref, error="archive failed or no repo")
@@ -1146,10 +1212,12 @@ async def git_divergence_workspace(room_id: str, branch: str, base: str):
 )
 async def git_discard_branch_workspace(room_id: str, req: GitDiscardBranchRequest):
     """internal design notes Stage 2 — tag ``branch`` under
-    ``refs/legion/trash/`` then delete it (recoverable). Refuses ``main`` /
-    ``dev`` and the currently checked-out branch."""
+    ``refs/legion/trash/`` then delete it (recoverable). Refuses ``main`` and
+    the integration branch; steps off ``branch`` when it is checked out."""
     from app.git_ops import git_discard_branch
-    return GitDiscardBranchResponse(**git_discard_branch(room_id, req.branch))
+    return GitDiscardBranchResponse(
+        **git_discard_branch(room_id, req.branch, req.working_branch)
+    )
 
 
 @app.post(
@@ -1180,14 +1248,16 @@ async def git_reset_branch_workspace(room_id: str, req: GitResetBranchRequest):
     "/workspaces/{room_id}/git/ahead-behind-remote",
     dependencies=[Depends(verify_token)],
 )
-async def git_ahead_behind_remote_workspace(room_id: str, branch: str = "dev"):
+async def git_ahead_behind_remote_workspace(room_id: str, branch: str | None = None):
     """internal design notes Stage 2 — ahead/behind vs remote tracking ref.
 
     Uses already-fetched ``refs/remotes/origin/<branch>`` — no network call.
     Returns 404 when no remote ref exists.
     """
-    from app.git_ops import git_ahead_behind_remote
-    result = git_ahead_behind_remote(room_id, branch)
+    from app.git_ops import _workspace_root, git_ahead_behind_remote, working_branch_of
+    result = git_ahead_behind_remote(
+        room_id, branch or working_branch_of(_workspace_root(room_id))
+    )
     if result is None:
         from fastapi.responses import JSONResponse
         return JSONResponse(status_code=404, content={"detail": "no remote tracking ref"})
@@ -1208,7 +1278,7 @@ async def git_adopt_workspace(room_id: str, req: GitAdoptRequest):
     """
     from app.git_ops import git_adopt_remote, git_init, is_git_repo
     if not is_git_repo(room_id):
-        git_init(room_id)
+        git_init(room_id, req.working_branch)
     result = git_adopt_remote(
         room_id,
         req.remote_url,

@@ -10,6 +10,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import re
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -64,8 +65,63 @@ def _serialized(*, busy_dict: bool):
 #   promotion (`dev → main`). `dev` is the room's integration branch: every
 #   agent / auto commit lands here (or on a task branch that merges here).
 RELEASE_BRANCH = "main"
+# Default name of the integration branch. A room may use another name
+# (internal design notes): the Hub's
+# ``git_config.working_branch`` is the source of truth and workspaced keeps a
+# copy in the repo's local config (``legion.workingBranch``) so the paths that
+# do not get the name from the Hub — parking a dirty ``main``, stepping off a
+# discarded branch — land on the right branch.
 INTEGRATION_BRANCH = "dev"
+_WORKING_BRANCH_KEY = "legion.workingBranch"
+# Prefixes Legion names its own short-lived branches with.
+_RESERVED_BRANCH_PREFIXES = ("task/", "goal/", "session/")
 _REMOTE_REF_PREFIX = "refs/legion/remote/"
+_BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$")
+
+
+def valid_working_branch_name(name: Optional[str]) -> bool:
+    """Whether ``name`` may be a room's integration branch.
+
+    ASCII only, a valid ``refs/heads/`` name (``git check-ref-format`` rules,
+    checked without a repo), not ``main`` / ``HEAD`` and not one of the
+    prefixes Legion names task, goal and session branches with.
+    """
+    if not name or not isinstance(name, str) or not _BRANCH_NAME_RE.match(name):
+        return False
+    if name in (RELEASE_BRANCH, "HEAD") or name.startswith(_RESERVED_BRANCH_PREFIXES):
+        return False
+    if ".." in name or "//" in name or "@{" in name:
+        return False
+    for part in name.split("/"):
+        if not part or part.startswith(".") or part.endswith(".lock"):
+            return False
+    return not name.endswith((".", "/"))
+
+
+def working_branch_of(root: Path) -> str:
+    """The room's integration branch as recorded in its repo (default ``dev``).
+
+    A missing or unusable value — an old repo, or an agent that edited
+    ``.git/config`` — falls back to the default instead of failing.
+    """
+    if not (root / ".git").is_dir():
+        return INTEGRATION_BRANCH
+    value = _run(["config", "--local", "--get", _WORKING_BRANCH_KEY], cwd=root).stdout.strip()
+    return value if valid_working_branch_name(value) else INTEGRATION_BRANCH
+
+
+def _record_working_branch(root: Path, name: str) -> None:
+    """Store ``name`` as the repo's integration branch (local config only)."""
+    current = _run(["config", "--local", "--get", _WORKING_BRANCH_KEY], cwd=root).stdout.strip()
+    if current != name:
+        _run(["config", "--local", _WORKING_BRANCH_KEY, name], cwd=root)
+
+
+def _working_branch_arg(root: Path, working_branch: Optional[str]) -> str:
+    """``working_branch`` when the caller passed a usable one, else the recorded one."""
+    if working_branch and valid_working_branch_name(working_branch):
+        return working_branch
+    return working_branch_of(root)
 
 
 class MainBranchProtectedError(RuntimeError):
@@ -397,7 +453,7 @@ def is_git_repo(room_id: str) -> bool:
     return (_workspace_root(room_id) / ".git").is_dir()
 
 
-def git_init(room_id: str) -> None:
+def git_init(room_id: str, working_branch: Optional[str] = None) -> None:
     """Initialise a git repo in the workspace volume (idempotent).
 
     internal design notes Stage 1: the synthetic root commit is now *empty* —
@@ -405,6 +461,10 @@ def git_init(room_id: str) -> None:
     Legion's own infrastructure lines go into ``.git/info/exclude`` instead. A
     shared ``.gitignore`` commit is seeded later and only when Legion itself
     publishes the repo (Stage 2); an externally adopted repo keeps its own.
+
+    ``working_branch`` names the integration branch a new repo is checked out
+    on (default ``dev``). An existing repo is left as it is —
+    ``ensure_base_branches`` reconciles its name with the Hub.
     """
     root = _workspace_root(room_id)
     root.mkdir(parents=True, exist_ok=True)
@@ -417,6 +477,10 @@ def git_init(room_id: str) -> None:
         ensure_ref_guard(root)
         return
 
+    integration = (
+        working_branch if valid_working_branch_name(working_branch) else INTEGRATION_BRANCH
+    )
+
     _run(["init"], cwd=root)
     _run(["config", "user.name", LEGION_GIT_NAME], cwd=root)
     _run(["config", "user.email", LEGION_GIT_EMAIL], cwd=root)
@@ -426,15 +490,17 @@ def git_init(room_id: str) -> None:
 
     _run(["commit", "--allow-empty", "-m", "init: Legion Hub workspace"], cwd=root)
 
-    # internal design notes Stage 0: the room develops on `dev`; `main` stays
-    # put as the release branch. The empty initial commit above landed on
-    # `main` (init.defaultBranch=main) — branch `dev` off it and check it out.
-    _run(["checkout", "-b", INTEGRATION_BRANCH], cwd=root)
+    # internal design notes Stage 0: the room develops on its
+    # integration branch; `main` stays put as the release branch. The empty
+    # initial commit above landed on `main` (init.defaultBranch=main) — branch
+    # the integration branch off it and check it out.
+    _run(["checkout", "-b", integration], cwd=root)
+    _record_working_branch(root, integration)
 
     # .git objects were created as root — hand them to the container user
     chown_workspace_tree(room_id)
 
-    logger.info("git_init: initialised repo for room %s (HEAD=%s)", room_id, INTEGRATION_BRANCH)
+    logger.info("git_init: initialised repo for room %s (HEAD=%s)", room_id, integration)
 
 
 @_serialized(busy_dict=False)
@@ -458,37 +524,186 @@ def git_set_author(room_id: str, name: Optional[str], email: Optional[str]) -> N
         _run(["config", "--unset", _AUTHOR_EMAIL_KEY], cwd=root)
 
 
-def ensure_base_branches(room_id: str) -> dict:
-    """Guarantee `main` and `dev` both exist (idempotent, no HEAD change).
+def _local_branch_exists(root: Path, name: str) -> bool:
+    return _run(["rev-parse", "--verify", "--quiet", f"refs/heads/{name}"], cwd=root).returncode == 0
+
+
+@_serialized(busy_dict=True)
+def ensure_base_branches(room_id: str, working_branch: Optional[str] = None) -> dict:
+    """Guarantee `main` and the integration branch both exist (idempotent).
 
     Backfill for rooms whose repo was initialised before internal design notes
-    Stage 0. A fresh ``git_init`` already creates both; this only matters for
-    repos that predate that change. Never switches branches — a concurrent
-    agent session may be working on the current HEAD.
+    Stage 0, and the point where the repo learns the integration branch name
+    the Hub has (``working_branch``; omitted → the name the repo already
+    records, default ``dev``). Never switches branches — a concurrent agent
+    session may be working on the current HEAD.
+
+    When the Hub names a branch the repo does not have while the branch the
+    repo used so far does exist, the old one is renamed only if it carries no
+    commits ``main`` lacks (nothing to lose — a room renamed before any work).
+    With work on it the call refuses (``error="working branch mismatch"``) and
+    changes nothing: moving that work is the explicit rename's job, never a
+    side effect of a backfill that would leave it behind on the old name.
     """
     root = _workspace_root(room_id)
     if not (root / ".git").is_dir():
         return {"ok": False, "created_dev": False, "error": "no git repo"}
 
-    had_dev = bool(
-        _run(["branch", "--list", INTEGRATION_BRANCH], cwd=root).stdout.strip()
-    )
-    if not had_dev:
-        base = (
-            RELEASE_BRANCH
-            if _run(["rev-parse", "--verify", RELEASE_BRANCH], cwd=root).returncode == 0
-            else "HEAD"
-        )
-        r = _run(["branch", INTEGRATION_BRANCH, base], cwd=root)
-        if r.returncode != 0:
-            logger.warning(
-                "ensure_base_branches: could not create %s for room %s: %s",
-                INTEGRATION_BRANCH, room_id, r.stderr[:300],
-            )
-            return {"ok": False, "created_dev": False, "error": r.stderr[:300]}
-        chown_workspace_tree(room_id)
+    if working_branch is not None and not valid_working_branch_name(working_branch):
+        return {
+            "ok": False, "created_dev": False,
+            "error": f"invalid working branch name {working_branch!r}",
+        }
+    previous = working_branch_of(root)
+    target = working_branch or previous
+    result = {"ok": True, "created_dev": False, "working_branch": target, "renamed_from": None}
 
-    return {"ok": True, "created_dev": not had_dev}
+    if _local_branch_exists(root, target):
+        _record_working_branch(root, target)
+        return result
+
+    if target != previous and _local_branch_exists(root, previous):
+        has_main = _local_branch_exists(root, RELEASE_BRANCH)
+        ahead = _rev_count(root, f"{RELEASE_BRANCH}..{previous}") if has_main else None
+        if ahead != 0:
+            logger.warning(
+                "ensure_base_branches: room %s works on %s but the Hub names %s; "
+                "left as is (%s commits not on %s)",
+                room_id, previous, target, ahead, RELEASE_BRANCH,
+            )
+            return {
+                "ok": False, "created_dev": False, "working_branch": previous,
+                "renamed_from": None, "error": "working branch mismatch",
+            }
+        r = _run(["branch", "-m", previous, target], cwd=root)
+        if r.returncode != 0:
+            return {"ok": False, "created_dev": False, "error": r.stderr[:300]}
+        _record_working_branch(root, target)
+        chown_workspace_tree(room_id)
+        logger.info(
+            "ensure_base_branches: renamed empty %s to %s for room %s", previous, target, room_id,
+        )
+        return {**result, "renamed_from": previous}
+
+    base = RELEASE_BRANCH if _local_branch_exists(root, RELEASE_BRANCH) else "HEAD"
+    r = _run(["branch", target, base], cwd=root)
+    if r.returncode != 0:
+        logger.warning(
+            "ensure_base_branches: could not create %s for room %s: %s",
+            target, room_id, r.stderr[:300],
+        )
+        return {"ok": False, "created_dev": False, "error": r.stderr[:300]}
+    _record_working_branch(root, target)
+    chown_workspace_tree(room_id)
+    return {**result, "created_dev": True}
+
+
+@_serialized(busy_dict=True)
+def rename_working_branch(room_id: str, from_branch: str, to_branch: str) -> dict:
+    """Rename the room's integration branch ``from_branch`` → ``to_branch``
+    (internal design notes Stage 3).
+
+    ``git branch -m`` keeps the commits and the reflog, and a HEAD sitting on
+    the branch follows it. The upstream recorded by an earlier ``push -u``
+    points at the old remote name, so it is dropped — Legion always pushes and
+    fetches with an explicit refspec. The new name is recorded as the repo's
+    integration branch. A room without a repo gets one, checked out on the new
+    name, so a later write does not create ``dev`` behind the Hub's back.
+
+    Returns ``{ok, renamed, created, from_branch, to_branch, head, error,
+    code}``; ``code`` is ``invalid_name`` / ``branch_exists`` on a refusal.
+    The Hub renames back with the same call when it cannot store the name.
+    """
+    result: dict = {
+        "ok": False, "renamed": False, "created": False,
+        "from_branch": from_branch, "to_branch": to_branch,
+        "head": None, "error": None, "code": None,
+    }
+    if not valid_working_branch_name(to_branch):
+        return {**result, "error": f"invalid branch name {to_branch!r}", "code": "invalid_name"}
+    root = _workspace_root(room_id)
+    if not (root / ".git").is_dir():
+        git_init(room_id, to_branch)
+        return {**result, "ok": True, "created": True, "head": git_current_branch(room_id)}
+
+    if from_branch == to_branch:
+        if not _local_branch_exists(root, to_branch):
+            base = RELEASE_BRANCH if _local_branch_exists(root, RELEASE_BRANCH) else "HEAD"
+            r = _run(["branch", to_branch, base], cwd=root)
+            if r.returncode != 0:
+                return {**result, "error": r.stderr[:300]}
+            result["created"] = True
+        _record_working_branch(root, to_branch)
+        chown_workspace_tree(room_id)
+        return {**result, "ok": True, "head": git_current_branch(room_id)}
+
+    if _local_branch_exists(root, to_branch):
+        return {
+            **result,
+            "error": f"a branch named {to_branch!r} already exists in this room",
+            "code": "branch_exists",
+        }
+
+    if _local_branch_exists(root, from_branch):
+        r = _run(["branch", "-m", from_branch, to_branch], cwd=root)
+        if r.returncode != 0:
+            return {**result, "error": r.stderr[:300]}
+        # No upstream is fine; any other failure leaves a harmless stale entry.
+        _run(["branch", "--unset-upstream", to_branch], cwd=root)
+        result["renamed"] = True
+    else:
+        recorded = working_branch_of(root)
+        if recorded not in (from_branch, to_branch) and _local_branch_exists(root, recorded):
+            # The repo works on a branch the Hub did not name: renaming
+            # nothing and starting a fresh branch would strand that work.
+            return {
+                **result,
+                "error": (
+                    f"this room works on {recorded!r}, not {from_branch!r}; "
+                    "nothing was renamed"
+                ),
+                "code": "working_branch_mismatch",
+            }
+        # Nothing to carry over: start the new branch where the old one would.
+        base = RELEASE_BRANCH if _local_branch_exists(root, RELEASE_BRANCH) else "HEAD"
+        r = _run(["branch", to_branch, base], cwd=root)
+        if r.returncode != 0:
+            return {**result, "error": r.stderr[:300]}
+        result["created"] = True
+
+    _record_working_branch(root, to_branch)
+    chown_workspace_tree(room_id)
+    logger.info(
+        "rename_working_branch: room %s %s → %s (renamed=%s)",
+        room_id, from_branch, to_branch, result["renamed"],
+    )
+    return {**result, "ok": True, "head": git_current_branch(room_id)}
+
+
+def remote_branch_exists(
+    room_id: str, remote_url: str, branch: str, token: Optional[str] = None
+) -> dict:
+    """Whether ``refs/heads/<branch>`` exists on ``remote_url`` (``ls-remote``).
+
+    Read-only and network-bound, so it runs outside the room lock. Returns
+    ``{ok, exists, error}``; ``ok=False`` when the remote could not be asked.
+    """
+    root = _workspace_root(room_id)
+    if not (root / ".git").is_dir():
+        return {"ok": False, "exists": False, "error": "no git repo"}
+    if not remote_url or not branch:
+        return {"ok": False, "exists": False, "error": "remote url and branch are required"}
+    r = _run(
+        ["ls-remote", "--heads", remote_url, f"refs/heads/{branch}"],
+        cwd=root, auth=(remote_url, token), timeout=60,
+    )
+    if r.returncode != 0:
+        return {"ok": False, "exists": False, "error": (r.stderr or "ls-remote failed")[:300]}
+    exists = any(
+        line.split("\t", 1)[-1].strip() == f"refs/heads/{branch}"
+        for line in r.stdout.splitlines()
+    )
+    return {"ok": True, "exists": exists, "error": None}
 
 
 _SHARED_GITIGNORE_MESSAGE = "chore: add default .gitignore"
@@ -496,7 +711,7 @@ _SHARED_GITIGNORE_MESSAGE = "chore: add default .gitignore"
 
 @_serialized(busy_dict=True)
 def ensure_shared_gitignore(
-    room_id: str, integration_branch: str = INTEGRATION_BRANCH
+    room_id: str, integration_branch: Optional[str] = None
 ) -> dict:
     """Commit a shared ``.gitignore`` on ``integration_branch`` once, if the
     repo does not already track one (internal design notes Stage 2).
@@ -516,7 +731,7 @@ def ensure_shared_gitignore(
     Returns ``{ok, added, sha, branch, stderr}``. HEAD is left where it was.
     """
     root = _workspace_root(room_id)
-    branch = integration_branch or INTEGRATION_BRANCH
+    branch = integration_branch or working_branch_of(root)
     result: dict = {"ok": False, "added": False, "sha": None, "branch": branch, "stderr": ""}
     if not (root / ".git").is_dir():
         result["stderr"] = "no git repo"
@@ -610,7 +825,8 @@ def git_commit(
     if not allow_main_commit and git_current_branch(room_id) == RELEASE_BRANCH:
         raise MainBranchProtectedError(
             "refusing to commit on `main`: agent and auto commits must target "
-            "a task branch or `dev` (internal design notes §0.1)"
+            f"a task branch or `{working_branch_of(root)}` "
+            "(internal design notes §0.1)"
         )
 
     if only_path:
@@ -1100,7 +1316,7 @@ def git_apply_patch(
 def git_revert_commit(
     room_id: str,
     sha: str,
-    target: str = INTEGRATION_BRANCH,
+    target: Optional[str] = None,
     mainline: int = 1,
 ) -> dict:
     """Revert commit ``sha`` on ``target`` with a fresh revert commit.
@@ -1113,6 +1329,7 @@ def git_revert_commit(
     root = _workspace_root(room_id)
     if not (root / ".git").is_dir():
         return {"ok": False, "conflict": False, "stdout": "", "stderr": "no git repo"}
+    target = target or working_branch_of(root)
 
     # Same dirty-tree guard as the merge path: park uncommitted work and clear
     # volatile Legion metadata so the checkout cannot abort.
@@ -1400,7 +1617,8 @@ def _park_worktree_before_switch(root, room_id: str, current: Optional[str]) -> 
         # Committing here would move `main` outside a promotion. Park the work
         # on the integration branch instead — `git checkout` carries the
         # uncommitted changes across when they don't conflict.
-        co = _run(["checkout", INTEGRATION_BRANCH], cwd=root)
+        integration = working_branch_of(root)
+        co = _run(["checkout", integration], cwd=root)
         if co.returncode != 0:
             logger.warning(
                 "park worktree: dirty tree on %s for room %s, cannot park: %s",
@@ -1408,7 +1626,7 @@ def _park_worktree_before_switch(root, room_id: str, current: Optional[str]) -> 
             )
             return (
                 f"working tree has uncommitted changes on `{RELEASE_BRANCH}` and they "
-                f"could not be moved to `{INTEGRATION_BRANCH}`: {co.stderr[:300]}"
+                f"could not be moved to `{integration}`: {co.stderr[:300]}"
             )
 
     _stage_all(root)
@@ -1508,7 +1726,7 @@ def git_adopt_remote(
     remote_url: str,
     branch: str = "main",
     token: Optional[str] = None,
-    working_branch: str = INTEGRATION_BRANCH,
+    working_branch: Optional[str] = None,
     force: bool = False,
 ) -> dict:
     """Adopt an external repository as the room's base (internal design notes §3).
@@ -1540,7 +1758,9 @@ def git_adopt_remote(
     """
     root = _workspace_root(room_id)
     if not (root / ".git").is_dir():
-        git_init(room_id)
+        git_init(room_id, working_branch)
+    previous_working = working_branch_of(root)
+    working_branch = _working_branch_arg(root, working_branch)
 
     fetch_url = remote_url
     auth = (remote_url, token)
@@ -1580,7 +1800,11 @@ def git_adopt_remote(
                 "another private-files namespace before adopting"
             ),
         }
-    pristine = _is_pristine_room(root, working_branch)
+    # The branch the room worked on so far counts too: under another name it
+    # may hold work the Hub-side name does not show yet.
+    pristine = _is_pristine_room(root, working_branch) and (
+        previous_working == working_branch or _is_pristine_room(root, previous_working)
+    )
     task_branches = [
         b.strip().lstrip("* ").strip()
         for b in _run(["branch", "--list", "task/*"], cwd=root).stdout.splitlines()
@@ -1603,6 +1827,11 @@ def git_adopt_remote(
         # to keep unrelated histories from ever appearing.
         _run(["checkout", "-B", working_branch, "FETCH_HEAD"], cwd=root)
         _run(["branch", "-f", RELEASE_BRANCH, "FETCH_HEAD"], cwd=root)
+        _record_working_branch(root, working_branch)
+        if pristine and previous_working != working_branch:
+            # The old integration branch only held the synthetic init commit
+            # that was just dropped — do not leave it behind under its name.
+            _run(["branch", "-D", previous_working], cwd=root)
         ensure_userfiles_dir(room_id, root=root)
         _write_local_excludes(root)
         chown_workspace_tree(room_id)
@@ -1644,6 +1873,8 @@ def git_adopt_remote(
         }
     ensure_userfiles_dir(room_id, root=root)
     _write_local_excludes(root)
+    if _local_branch_exists(root, working_branch):
+        _record_working_branch(root, working_branch)
     return {
         "ok": True, "adopted": True, "diverged": False, "dropped_init": False,
         "main_sha": _rev(root, RELEASE_BRANCH),
@@ -1979,6 +2210,134 @@ def git_ahead_behind_remote(room_id: str, branch: str) -> Optional[dict]:
         }
     except ValueError:
         return None
+
+
+# ── Catching ``main`` up with the remote
+# (internal design notes Stage 5) ────────────────────
+
+def _is_ancestor(root: Path, older: str, newer: str) -> bool:
+    return _run(["merge-base", "--is-ancestor", older, newer], cwd=root).returncode == 0
+
+
+def _count_between(root: Path, from_ref: str, to_ref: str) -> Optional[int]:
+    """Commits ``to_ref`` has that ``from_ref`` does not (``from..to``)."""
+    r = _run(["rev-list", "--count", f"{from_ref}..{to_ref}"], cwd=root)
+    if r.returncode != 0:
+        return None
+    try:
+        return int(r.stdout.strip())
+    except ValueError:
+        return None
+
+
+@_serialized(busy_dict=True)
+def git_catch_up_release(room_id: str, remote_url: str, token: Optional[str] = None) -> dict:
+    """Fast-forward the local ``main`` to the remote's ``main``, never merging.
+
+    Several rooms can publish into one remote ``main`` (one per working
+    branch). After another room published, this room's ``main`` is behind and
+    its next promotion would end in a non-fast-forward push. Called before a
+    promotion is opened and before it is merged.
+
+    The fetched tip is saved under ``refs/legion/remote/main`` (the same ref a
+    Pull writes). ``state``:
+
+    * ``up_to_date`` — local and remote ``main`` are the same commit;
+    * ``fast_forwarded`` — local ``main`` was behind and now matches the remote;
+    * ``ahead`` — local ``main`` has commits the remote does not (a promotion
+      not pushed yet); left alone;
+    * ``diverged`` — both sides have their own commits; left alone, a Pull of
+      ``main`` resolves it through the divergence review;
+    * ``userfiles_conflict`` — the remote ``main`` tracks the private-files
+      directory; left alone, a Pull reports it;
+    * ``no_local_main`` — the room has no ``main`` yet; nothing to compare.
+
+    ``ok=False`` only when the fetch itself failed (network, credentials) or
+    the fast-forward could not be written. HEAD never moves: the ref is
+    updated in place unless ``main`` is the checked-out branch.
+    """
+    root = _workspace_root(room_id)
+    if not (root / ".git").is_dir():
+        return {"ok": False, "state": "no_repo", "error": "no git repo"}
+    if not remote_url:
+        return {"ok": False, "state": "no_remote", "error": "remote url is required"}
+
+    fetched = _run(
+        ["fetch", "--", remote_url, f"refs/heads/{RELEASE_BRANCH}"],
+        cwd=root, auth=(remote_url, token),
+    )
+    if fetched.returncode != 0:
+        logger.warning(
+            "git_catch_up_release: fetch failed for room %s: %s", room_id, fetched.stderr[:300]
+        )
+        return {
+            "ok": False, "state": "fetch_failed",
+            "error": "Could not fetch main from the remote. Check the remote and its credentials.",
+        }
+    remote_sha = _commit_sha(root, "FETCH_HEAD")
+    if remote_sha is None:
+        return {"ok": False, "state": "fetch_failed", "error": "FETCH_HEAD is not a commit"}
+    _run(["update-ref", f"{_REMOTE_REF_PREFIX}{RELEASE_BRANCH}", remote_sha], cwd=root)
+
+    local_sha = _commit_sha(root, f"refs/heads/{RELEASE_BRANCH}")
+    result = {"ok": True, "local_sha": local_sha, "main_sha": local_sha, "remote_sha": remote_sha}
+    if local_sha is None:
+        return {**result, "state": "no_local_main"}
+    if local_sha == remote_sha:
+        return {**result, "state": "up_to_date"}
+    if _is_ancestor(root, remote_sha, local_sha):
+        return {**result, "state": "ahead"}
+    if not _is_ancestor(root, local_sha, remote_sha):
+        return {**result, "state": "diverged"}
+    if git_ls_remote_userfiles(root, remote_sha):
+        return {**result, "state": "userfiles_conflict"}
+
+    if git_current_branch(room_id) == RELEASE_BRANCH:
+        ff = _run(["merge", "--ff-only", remote_sha], cwd=root)
+        chown_workspace_tree(room_id)
+    else:
+        ff = _run(
+            ["update-ref", f"refs/heads/{RELEASE_BRANCH}", remote_sha, local_sha], cwd=root
+        )
+    if ff.returncode != 0:
+        logger.warning(
+            "git_catch_up_release: fast-forward failed for room %s: %s", room_id, ff.stderr[:300]
+        )
+        return {**result, "ok": False, "state": "ff_failed", "error": ff.stderr[:300]}
+    logger.info(
+        "git_catch_up_release: room %s main %s → %s", room_id, local_sha[:8], remote_sha[:8]
+    )
+    return {**result, "state": "fast_forwarded", "main_sha": remote_sha}
+
+
+def release_remote_status(room_id: str, working_branch: str) -> dict:
+    """What the last fetched remote ``main`` carries that this room lacks.
+
+    Pure read of ``refs/legion/remote/main`` (written by a Pull of ``main``
+    and by ``git_catch_up_release``) — no network. ``main_behind``: commits
+    the local ``main`` lacks; ``working_behind``: commits ``working_branch``
+    lacks, i.e. what a Pull would bring into it. ``None`` where unknown.
+    """
+    root = _workspace_root(room_id)
+    empty = {"ok": False, "remote_sha": None, "main_behind": None, "working_behind": None}
+    if not (root / ".git").is_dir():
+        return empty
+    remote_ref = f"{_REMOTE_REF_PREFIX}{RELEASE_BRANCH}"
+    remote_sha = _commit_sha(root, remote_ref)
+    if remote_sha is None:
+        return empty
+    main_behind = (
+        _count_between(root, f"refs/heads/{RELEASE_BRANCH}", remote_ref)
+        if _local_branch_exists(root, RELEASE_BRANCH) else None
+    )
+    working_behind = (
+        _count_between(root, f"refs/heads/{working_branch}", remote_ref)
+        if working_branch and _local_branch_exists(root, working_branch) else None
+    )
+    return {
+        "ok": True, "remote_sha": remote_sha,
+        "main_behind": main_behind, "working_behind": working_behind,
+    }
 
 
 # ── Divergence review (internal design notes Stage 1) ────────────────────
@@ -2375,7 +2734,7 @@ def git_reset_branch_to(
 
 
 @_serialized(busy_dict=True)
-def git_discard_branch(room_id: str, branch: str) -> dict:
+def git_discard_branch(room_id: str, branch: str, working_branch: Optional[str] = None) -> dict:
     """Tag ``branch`` under ``refs/legion/trash/`` then delete it.
 
     internal design notes Stage 2 — the "Delete branch" divergence
@@ -2383,12 +2742,17 @@ def git_discard_branch(room_id: str, branch: str) -> dict:
     refs/legion/trash/<...>``). Refuses to delete the branch that is currently
     checked out. Serialised: it moves refs the branch tree depends on.
 
+    ``working_branch`` is the room's integration branch (omitted → the one
+    the repo records): it is never discarded and is where the working tree
+    steps to when ``branch`` is checked out.
+
     Returns ``{ok, deleted, backup_ref, busy, stderr}``.
     """
     root = _workspace_root(room_id)
     if not (root / ".git").is_dir():
         return {"ok": False, "deleted": False, "stderr": "no git repo"}
-    if not branch or branch in (RELEASE_BRANCH, INTEGRATION_BRANCH):
+    integration = _working_branch_arg(root, working_branch)
+    if not branch or branch in (RELEASE_BRANCH, integration):
         return {"ok": False, "deleted": False, "stderr": f"refusing to discard {branch!r}"}
     if not git_branch_exists(room_id, branch):
         # Idempotent: nothing to do.
@@ -2403,7 +2767,7 @@ def git_discard_branch(room_id: str, branch: str) -> dict:
         if park_error:
             return {"ok": False, "deleted": False, "stderr": park_error}
         _drop_volatile_worktree_remnants(root)
-        co = _run(["checkout", INTEGRATION_BRANCH], cwd=root)
+        co = _run(["checkout", integration], cwd=root)
         if co.returncode != 0:
             logger.warning(
                 "git_discard_branch: cannot leave %s for room %s: %s",
@@ -2413,7 +2777,7 @@ def git_discard_branch(room_id: str, branch: str) -> dict:
                 "ok": False, "deleted": False,
                 "stderr": (
                     f"the branch is checked out in the working tree and leaving it for "
-                    f"`{INTEGRATION_BRANCH}` failed: {co.stderr[:300]}"
+                    f"`{integration}` failed: {co.stderr[:300]}"
                 ),
             }
         chown_workspace_tree(room_id)  # checkout rewrote worktree files as root

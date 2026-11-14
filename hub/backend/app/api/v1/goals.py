@@ -177,9 +177,15 @@ async def resolve_goal_review_endpoint(
             detail=f"CI on the goal branch is {result.get('ci_status')!r} — pass force=true to merge anyway",
         )
     if result.get("conflict"):
+        from app.core.room_git_flow import room_working_branch
+
+        working = await room_working_branch(room_id, db)
         raise HTTPException(
             status_code=409,
-            detail="goal branch → dev did not merge cleanly — resolve the conflict manually (GIT_CONFLICT emitted)",
+            detail=(
+                f"goal branch → {working} did not merge cleanly — resolve the conflict "
+                "manually (GIT_CONFLICT emitted)"
+            ),
         )
     if not result.get("ok"):
         raise HTTPException(status_code=502, detail=f"Goal review failed: {result.get('error')}")
@@ -298,7 +304,10 @@ async def merge_goal_branch_endpoint(
     if result.get("conflict"):
         raise HTTPException(
             status_code=409,
-            detail="goal branch → dev did not merge cleanly — resolve the conflict manually (GIT_CONFLICT emitted)",
+            detail=(
+                f"goal branch → {cfg.working_branch} did not merge cleanly — resolve the "
+                "conflict manually (GIT_CONFLICT emitted)"
+            ),
         )
     if not result.get("ok"):
         raise HTTPException(status_code=502, detail=f"Goal merge failed: {result.get('error')}")

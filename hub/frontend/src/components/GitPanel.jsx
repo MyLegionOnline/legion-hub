@@ -3,7 +3,7 @@ import {
   GitBranch, GitMerge, GitCommit, Settings, Link2, Download, Upload,
   MoreHorizontal, CheckCircle2, XCircle, Loader2, AlertTriangle, Rocket,
   ExternalLink, Flag, Zap, ChevronRight, ChevronDown, Maximize2, X, RotateCcw,
-  GitCompare, Trash2,
+  GitCompare, Trash2, Pencil,
 } from 'lucide-react';
 import { useGitState, useGateActions } from '../context/GitStateContext';
 import { CiBadge, RiskBadge } from './GitFlowCards';
@@ -11,6 +11,10 @@ import { GitLinkModal } from './RepoPanel';
 import { ModalPortal } from './shared';
 import { releaseTagMessages } from '../lib/releaseTagI18n';
 import { PULL_CONFLICT_MESSAGE, requestPullConflict } from '../lib/remoteDivergence';
+import {
+  workingBranchRenameMessages, workingBranchNameProblem, renameRefusal,
+  requestWorkingBranchRename, fill,
+} from '../lib/workingBranchRename';
 
 /* internal design notes Stage 4 (header / gate queue / operations)
  *                  Stage 5 (BranchTree + expand modal) */
@@ -58,7 +62,7 @@ function PullConflictGateItem({ gate, roomId, token, onReview }) {
 
 /* ── GoalGateItem ─────────────────────────────────────────────────────────── */
 
-function GoalGateItem({ gate, roomId, token }) {
+function GoalGateItem({ gate, roomId, token, workingBranch }) {
   const { pending, error, publishBranch, resolveGate } = useGateActions(roomId, token);
   const [override, setOverride] = useState(false);
   const approveBlocked = gate.ci_status !== 'passed' && !override;
@@ -111,7 +115,7 @@ function GoalGateItem({ gate, roomId, token }) {
           }}
         >
           {pending === 'approve' ? <Loader2 size={9} className="animate-spin" /> : <CheckCircle2 size={9} />}
-          Merge into dev
+          Merge into {workingBranch}
         </button>
         <button
           type="button"
@@ -234,6 +238,7 @@ function BranchRow({ node, depth }) {
   const {
     expanded, toggleExpand, showMerged, onShowDiff, pending, errors, act, reviewDivergence,
     releaseBranch, workingBranch, dense, pushState, pushBranch, pullBranch, deleteState, deleteBranch, onRelease,
+    onRenameWorkingBranch,
   } = useContext(TreeCtx);
 
   const isLive = node.kind === 'session' && node.entity?.state === 'live';
@@ -356,6 +361,18 @@ function BranchRow({ node, depth }) {
             {releaseTagMessages().open}
           </button>
         )}
+        {node.kind === 'dev' && onRenameWorkingBranch && (
+          <button
+            data-testid="git-working-branch-rename"
+            onClick={e => { e.stopPropagation(); onRenameWorkingBranch(); }}
+            className="flex items-center gap-0.5 text-[8px] px-1 py-0.5 rounded-lg flex-shrink-0 font-medium transition-opacity opacity-0 group-hover:opacity-100 focus:opacity-100"
+            style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}
+            title={workingBranchRenameMessages().openTitle}
+            aria-label={workingBranchRenameMessages().openTitle}
+          >
+            <Pencil size={8} />
+          </button>
+        )}
         {/* Pull this branch from the remote — for when the same-named branch
             was edited there (e.g. someone fixed `dev` straight on GitHub). */}
         <button
@@ -458,7 +475,7 @@ function BranchRow({ node, depth }) {
 
 /* ── BranchTree ───────────────────────────────────────────────────────────── */
 
-export function BranchTree({ dense = true, onShowDiff, roomId, token, onRelease }) {
+export function BranchTree({ dense = true, onShowDiff, roomId, token, onRelease, onRenameWorkingBranch }) {
   const { state, invalidate, bumpWorkspace } = useGitState();
   const nodes = state?.branches ?? [];
   const releaseBranch = state?.flow?.release_branch ?? 'main';
@@ -683,6 +700,7 @@ export function BranchTree({ dense = true, onShowDiff, roomId, token, onRelease 
   const ctx = {
     expanded, toggleExpand, showMerged, onShowDiff, pending, errors, act, reviewDivergence,
     releaseBranch, workingBranch, dense, pushState, pushBranch, pullBranch, deleteState, deleteBranch, onRelease,
+    onRenameWorkingBranch,
   };
 
   if (nodes.length === 0) {
@@ -712,7 +730,7 @@ export function BranchTree({ dense = true, onShowDiff, roomId, token, onRelease 
 
 /* ── BranchTreeModal (⛶ expand view) ─────────────────────────────────────── */
 
-function BranchTreeModal({ roomId, token, onShowDiff, onClose, onRelease }) {
+function BranchTreeModal({ roomId, token, onShowDiff, onClose, onRelease, onRenameWorkingBranch }) {
   const handleShowDiff = (branch, base) => {
     onClose();
     onShowDiff?.(branch, base);
@@ -739,6 +757,7 @@ function BranchTreeModal({ roomId, token, onShowDiff, onClose, onRelease }) {
           </div>
           <div className="overflow-y-auto px-3 py-3 flex-1">
             <BranchTree onRelease={onRelease}
+              onRenameWorkingBranch={onRenameWorkingBranch}
               key={`modal-${roomId}`}
               dense={false}
               onShowDiff={handleShowDiff}
@@ -818,6 +837,165 @@ function ReleaseTagModal({ roomId, token, onClose }) {
   );
 }
 
+/* ── WorkingBranchRenameModal ─────────────────────────────────────────────────
+ * internal design notes Stage 4. */
+
+function collectBranchNames(nodes, out = []) {
+  for (const b of nodes || []) {
+    out.push(b.name);
+    collectBranchNames(b.children, out);
+  }
+  return out;
+}
+
+const CI_SNIPPET = (name) => `on:\n  push:\n    branches: [${name}]`;
+
+function WorkingBranchRenameModal({ roomId, token, current, release, hasRepo, existing, onClose, onRenamed }) {
+  const t = workingBranchRenameMessages();
+  const [name, setName] = useState('');
+  const [touched, setTouched] = useState(false);
+  const [pending, setPending] = useState(false);
+  const [refusal, setRefusal] = useState(null);
+  const [remoteExists, setRemoteExists] = useState(false);
+  const [result, setResult] = useState(null);
+
+  const trimmed = name.trim();
+  const problem = workingBranchNameProblem(trimmed, { current, release, existing });
+  const shown = trimmed || current;
+  const vars = { from: current, to: shown, release };
+
+  const submit = async (e, confirmRemoteExists = false) => {
+    e?.preventDefault();
+    if (pending || problem) { setTouched(true); return; }
+    setPending(true); setRefusal(null);
+    try {
+      const { ok, status, data } = await requestWorkingBranchRename(roomId, token, trimmed, { confirmRemoteExists });
+      if (ok && data.ok) {
+        setResult(data);
+        setRemoteExists(false);
+        onRenamed?.(data);
+      } else if (ok && data.remote_exists) {
+        setRemoteExists(true);
+      } else {
+        setRemoteExists(false);
+        setRefusal(renameRefusal(status, data.detail, t, vars));
+      }
+    } catch {
+      setRefusal({ message: t.failure, items: [] });
+    } finally {
+      setPending(false);
+    }
+  };
+
+  return (
+    <ModalPortal onClose={onClose}>
+      <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: 'rgba(0,0,0,0.55)' }}
+        onClick={e => { if (e.target === e.currentTarget && !pending) onClose(); }}>
+        <form onSubmit={submit} data-testid="working-branch-rename-form"
+          className="flex flex-col gap-3 p-4 rounded-xl w-[min(92vw,440px)] max-h-[85vh] overflow-y-auto"
+          style={{ background: 'var(--bg-panel)', color: 'var(--text-primary)', border: '1px solid var(--border)' }}>
+          <div className="flex items-center gap-2">
+            <GitBranch size={14} style={{ color: 'var(--accent-light)' }} />
+            <h2 className="font-medium text-sm">{t.title}</h2>
+          </div>
+
+          {result ? (
+            <p data-testid="working-branch-rename-success" className="text-xs" style={{ color: '#4ade80' }}>
+              {fill(result.changed === false ? t.unchanged : t.success, { to: result.to_branch })}
+            </p>
+          ) : (
+            <>
+              <p className="text-xs" style={{ color: 'var(--text-muted)' }}>{fill(t.intro, vars)}</p>
+              <label className="flex flex-col gap-1 text-xs">
+                {t.label}
+                <div className="flex items-center gap-1.5 text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                  <code>{current}</code> →
+                </div>
+                <input
+                  data-testid="working-branch-rename-input"
+                  autoFocus
+                  value={name}
+                  placeholder={t.placeholder}
+                  onChange={e => { setName(e.target.value); setTouched(true); setRemoteExists(false); setRefusal(null); }}
+                  className="rounded p-2 font-mono"
+                  style={{ background: 'var(--bg-hover)' }}
+                  aria-invalid={Boolean(touched && problem)}
+                  spellCheck={false}
+                  autoComplete="off"
+                />
+              </label>
+              {touched && problem && problem !== 'empty' && (
+                <p data-testid="working-branch-rename-problem" className="text-[11px]" style={{ color: '#f87171' }}>
+                  {fill(t.invalid[problem], vars)}
+                </p>
+              )}
+
+              <div className="flex flex-col gap-1 rounded-lg p-2 text-[11px]" style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}>
+                <span className="font-medium" style={{ color: 'var(--text-primary)' }}>{t.whatHappens}</span>
+                <ul className="list-disc pl-4 flex flex-col gap-1">
+                  <li>{fill(t.stepLocal, vars)}</li>
+                  {hasRepo ? (
+                    <>
+                      <li>{fill(t.stepPush, vars)}</li>
+                      <li>{fill(t.stepOldRemote, vars)}</li>
+                      <li>
+                        {fill(t.stepCi, vars)}
+                        <pre data-testid="working-branch-rename-ci" className="mt-1 rounded p-1.5 text-[10px] overflow-x-auto" style={{ background: 'var(--bg-panel)' }}>
+                          {CI_SNIPPET(shown)}
+                        </pre>
+                      </li>
+                    </>
+                  ) : (
+                    <li>{t.stepNoRepo}</li>
+                  )}
+                </ul>
+              </div>
+
+              {remoteExists && (
+                <div data-testid="working-branch-rename-remote-exists" className="flex flex-col gap-1.5 rounded-lg p-2 text-[11px]"
+                  style={{ background: 'rgba(251,191,36,0.1)', border: '1px solid rgba(251,191,36,0.4)', color: '#fbbf24' }}>
+                  <span className="flex items-start gap-1"><AlertTriangle size={12} className="shrink-0 mt-px" /> {fill(t.remoteExists, vars)}</span>
+                  <button type="button" data-testid="working-branch-rename-confirm-remote"
+                    onClick={e => submit(e, true)} disabled={pending}
+                    className="self-start rounded px-2 py-1 text-[11px] font-medium"
+                    style={{ background: 'rgba(251,191,36,0.2)', color: '#fbbf24', opacity: pending ? 0.6 : 1 }}>
+                    {fill(t.remoteExistsConfirm, vars)}
+                  </button>
+                </div>
+              )}
+
+              {refusal && (
+                <div role="alert" data-testid="working-branch-rename-error" className="text-[11px]" style={{ color: '#f87171' }}>
+                  <p>{refusal.message}</p>
+                  {refusal.items.length > 0 && (
+                    <ul className="list-disc pl-4 mt-0.5">
+                      {refusal.items.map(item => <li key={item}>{item}</li>)}
+                    </ul>
+                  )}
+                </div>
+              )}
+
+              <button type="submit" data-testid="working-branch-rename-submit"
+                disabled={pending || Boolean(problem) || remoteExists}
+                className="flex items-center justify-center gap-1.5 rounded p-2 text-sm"
+                style={{ background: 'var(--accent)', color: 'white', opacity: pending || problem || remoteExists ? 0.5 : 1 }}>
+                {pending && <Loader2 size={12} className="animate-spin" />}
+                {pending ? t.submitting : t.submit}
+              </button>
+            </>
+          )}
+          {result?.notes?.length > 0 && (
+            <ul data-testid="working-branch-rename-notes" className="list-disc pl-4 text-[11px]" style={{ color: 'var(--text-muted)' }}>
+              {result.notes.map(n => <li key={n}>{n}</li>)}
+            </ul>
+          )}
+          <button type="button" onClick={onClose} disabled={pending} className="text-xs">{result ? t.close : t.cancel}</button>
+        </form>
+      </div>
+    </ModalPortal>
+  );
+}
+
 /* ── GitPanel ─────────────────────────────────────────────────────────────── */
 
 export function GitPanel({ roomId, token, onShowDiff, onReviewPullConflict }) {
@@ -825,6 +1003,7 @@ export function GitPanel({ roomId, token, onShowDiff, onReviewPullConflict }) {
   const [gitModal, setGitModal] = useState(false);
   const [treeModal, setTreeModal] = useState(false);
   const [releaseModal, setReleaseModal] = useState(false);
+  const [renameModal, setRenameModal] = useState(false);
   const [showOverflow, setShowOverflow] = useState(false);
   const [opStatus, setOpStatus] = useState(null);
   const [pulling, setPulling] = useState(false);
@@ -843,6 +1022,9 @@ export function GitPanel({ roomId, token, onShowDiff, onReviewPullConflict }) {
   const releaseBranch = flow?.release_branch ?? 'main';
   const devNode = findBranchNode(state?.branches, workingBranch);
   const pendingAhead = devNode?.ahead ?? 0;
+  // internal design notes Stage 5 — another room published into the
+  // shared remote `main`; a Pull brings it into the working branch.
+  const remoteAhead = flow?.release_remote_ahead ?? 0;
   const hasOpenPromotion = gates.some(g => g.kind === 'promotion');
 
   const openPromotion = async () => {
@@ -962,6 +1144,28 @@ export function GitPanel({ roomId, token, onShowDiff, onReviewPullConflict }) {
 
       {/* ── Gate queue ────────────────────────────────────────────────────── */}
       <div className="flex flex-col gap-2">
+        {remoteAhead > 0 && (
+          <div
+            data-testid="release-remote-ahead"
+            className="flex items-center gap-2 px-2 py-1.5 rounded-xl text-[10px]"
+            style={{ background: 'rgba(251,191,36,0.10)', border: '1px solid rgba(251,191,36,0.35)', color: 'var(--text-secondary)' }}
+          >
+            <AlertTriangle size={12} style={{ color: '#fbbf24', flexShrink: 0 }} />
+            <span className="flex-1">
+              {releaseBranch} on the remote has {remoteAhead} commit(s) {workingBranch} does not have yet.
+              Pull them in before you publish.
+            </span>
+            <button
+              data-testid="release-remote-pull"
+              onClick={pull}
+              disabled={pulling || pushing}
+              className="px-2 py-0.5 rounded-lg text-[10px]"
+              style={{ background: 'var(--bg-hover)', color: 'var(--text-primary)', opacity: pulling || pushing ? 0.5 : 1 }}
+            >
+              {pulling ? 'Pulling…' : 'Pull'}
+            </button>
+          </div>
+        )}
         {gates.length === 0 ? (
           <p className="text-[10px] text-center px-2 py-1" style={{ color: 'var(--text-muted)' }}>
             {pendingAhead > 0
@@ -974,7 +1178,7 @@ export function GitPanel({ roomId, token, onShowDiff, onReviewPullConflict }) {
               return <PullConflictGateItem key={gate.id} gate={gate} roomId={roomId} token={token} onReview={onReviewPullConflict} />;
             }
             return gate.kind === 'goal_review'
-              ? <GoalGateItem key={gate.id} gate={gate} roomId={roomId} token={token} />
+              ? <GoalGateItem key={gate.id} gate={gate} roomId={roomId} token={token} workingBranch={workingBranch} />
               : <PromotionGateItem key={gate.id} gate={gate} roomId={roomId} token={token} />;
           })
         )}
@@ -1021,6 +1225,7 @@ export function GitPanel({ roomId, token, onShowDiff, onReviewPullConflict }) {
             key={`sidebar-${roomId}`}
             dense={true}
             onRelease={() => setReleaseModal(true)}
+            onRenameWorkingBranch={() => setRenameModal(true)}
             onShowDiff={onShowDiff}
             roomId={roomId}
             token={token}
@@ -1096,6 +1301,19 @@ export function GitPanel({ roomId, token, onShowDiff, onReviewPullConflict }) {
       )}
 
       {releaseModal && <ReleaseTagModal key={roomId} roomId={roomId} token={token} onClose={() => setReleaseModal(false)} />}
+      {renameModal && (
+        <WorkingBranchRenameModal
+          key={`rename-${roomId}`}
+          roomId={roomId}
+          token={token}
+          current={workingBranch}
+          release={releaseBranch}
+          hasRepo={hasRepo}
+          existing={collectBranchNames(state?.branches)}
+          onClose={() => setRenameModal(false)}
+          onRenamed={() => { invalidate(); bumpWorkspace(); }}
+        />
+      )}
 
       {/* ── Modals ────────────────────────────────────────────────────────── */}
       {gitModal && (
@@ -1115,6 +1333,7 @@ export function GitPanel({ roomId, token, onShowDiff, onReviewPullConflict }) {
           onShowDiff={onShowDiff}
           onClose={() => setTreeModal(false)}
           onRelease={() => { setTreeModal(false); setReleaseModal(true); }}
+          onRenameWorkingBranch={() => { setTreeModal(false); setRenameModal(true); }}
         />
       )}
     </div>

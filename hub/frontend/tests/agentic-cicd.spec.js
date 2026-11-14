@@ -139,12 +139,13 @@ function makeGitState({ devAhead = 0, gates = [], extraBranches = [] } = {}) {
 // ── installHarness ───────────────────────────────────────────────────────────
 
 async function installHarness(page, {
-  history = [], tasks = [], goals = [], promotionCi = 'failed', gitState = null,
+  history = [], tasks = [], goals = [], promotionCi = 'failed', gitState = null, renameResponses = [],
 } = {}) {
   const state = {
     resolveBodies: [], reverts: 0, promotionsOpened: 0, promotionCi,
     goalPublished: 0, goalResolveBodies: [], returnedToReview: [], mergedReviewed: [], goalMergedDirect: 0,
     divergenceReviewsRequested: [], divergenceResolveBodies: [], releaseTagBodies: [], releaseTagError: null,
+    renameBodies: [],
   };
 
   await page.addInitScript(() => {
@@ -178,6 +179,14 @@ async function installHarness(page, {
       state.releaseTagBodies.push(JSON.parse(request.postData() || '{}'));
       if (state.releaseTagError) return route.fulfill({ status: 409, json: { detail: { code: state.releaseTagError, message: 'error' } } });
       return route.fulfill({ json: { tag: 'v1.3.0', sha: 'a'.repeat(40) } });
+    }
+
+    if (method === 'POST' && path === `/api/v1/rooms/${ROOM_ID}/git/working-branch/rename`) {
+      const body = JSON.parse(request.postData() || '{}');
+      state.renameBodies.push(body);
+      const next = renameResponses[Math.min(state.renameBodies.length, renameResponses.length) - 1]
+        ?? { status: 200, json: { ok: true, changed: true, from_branch: 'dev', to_branch: body.name, notes: [] } };
+      return route.fulfill({ status: next.status ?? 200, json: next.json });
     }
 
     // git/state — single source of truth for GitPanel / GitFlowReviewCard
@@ -359,6 +368,50 @@ test('GitPanel offers Publish to main when dev has pending commits', async ({ pa
   await expect.poll(() => state.promotionsOpened).toBe(1);
 });
 
+test('GitPanel warns when the remote main moved and Pulls it in', async ({ page }) => {
+  // internal design notes Stage 5 — another room published first.
+  let remoteAhead = 2;
+  const gitState = () => {
+    const gs = makeGitState({ devAhead: 1 });
+    gs.flow = { ...gs.flow, working_branch: 'dev', release_remote_ahead: remoteAhead };
+    return gs;
+  };
+  const pullBodies = [];
+  await installHarness(page, { gitState });
+  await page.route('**/git/sync', route => {
+    pullBodies.push(route.request().postDataJSON());
+    remoteAhead = 0;
+    return route.fulfill({ json: { ok: true, synced: 1 } });
+  });
+  await openRoom(page);
+
+  const panel = page.getByTestId('git-panel');
+  const notice = panel.getByTestId('release-remote-ahead');
+  await expect(notice).toContainText('main on the remote has 2 commit(s) dev does not have yet');
+  await expect(panel.getByTestId('publish-to-main')).toBeVisible();
+
+  await notice.getByTestId('release-remote-pull').click();
+  await expect.poll(() => pullBodies.length).toBe(1);
+  expect(pullBodies[0]).toBeNull();
+  await expect(panel.getByTestId('release-remote-ahead')).toHaveCount(0);
+});
+
+test('GitPanel shows why publishing needs a Pull first', async ({ page }) => {
+  await installHarness(page, { gitState: makeGitState({ devAhead: 1 }) });
+  const detail = 'dev conflicts with the current main (it has moved since dev last took it in). '
+    + 'Press Pull on the Git tab to bring main into dev, resolve the conflict, then publish again.';
+  await page.route(`**/api/v1/rooms/${ROOM_ID}/promotions`, route => (
+    route.request().method() === 'POST'
+      ? route.fulfill({ status: 409, json: { detail } })
+      : route.fallback()
+  ));
+  await openRoom(page);
+
+  const panel = page.getByTestId('git-panel');
+  await panel.getByTestId('publish-to-main').click();
+  await expect(panel.getByText(detail)).toBeVisible();
+});
+
 test('GitPanel gate queue surfaces goal → dev gate with publish and approve', async ({ page }) => {
   const goalGate = {
     kind: 'goal_review', id: GOAL_ID,
@@ -383,6 +436,116 @@ test('GitPanel gate queue surfaces goal → dev gate with publish and approve', 
 
   await queue.getByTestId('goal-review-approve').click();
   await expect.poll(() => state.goalResolveBodies).toEqual([{ decision: 'approve' }]);
+});
+
+test('goal gate names a renamed working branch instead of dev', async ({ page }) => {
+  const goalGate = {
+    kind: 'goal_review', id: GOAL_ID, title: 'Ship the transport layer',
+    branch: `goal/${GOAL_ID}-ship`, ci_status: 'passed', diff_stat: '', can_publish: false, pr_url: null,
+  };
+  const gs = makeGitState({ gates: [goalGate] });
+  gs.flow.working_branch = 'core';
+  gs.branches[0].children[0].name = 'core';
+  await installHarness(page, { gitState: gs });
+  await openRoom(page);
+
+  const approve = page.getByTestId('git-gate-queue').getByTestId('goal-review-approve');
+  await expect(approve).toHaveText(/Merge into core/);
+  await expect(approve).not.toHaveText(/\bdev\b/);
+});
+
+// internal design notes Stage 4
+async function openRename(page) {
+  const row = page.getByTestId('git-panel').getByTestId('git-branch-row').filter({ hasText: /^dev/ }).first();
+  await row.hover();
+  await row.getByTestId('git-working-branch-rename').click();
+  return page.getByTestId('working-branch-rename-form');
+}
+
+test('working branch rename checks the name, explains the remote and renames', async ({ page }) => {
+  const gs = makeGitState({ extraBranches: [{
+    name: 'feature-x', kind: 'other', base: 'dev', merged: false, ahead: 1, behind: 0,
+    entity: null, ci_status: null, risk: null, action: 'merge', children: [],
+  }] });
+  const state = await installHarness(page, { gitState: gs });
+  await openRoom(page);
+
+  const form = await openRename(page);
+  const input = form.getByTestId('working-branch-rename-input');
+  const submit = form.getByTestId('working-branch-rename-submit');
+  await expect(submit).toBeDisabled();
+
+  for (const [bad, text] of [
+    ['main', 'cannot be the working branch'],
+    ['task/core', 'task/, goal/ or session/'],
+    ['\u044f\u0434\u0440\u043e', 'Latin letters'],
+    ['core..x', 'Not a valid branch name'],
+    ['feature-x', 'already exists'],
+    ['dev', 'already the working branch'],
+  ]) {
+    await input.fill(bad);
+    await expect(form.getByTestId('working-branch-rename-problem')).toContainText(text);
+    await expect(submit).toBeDisabled();
+  }
+
+  await input.fill('core');
+  await expect(form.getByTestId('working-branch-rename-problem')).toHaveCount(0);
+  await expect(form).toContainText('left as it is');
+  await expect(form.getByTestId('working-branch-rename-ci')).toContainText('branches: [core]');
+  await submit.click();
+  await expect.poll(() => state.renameBodies).toEqual([{ name: 'core', confirm_remote_exists: false }]);
+  await expect(form.getByTestId('working-branch-rename-success')).toContainText('now core');
+});
+
+test('working branch rename lists what blocks it', async ({ page }) => {
+  const state = await installHarness(page, {
+    renameResponses: [{ status: 409, json: { detail: {
+      code: 'work_in_progress', message: 'work is moving through the branch',
+      blockers: [
+        { kind: 'promotion', count: 1, message: 'server text' },
+        { kind: 'task', count: 2, message: 'server text' },
+      ],
+    } } }],
+  });
+  await openRoom(page);
+
+  const form = await openRename(page);
+  await form.getByTestId('working-branch-rename-input').fill('core');
+  await form.getByTestId('working-branch-rename-submit').click();
+
+  const error = form.getByTestId('working-branch-rename-error');
+  await expect(error).toContainText('while work is moving through it');
+  await expect(error).toContainText('A promotion to main is waiting for review');
+  await expect(error).toContainText('A task is running — wait for it to finish or pause it. (2)');
+  await expect(form.getByTestId('working-branch-rename-success')).toHaveCount(0);
+  expect(state.renameBodies).toHaveLength(1);
+});
+
+test('working branch rename asks before taking over a branch the remote already has', async ({ page }) => {
+  const state = await installHarness(page, {
+    renameResponses: [
+      { status: 200, json: { ok: false, changed: false, from_branch: 'dev', to_branch: 'core', remote_exists: true, remote_checked: true, notes: [] } },
+      { status: 200, json: { ok: true, changed: true, from_branch: 'dev', to_branch: 'core', remote_exists: true, remote_checked: true,
+        notes: ['The old branch dev on the remote was left alone.'] } },
+    ],
+  });
+  await openRoom(page);
+
+  const form = await openRename(page);
+  await form.getByTestId('working-branch-rename-input').fill('core');
+  await form.getByTestId('working-branch-rename-submit').click();
+
+  const warning = form.getByTestId('working-branch-rename-remote-exists');
+  await expect(warning).toContainText('already has a branch named core');
+  await expect(form.getByTestId('working-branch-rename-submit')).toBeDisabled();
+  await warning.getByTestId('working-branch-rename-confirm-remote').click();
+
+  await expect.poll(() => state.renameBodies).toEqual([
+    { name: 'core', confirm_remote_exists: false },
+    { name: 'core', confirm_remote_exists: true },
+  ]);
+  await expect(form.getByTestId('working-branch-rename-success')).toContainText('now core');
+  await expect(form.getByTestId('working-branch-rename-notes')).toContainText('left alone');
 });
 
 test('GitPanel replaces old Publish section — Git section follows Goals in sidebar', async ({ page }) => {

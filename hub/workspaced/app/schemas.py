@@ -190,10 +190,82 @@ class GitAuthorRequest(BaseModel):
     email: Optional[str] = Field(default=None, max_length=320)
 
 
+class GitInitRequest(BaseModel):
+    # Integration branch a new repo is checked out on; omitted → ``dev``.
+    working_branch: Optional[str] = None
+
+
+class GitEnsureBaseBranchesRequest(BaseModel):
+    # The Hub's ``git_config.working_branch``; omitted → the name the repo
+    # already records (default ``dev``).
+    working_branch: Optional[str] = None
+
+
 class GitEnsureBaseBranchesResponse(BaseModel):
     ok: bool
+    # True when the integration branch was created (name kept for old callers).
     created_dev: bool = False
+    working_branch: Optional[str] = None
+    # Set when an integration branch without work was renamed to the Hub's name.
+    renamed_from: Optional[str] = None
+    busy: bool = False
     error: Optional[str] = None
+
+
+class GitRenameWorkingBranchRequest(BaseModel):
+    from_branch: str
+    to_branch: str
+
+
+class GitRenameWorkingBranchResponse(BaseModel):
+    ok: bool
+    renamed: bool = False
+    # The new branch was started from ``main`` (no old branch, or no repo yet).
+    created: bool = False
+    from_branch: Optional[str] = None
+    to_branch: Optional[str] = None
+    head: Optional[str] = None
+    busy: bool = False
+    error: Optional[str] = None
+    # ``invalid_name`` / ``branch_exists`` on a refusal.
+    code: Optional[str] = None
+    stderr: Optional[str] = None
+
+
+class GitRemoteBranchExistsRequest(BaseModel):
+    remote_url: str
+    branch: str
+    token: Optional[str] = None
+
+
+class GitRemoteBranchExistsResponse(BaseModel):
+    ok: bool
+    exists: bool = False
+    error: Optional[str] = None
+
+
+class GitCatchUpReleaseRequest(BaseModel):
+    """internal design notes Stage 5."""
+
+    remote_url: str
+    token: Optional[str] = None
+
+
+class GitCatchUpReleaseResponse(BaseModel):
+    ok: bool
+    state: str = "busy"
+    local_sha: Optional[str] = None
+    main_sha: Optional[str] = None
+    remote_sha: Optional[str] = None
+    error: Optional[str] = None
+    busy: bool = False
+
+
+class GitReleaseRemoteStatusResponse(BaseModel):
+    ok: bool
+    remote_sha: Optional[str] = None
+    main_behind: Optional[int] = None
+    working_behind: Optional[int] = None
 
 
 class GitBackfillExcludesResponse(BaseModel):
@@ -318,6 +390,8 @@ class GitMainBypassRequest(BaseModel):
     # Commits the forge already has (its ``main`` head); unknown ones are ignored.
     exclude: list[str] = []
     limit: int = 20
+    # The room's integration branch; omitted → the one the repo records.
+    integration_branch: Optional[str] = None
 
 
 class GitReleaseTagRequest(BaseModel):
@@ -360,7 +434,8 @@ class GitAdoptRequest(BaseModel):
     remote_url: str
     branch: str = "main"
     token: Optional[str] = None
-    working_branch: str = "dev"
+    # Omitted → the integration branch the repo records (default ``dev``).
+    working_branch: Optional[str] = None
     # An explicit human choice: allow the transplant even on a room that
     # already has work (still refused while an unfinished task/* branch exists).
     force: bool = False
@@ -384,7 +459,8 @@ class GitAdoptResponse(BaseModel):
 class GitEnsureSharedGitignoreRequest(BaseModel):
     """internal design notes Stage 2 — branch to seed the shared file on."""
 
-    integration_branch: str = "dev"
+    # Omitted → the integration branch the repo records (default ``dev``).
+    integration_branch: Optional[str] = None
 
 
 class GitEnsureSharedGitignoreResponse(BaseModel):
@@ -476,6 +552,8 @@ class GitResetBranchResponse(BaseModel):
 
 class GitDiscardBranchRequest(BaseModel):
     branch: str
+    # The room's integration branch; omitted → the one the repo records.
+    working_branch: Optional[str] = None
 
 
 class GitDiscardBranchResponse(BaseModel):

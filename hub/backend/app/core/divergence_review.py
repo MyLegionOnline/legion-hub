@@ -38,6 +38,20 @@ from app.models.task import DispatchStatus, Task, TaskState
 
 logger = logging.getLogger(__name__)
 
+
+async def _room_working_branch(rid, db) -> str | None:
+    """The room's integration branch for workspaced; ``None`` (workspaced then
+    uses the one the repo records) when the room cannot be read."""
+    from app.core.room_git_flow import _working_branch
+
+    try:
+        name = await _working_branch(rid, db)
+    except Exception:  # noqa: BLE001 — best effort, workspaced has a fallback
+        logger.warning("divergence_review: could not read the working branch of %s", rid)
+        return None
+    return name if isinstance(name, str) else None
+
+
 DECISIONS = ("take_branch", "rework", "delete_branch")
 
 _ANALYSIS_SCHEMA: dict[str, Any] = {
@@ -45,7 +59,7 @@ _ANALYSIS_SCHEMA: dict[str, Any] = {
     "properties": {
         "summary": {
             "type": "string",
-            "description": "1-2 sentences: the essence of the divergence between the task branch and dev.",
+            "description": "1-2 sentences: the essence of the divergence between the task branch and its base.",
         },
         "branch_side": {
             "type": "string",
@@ -53,7 +67,7 @@ _ANALYSIS_SCHEMA: dict[str, Any] = {
         },
         "base_side": {
             "type": "string",
-            "description": "What arrived in the base (dev/goal) after the fork and why it overlaps.",
+            "description": "What arrived in the base (the working branch or a goal branch) after the fork and why it overlaps.",
         },
         "conflict_explanation": {
             "type": "string",
@@ -81,7 +95,7 @@ _ANALYSIS_SCHEMA: dict[str, Any] = {
             "type": "string",
             "description": (
                 "A self-contained brief for the responsible agent if rework is chosen: "
-                "what to carry over from the branch, a mandatory requirement to rebase onto dev, "
+                "what to carry over from the branch, a mandatory requirement to rebase onto the base branch, "
                 "which files not to touch. Be sure to name the SPECIFIC input files "
                 "the agent must open (mockup/reference, design spec, "
                 "affected code — with exact paths from the workspace root), and which "
@@ -104,7 +118,7 @@ _ANALYSIS_SCHEMA: dict[str, Any] = {
 }
 
 _SYSTEM_PROMPT = (
-    "You are ChatMaster. A task branch has diverged from its base (dev or a goal branch): "
+    "You are ChatMaster. A task branch has diverged from its base (the room's working branch or a goal branch): "
     "a flat 3-way merge failed because of overlapping edits. The user cannot "
     "sort it out alone. Analyze the divergence data package and explain in plain "
     "language: what the branch did, what arrived in the base, where and why the conflict is. Then for "
@@ -390,7 +404,9 @@ def _fallback_analysis(report: dict) -> dict:
         "take_branch_consequence": (
             f"The base's changes in files {', '.join(overlap) or '(overlap)'} will be replaced by the branch version."
         ),
-        "rework_consequence": "A new task will carry the needed parts of the branch over the current dev.",
+        "rework_consequence": (
+            f"A new task will carry the needed parts of the branch over the current {report.get('base') or 'base'}."
+        ),
         "delete_branch_consequence": (
             f"The branch's work ({len(report.get('branch_commits') or [])} commits) will go to a backup tag and out of active development."
         ),
@@ -515,10 +531,10 @@ def _degraded_analysis(reason: str, branch: str | None, base: str | None) -> dic
         "recommendation": "rework",
         "recommendation_reason": "Without a detailed analysis it is safer to hand the rework to a separate task.",
         "take_branch_consequence": "The base's changes in overlapping files will be replaced by the branch version — check the Diff before choosing.",
-        "rework_consequence": "A new task will carry the needed parts of the branch over the current dev.",
+        "rework_consequence": f"A new task will carry the needed parts of the branch over the current {base or 'base'}.",
         "delete_branch_consequence": "The branch's work will go to a backup tag and out of active development.",
         "rework_brief": (
-            f"Carry the edits of branch {branch} over to the current {base or 'dev'}, "
+            f"Carry the edits of branch {branch} over to the current {base or 'base'}, "
             "without rolling back the base's changes. You must rebase before working."
         ),
     }
@@ -700,7 +716,9 @@ async def resolve_divergence(
 
     if decision == "delete_branch":
         try:
-            res = await wsd.git_discard_branch_workspace(str(rid), branch)
+            res = await wsd.git_discard_branch_workspace(
+                str(rid), branch, working_branch=await _room_working_branch(rid, db)
+            )
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "detail": f"could not delete the branch: {exc}"}
         if res.get("busy"):
@@ -812,7 +830,9 @@ async def _spawn_rework_task(rid: UUID, task: Task, base: str, note: str | None,
     backup_ref = None
     if stale_branch:
         try:
-            res = await wsd.git_discard_branch_workspace(str(rid), stale_branch)
+            res = await wsd.git_discard_branch_workspace(
+                str(rid), stale_branch, working_branch=await _room_working_branch(rid, db)
+            )
             if res.get("ok"):
                 backup_ref = res.get("backup_ref")
             else:

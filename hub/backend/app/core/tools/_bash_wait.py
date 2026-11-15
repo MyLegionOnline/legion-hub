@@ -35,24 +35,21 @@ _TAIL_LINES = 40
 class BashWaitTool(Tool):
     name = TOOL_NAME
     description = (
-        "Wait for a background process started with bash(background=true) to finish, "
-        f"for up to max_wait_sec (1–{MAX_WAIT_SECONDS}). Returns as soon as the process exits, with its "
-        "exit code and the tail of its log; if it is still running at the deadline the status is "
-        "'running' — call bash_wait again. Use this instead of polling bash_output in a loop: it "
-        "does not use up your tool-call budget and the waiting time does not count against the "
-        "task time limit. Run long installs/builds with bash(background=true) and then bash_wait."
+        "Wait for a background bash process to exit; returns its exit code and log tail, or "
+        "status 'running' at the deadline (call again). Free: no tool-call budget, no task "
+        "time — use it instead of polling bash_output."
     )
     input_schema: dict[str, Any] = {
         "type": "object",
         "properties": {
             "bg_id": {
                 "type": "string",
-                "description": "Background process ID returned by bash(background=true)",
+                "description": "From bash(background=true).",
             },
             "max_wait_sec": {
                 "type": "integer",
                 "default": 120,
-                "description": f"Longest time to wait in this call (1–{MAX_WAIT_SECONDS} seconds)",
+                "description": f"Seconds, 1–{MAX_WAIT_SECONDS}.",
             },
         },
         "required": ["bg_id"],

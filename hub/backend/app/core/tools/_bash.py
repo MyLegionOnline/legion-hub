@@ -61,6 +61,16 @@ _NO_NETWORK_HINT = (
 
 _BG_MAX = 5  # max concurrent background processes per workspace
 
+# Guidance for the rare ``secrets``/``environment`` parameters lives here, not
+# in the schema the model pays for on every step: it is shown only when the
+# agent gets one of them wrong (internal design notes S1).
+_SECRETS_HINT = (
+    "\n[bash secrets=[...] takes names of Room secrets (room_config lists them); you "
+    "never see values — use $NAME in cmd. Room variables are already in env: do not list "
+    "them. A deploy SSH key becomes a temp file with GIT_SSH_COMMAND set, so plain "
+    "git push/clone over ssh works. environment='staging' etc. picks scoped values.]"
+)
+
 # A synchronous call is capped at 120 s, but a package install over a slow
 # mirror routinely outruns that and forced the agent into background + polling
 # (a tool-call step per poll). Recognised install commands get a longer window.
@@ -135,88 +145,59 @@ def _classify_single_file_cat(cmd: str) -> str | None:
 class BashTool(Tool):
     name = "bash"
     description = (
-        "Run a shell command in the workspace container. Returns exit_code, stdout, stderr.\n"
-        "The workspace root is the current directory; cwd accepts a relative path "
-        "(legacy /workspace/... is normalized).\n"
-        "• cwd: working directory for this call only — NOT preserved between calls; "
-        "use 'cd dir && cmd' to chain within one call.\n"
-        "• background=true: start a temporary non-user-facing watcher. User-visible web/API/worker apps "
-        "must use workspace_service instead when it is enabled; if workspace_service reports that "
-        "services are disabled on this deployment, background=true is the way to run them. "
-        "Returns a bg_id; use bash_wait(bg_id) to wait for it to finish (installs, builds — a sync call is "
-        "capped at 120 s), bash_output(bg_id) to read its log and bash_kill(bg_id) to stop it.\n"
-        "• Large output (>16 KB) is saved to /workspace/.legion/logs/ and you get the tail + path.\n"
-        "• Headless-browser renders (Remotion, Playwright, Puppeteer) take 100+ processes/threads "
-        "each and the container has a fixed process limit: run them with background=true and "
-        "one browser at a time (e.g. `remotion render/still --concurrency=1`), never several in parallel.\n"
-        f"• Max {_BG_MAX} concurrent background processes per workspace."
+        "Run a shell command in the workspace (bash -c); returns exit_code, stdout, stderr. "
+        "cwd applies to this call only — chain with 'cd dir && cmd'.\n"
+        "• A sync call is capped at 120 s (installs get longer automatically). For longer work use "
+        "background=true, then bash_wait(bg_id); bash_output/bash_kill read or stop it "
+        f"(max {_BG_MAX} at once). User-facing web/API apps go through workspace_service instead.\n"
+        "• Output over 16 KB is saved under .legion/logs/; you get the tail and the path.\n"
+        "• No root: install system libraries, toolchains and caches under .legion/local/ "
+        "(kept across restarts, never committed).\n"
+        "• Headless browsers (Remotion, Playwright, Puppeteer) need 100+ processes: run one at a "
+        "time in background (e.g. --concurrency=1)."
     )
     input_schema: dict[str, Any] = {
         "type": "object",
         "properties": {
             "cmd": {
                 "type": "string",
-                "description": "Shell command to run (executed as: bash -c <cmd>)",
+                "description": "Shell command.",
             },
             "timeout_sec": {
                 "type": "integer",
                 "default": 30,
-                "description": (
-                    "Execution timeout in seconds (1–120); ignored when background=true. "
-                    "Package-install commands (pip/apt/npm/…) get a longer window "
-                    f"(up to {_INSTALL_MAX_TIMEOUT_SEC} s) automatically."
-                ),
+                "description": "Seconds, 1–120 (installs get more automatically).",
             },
             "cwd": {
                 "type": "string",
                 "default": "/workspace",
-                "description": "Workspace-relative working directory (default root). NOT preserved between calls.",
+                "description": "Workspace-relative directory for this call.",
             },
             "background": {
                 "type": "boolean",
                 "default": False,
-                "description": (
-                    "Run as a background process. Returns bg_id immediately; "
-                    "use bash_output(bg_id) to read output and bash_kill(bg_id) to stop."
-                ),
+                "description": "Start in the background and return a bg_id.",
             },
             "secrets": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": (
-                    "Names of Room secrets (from the Room's Secrets & variables tab) to "
-                    "resolve and inject into this command's env. You only ever see the "
-                    "name, never the value — reference it as $NAME in cmd. Room variables "
-                    "are always in env already; this is only for secrets. A name bound as "
-                    "a deploy SSH key is not put in env — it's written to a tmpfs file for "
-                    "this command only and GIT_SSH_COMMAND is set automatically, so a plain "
-                    "'git push'/'git clone' over ssh just works. Not usable with background=true."
-                ),
+                "description": "Room secret names to put in env as $NAME (values stay hidden).",
             },
             "wake_on_exit": {
                 "type": "boolean",
                 "default": False,
                 "description": (
-                    "background=true only, direct chat only. For a process that may run longer "
-                    "than a few minutes (a long build, a render, a download): start it with "
-                    "wake_on_exit=true, tell the user briefly what you are waiting for, and END "
-                    "YOUR TURN. You are resumed automatically — once — when the process exits, "
-                    "with its exit code and log tail. Do not poll while waiting."
+                    "Direct chat, with background: resume me once when the process exits; "
+                    "end the turn instead of polling."
                 ),
             },
             "wake_note": {
                 "type": "string",
-                "description": (
-                    "With wake_on_exit: a short note to your future self — what to do once the "
-                    "process finishes (it is shown to you when you are resumed)."
-                ),
+                "description": "With wake_on_exit: note shown to you on resume.",
             },
             "environment": {
                 "type": "string",
-                "description": (
-                    "Room environment to resolve variables/secrets for (e.g. 'staging', "
-                    "'production'). Omit for the Room's shared (non-environment-scoped) values."
-                ),
+                "description": "Room environment for variables/secrets, e.g. 'staging'.",
             },
         },
         "required": ["cmd"],
@@ -228,7 +209,7 @@ class BashTool(Tool):
     async def execute(self, ctx: ToolContext, tool_input: dict[str, Any]) -> str:
         from app.core import workspaced_client as wsd
 
-        cmd = str(tool_input.get("cmd") or "").strip()
+        cmd = str(tool_input.get("cmd") or tool_input.get("command") or "").strip()
         try:
             timeout_sec = _effective_timeout(cmd, tool_input.get("timeout_sec"))
         except (TypeError, ValueError):
@@ -244,19 +225,19 @@ class BashTool(Tool):
         sid = str(ctx.session_id)
 
         if not cmd:
-            return "Error: cmd is required"
+            return "Error: cmd is required — pass the shell command as the `cmd` argument"
 
         secrets_requested = tool_input.get("secrets")
         if secrets_requested is not None:
             if not isinstance(secrets_requested, list) or not all(
                 isinstance(s, str) for s in secrets_requested
             ):
-                return "Error: secrets must be a list of strings"
+                return "Error: secrets must be a list of strings" + _SECRETS_HINT
             if len(secrets_requested) > 20:
                 return "Error: at most 20 secrets per call"
         environment = tool_input.get("environment")
         if environment is not None and not isinstance(environment, str):
-            return "Error: environment must be a string"
+            return "Error: environment must be a string" + _SECRETS_HINT
 
         denied = _check_deny(cmd)
         if denied:
@@ -278,7 +259,10 @@ class BashTool(Tool):
             # it — the launcher exec below returns as soon as the background
             # process is spawned, and the key would be removed before the
             # detached command actually uses it (plan §3.3).
-            return "Error: deploy-key secrets cannot be used with background=true"
+            return (
+                "Error: deploy-key secrets cannot be used with background=true — the key "
+                "exists only for one synchronous call; run the git command without background"
+            )
 
         if background:
             return await self._run_background(
@@ -360,11 +344,11 @@ class BashTool(Tool):
                     environment=environment,
                 )
             except room_secrets.RoomSecretNotAvailable as exc2:
-                return {}, {}, [], f"Error: [{exc2.code}] {exc2}"
+                return {}, {}, [], f"Error: [{exc2.code}] {exc2}{_SECRETS_HINT}"
             except room_secrets.RoomSecretError as exc2:
                 return {}, {}, [], f"Error: {exc2}"
         except room_secrets.RoomSecretNotAvailable as exc:
-            return {}, {}, [], f"Error: [{exc.code}] {exc}"
+            return {}, {}, [], f"Error: [{exc.code}] {exc}{_SECRETS_HINT}"
         except room_secrets.RoomSecretError as exc:
             return {}, {}, [], f"Error: {exc}"
 
@@ -704,6 +688,11 @@ class BashTool(Tool):
                     )
             except asyncio.TimeoutError:
                 msg = f"Error: execution timed out after {timeout_sec}s"
+                if not install:
+                    msg += (
+                        "\n[a sync call is capped at 120 s: run long work with "
+                        "background=true, then bash_wait(bg_id)]"
+                    )
                 if install:
                     msg += (
                         "\n[install still running in the container is not killed; run it with "

@@ -23,17 +23,17 @@ class ObservationReadTool(Tool):
         "properties": {
             "ref": {
                 "type": "string",
-                "description": "Observation reference returned by a workspace tool",
+                "description": "Observation ref.",
             },
             "offset": {
                 "type": "integer",
                 "default": 1,
-                "description": "1-indexed line offset within the stored observation",
+                "description": "1-indexed line.",
             },
             "limit": {
                 "type": "integer",
                 "default": 100,
-                "description": "Number of lines to return (maximum 200)",
+                "description": "Lines (max 200).",
             },
         },
         "required": ["ref"],

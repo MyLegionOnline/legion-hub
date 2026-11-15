@@ -20,15 +20,9 @@ _REREAD_WARNING = (
 class ReadFileTool(Tool):
     name = "read_file"
     description = (
-        "Read a file from the workspace. "
-        "The current directory is the workspace root; use workspace-relative paths. "
-        "Legacy /workspace/... paths are accepted and normalized once. "
-        "Returns content with 1-indexed line numbers. "
-        "Default: first 100 lines (hard maximum 200). Use offset/limit to page through large files. "
-        "Must be called before edit_file. "
-        "PREFER grep to locate a specific section first, then read only that section. "
-        "NEVER re-read a file from offset=1 if you already read it — use grep + targeted offset instead. "
-        "Need 2+ files at once? Use read_files instead of multiple read_file calls."
+        "Read a workspace file with 1-indexed line numbers: 100 lines by default, 200 max; "
+        "page with offset/limit. Locate the section with grep first and read only that; never "
+        "re-read from line 1. For 2+ known files use read_files."
     )
     role_descriptions: dict[str, str] = {
         "cm": (
@@ -47,16 +41,16 @@ class ReadFileTool(Tool):
         "properties": {
             "path": {
                 "type": "string",
-                "description": "Path relative to the workspace root (legacy /workspace/... is also accepted)",
+                "description": "Workspace-relative path.",
             },
             "offset": {
                 "type": "integer",
-                "description": "First line to read, 1-indexed (default: 1)",
+                "description": "First line, 1-indexed.",
                 "default": 1,
             },
             "limit": {
                 "type": "integer",
-                "description": "Maximum number of lines to return (default: 100). Pass a larger value only when you need more.",
+                "description": "Max lines (default 100).",
             },
         },
         "required": ["path"],

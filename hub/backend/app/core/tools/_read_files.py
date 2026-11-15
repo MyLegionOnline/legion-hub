@@ -23,14 +23,9 @@ _BATCH_MAX_OUTPUT = 24_000
 class ReadFilesTool(Tool):
     name = "read_files"
     description = (
-        "Read up to 8 files from the workspace in a single call — use this instead of "
-        "multiple read_file calls when you already know the set of files you need "
-        "(e.g. a template + its base template + its view + its model). "
-        "Each file is returned whole if it is small (<= 300 lines), otherwise only the "
-        "first 100 lines are returned (use read_file with offset/limit to page through a "
-        "large file). Files already read this session with unchanged content come back as "
-        "a short receipt instead of full text. Marks every path as read for edit_file, "
-        "exactly like read_file does."
+        "Read up to 8 known files in one call: files up to 300 lines whole, larger ones "
+        "their first 100 lines (page with read_file). Unchanged files already read come back "
+        "as a short receipt. Counts as a read for edit_file."
     )
     input_schema: dict[str, Any] = {
         "type": "object",
@@ -40,7 +35,7 @@ class ReadFilesTool(Tool):
                 "items": {"type": "string"},
                 "minItems": 1,
                 "maxItems": _MAX_PATHS,
-                "description": "Workspace-relative paths to read (max 8 per call).",
+                "description": "Workspace-relative paths.",
             },
         },
         "required": ["paths"],

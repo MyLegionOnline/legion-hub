@@ -197,7 +197,20 @@ _LEGION_LOCAL_EXCLUDES = (
     # and an agent's ``git add -A`` would push them into the client's repo.
     ".legion/plans/\n"
     ".legion/drafts/\n"
+    # Everything else under ``.legion/`` is room-local too: venvs
+    # (``environments/``), materialized skills, ``bash`` output logs, media
+    # caches, and whatever an agent stashes there to survive a restart — e.g. a
+    # hand-extracted ``libroot/`` of ``.deb`` packages. ``.legion/`` is
+    # therefore an allowlist: only the shared configs below are ever committed.
+    # The negations must follow ``.legion/*``; ``_write_local_excludes`` appends
+    # missing lines in this order.
+    ".legion/*\n"
+    + "".join(f"!{p}\n" for p in ("/.legion/run.json", "/.legion/services.json"))
 )
+
+# ``.legion/`` files that belong to the project and stay tracked: the CI config
+# (``run.json``) and the Browser services manifest (``services.json``).
+_TRACKED_LEGION_FILES = (".legion/run.json", ".legion/services.json")
 # Until the first outgoing push there is no shared ``.gitignore`` yet, so the
 # room clone's ``.git/info/exclude`` carries the union — that keeps the agent's
 # ``git add -A`` / ``git status`` clean without committing anything.
@@ -228,7 +241,14 @@ _VOLATILE_LEGION_PATHS = (".legion/generation.json", ".legion/runs")
 # ``_VOLATILE_LEGION_PATHS`` they are never deleted from the working tree. Once
 # untracked they are covered by ``.git/info/exclude``, and git treats ignored
 # files as expendable on checkout, so they cannot block the switch either.
-_UNTRACK_LEGION_PATHS = (*_VOLATILE_LEGION_PATHS, ".legion/bg")
+#
+# Since ``.legion/`` became an allowlist this is the whole directory minus
+# ``_TRACKED_LEGION_FILES`` — a room that already committed, say, an agent's
+# ``.legion/libroot/`` drops it from the index on its next commit or switch.
+_UNTRACK_LEGION_PATHS = (
+    ".legion",
+    *(f":(exclude){p}" for p in _TRACKED_LEGION_FILES),
+)
 
 
 def _workspace_root(room_id: str) -> Path:
@@ -298,7 +318,7 @@ def _userfiles_excluded(root: Path) -> bool:
         return False
 
 
-def _stage_all(root: Path) -> None:
+def _stage_all(root: Path) -> list[str]:
     """``git add -A`` that can never stage room-private files.
 
     ``.git/info/exclude`` is only a *local* rule that a one-off backfill wrote,
@@ -307,9 +327,80 @@ def _stage_all(root: Path) -> None:
     therefore re-asserts the rule first and, independently of it, carves
     ``.userfiles`` out with an exclude pathspec — that also covers a file which
     is already tracked, which the exclude file would not.
+
+    Room-local ``.legion/`` content a legacy room still tracks is unstaged too
+    (the working copy stays), and newly added machine binaries are held back by
+    ``_hold_back_binaries``. Returns the held-back paths.
     """
     _write_local_excludes(root)
+    _untrack_volatile_legion_paths(root)
     _run(["add", "-A", "--", ".", f":(exclude){USERFILES_DIR}"], cwd=root)
+    return _hold_back_binaries(root)
+
+
+# Package archives and native libraries: build/runtime artefacts of *this*
+# container, never project source. ``.so`` also matches versioned names such as
+# ``libX11.so.6.4.0`` and the symlinks pointing at them.
+_BINARY_SUFFIXES = (".deb", ".rpm", ".so")
+_SO_VERSIONED = re.compile(r"\.so(\.\d+)+$")
+_ELF_MAGIC = b"\x7fELF"
+_HOLD_BACK_HEADER = "# Legion: machine binaries kept out of git (auto)"
+# Cap per call: a dump of thousands of files is reported by count beyond this.
+_HOLD_BACK_REPORT_MAX = 50
+
+
+def _is_machine_binary(root: Path, rel: str) -> bool:
+    """A native library, executable or OS package — by name or ELF header."""
+    name = rel.rsplit("/", 1)[-1].lower()
+    if name.endswith(_BINARY_SUFFIXES) or _SO_VERSIONED.search(name):
+        return True
+    p = root / rel
+    try:
+        if p.is_symlink() or not p.is_file():
+            return False
+        with p.open("rb") as fh:
+            return fh.read(4) == _ELF_MAGIC
+    except OSError:
+        return False
+
+
+def _gitignore_literal(rel: str) -> str:
+    """An anchored ``.git/info/exclude`` line matching exactly ``rel``."""
+    escaped = re.sub(r"([\\*?\[\]!#])", r"\\\1", rel)
+    if escaped.endswith(" "):
+        escaped = escaped[:-1] + "\\ "
+    return "/" + escaped
+
+
+def _hold_back_binaries(root: Path) -> list[str]:
+    """Unstage newly added machine binaries and ignore them locally.
+
+    Agents that lack root install system libraries by hand — ``apt-get
+    download`` + ``dpkg -x`` into the workspace, the only path that survives a
+    restart — and the next ``git add -A`` would ship hundreds of ``.deb`` /
+    ``.so`` files into the client's repository. Only *added* paths are
+    considered: a binary the project already tracks is its own business, and an
+    explicit ``git add -f`` by a human still works because the rule is local.
+    Each held-back path is written to ``.git/info/exclude`` so the agent's own
+    ``git add -A`` skips it from then on. Best-effort, never raises.
+    """
+    try:
+        r = _run(["diff", "--cached", "--name-only", "--diff-filter=A", "-z"], cwd=root)
+        if r.returncode != 0:
+            return []
+        added = [p for p in r.stdout.split("\0") if p]
+        held = [p for p in added if _is_machine_binary(root, p)]
+        if not held:
+            return []
+        for i in range(0, len(held), 200):
+            _run(["rm", "--cached", "--quiet", "--", *held[i:i + 200]], cwd=root)
+        lines = [_HOLD_BACK_HEADER, *(_gitignore_literal(p) for p in held)]
+        _write_local_excludes(root, "\n".join(lines) + "\n")
+        logger.info("held back %d machine binaries from commit in %s", len(held), root)
+        return held
+    except Exception as exc:  # pragma: no cover — never block a commit
+        logger.warning("binary hold-back failed in %s: %s", root, exc)
+        return []
 
 
 def is_path_tracked(room_id: str, path: str) -> bool:
@@ -806,8 +897,12 @@ def git_commit(
     message: str,
     allow_main_commit: bool = False,
     only_path: Optional[str] = None,
+    report: Optional[dict] = None,
 ) -> Optional[str]:
     """Stage everything and commit. Returns new HEAD sha, or None if nothing changed.
+
+    ``report``, when given, receives ``held_back``: the machine binaries the
+    staging step kept out of this commit (see ``_hold_back_binaries``).
 
     ``only_path`` commits just that one workspace-relative file and leaves every
     other pending change (an agent's half-done edit) staged or not exactly as it
@@ -834,7 +929,9 @@ def git_commit(
         _run(["add", "-A", "--", rel], cwd=root)
         r = _run(["commit", "-m", message, "--", rel], cwd=root)
     else:
-        _stage_all(root)
+        held = _stage_all(root)
+        if report is not None:
+            report["held_back"] = held
         r = _run(["commit", "-m", message], cwd=root)
     if r.returncode != 0:
         output = r.stdout + r.stderr

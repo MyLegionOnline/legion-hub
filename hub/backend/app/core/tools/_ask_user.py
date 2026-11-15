@@ -28,11 +28,7 @@ _SCHEMA: dict[str, Any] = {
     "properties": {
         "questions": {
             "type": "array",
-            "description": (
-                "List of 1-2 questions to present to the user. "
-                "Each question offers 2-4 predefined options; the user may also "
-                "type a free-text answer ('Other')."
-            ),
+            "description": "The user may also answer in free text.",
             "minItems": 1,
             "maxItems": 2,
             "items": {
@@ -40,16 +36,15 @@ _SCHEMA: dict[str, Any] = {
                 "properties": {
                     "question": {
                         "type": "string",
-                        "description": "Complete question text, ending with a question mark.",
+                        "description": "Full question ending with '?'.",
                     },
                     "header": {
                         "type": "string",
-                        "description": "Short chip label shown above the options (max 12 chars).",
+                        "description": "Chip label.",
                         "maxLength": 12,
                     },
                     "options": {
                         "type": "array",
-                        "description": "2-4 mutually exclusive answer choices.",
                         "minItems": 2,
                         "maxItems": 4,
                         "items": {
@@ -57,11 +52,11 @@ _SCHEMA: dict[str, Any] = {
                             "properties": {
                                 "label": {
                                     "type": "string",
-                                    "description": "Concise option name (1-5 words).",
+                                    "description": "1-5 words.",
                                 },
                                 "description": {
                                     "type": "string",
-                                    "description": "Brief explanation of what this option means.",
+                                    "description": "What it means.",
                                 },
                             },
                             "required": ["label", "description"],
@@ -70,7 +65,6 @@ _SCHEMA: dict[str, Any] = {
                     "multi_select": {
                         "type": "boolean",
                         "default": False,
-                        "description": "Allow selecting multiple options simultaneously.",
                     },
                 },
                 "required": ["question", "header", "options"],
@@ -84,13 +78,9 @@ _SCHEMA: dict[str, Any] = {
 class AskUserTool(Tool):
     name = "ask_user"
     description = (
-        "Pause the current task session and ask the user a clarifying question. "
-        "The session resumes automatically when the user clicks an option or types "
-        f"a free-text answer. If the user does not respond within "
-        f"{_TIMEOUT // 60} minutes the session resumes on its own with a "
-        "'user is away' message — always use your best judgement in that case. "
-        "Use this ONLY when a decision truly requires user input that cannot be "
-        "inferred from context. Provide 2-4 concrete options per question."
+        "Pause and ask the user a question with 2-4 concrete options — ONLY for a "
+        "decision you cannot infer from context. You resume when they answer; after "
+        f"{_TIMEOUT // 60} minutes you resume with 'user is away' — then use your best judgement."
     )
     input_schema = _SCHEMA
     roles = frozenset({"agent"})

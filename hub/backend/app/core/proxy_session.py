@@ -119,12 +119,15 @@ from app.db.release import release_db
 from app.core.secrets.crypto import SecretValue
 from app.core.secrets.runtime import legacy_secret_value, resolve_agent_secret
 from app.models.secret import SecretPurpose
+from app.core.tool_offer import LOAD_TOOLS, ToolOffer
 from app.core.session_close import (
     ANTHROPIC_CLOSE_TOOL,
     OPENAI_CLOSE_TOOL,
     SessionCloseActions,
     ToolArgumentsParseError,
     apply_close_actions,
+    close_tool_for_kind,
+    malformed_arguments_result,
     clean_reply_text,
     extract_close_actions_from_tool_use,
     flush_session_memory,
@@ -180,7 +183,7 @@ _MCP_FAILURE_CIRCUIT_LIMIT = int(os.getenv("MCP_FAILURE_CIRCUIT_LIMIT", "2"))
 # Calls that never spend the tool-call budget: closing the session, and
 # ``bash_wait`` (blocks on a background process; its time is credited back to
 # the deadline through app.core.run_clock, so waiting is not work).
-_FREE_TOOLS = frozenset({"close_session", "bash_wait"})
+_FREE_TOOLS = frozenset({"close_session", "bash_wait", LOAD_TOOLS})
 
 # While an LLM call is in flight, an ephemeral llm_heartbeat status is broadcast
 # every N seconds so the frontend can show "thinking for Ns…".
@@ -1681,6 +1684,25 @@ async def _call_with_heartbeat(
             await asyncio.gather(llm_task, return_exceptions=True)
 
 
+# close_session fields each proxy side may set (session_close._KIND_ALLOWED).
+# apply_close_actions drops every other field anyway, so offering the full
+# schema only cost ~3.5k chars per step (internal design notes S1).
+# A run_subtask child reports file_writes to its parent, like the agent side.
+_CLOSE_KIND_BY_ROLE = {
+    "agent": "cm_agent_proxy_agent",
+    "agent_subtask": "cm_agent_proxy_agent",
+    "chat_master": "cm_agent_proxy_chat_master",
+}
+
+
+def close_tools_for_role(context_role: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Anthropic and OpenAI close_session schemas for one proxy loop role."""
+    kind = _CLOSE_KIND_BY_ROLE.get(context_role)
+    if kind is None:
+        return ANTHROPIC_CLOSE_TOOL, OPENAI_CLOSE_TOOL
+    return close_tool_for_kind(kind, "anthropic"), close_tool_for_kind(kind, "openai")
+
+
 async def _call_llm_with_tools(
     llm_config: dict[str, Any],
     system_prompt: str,
@@ -1710,6 +1732,7 @@ async def _call_llm_with_tools(
     deadline_monotonic: float | None = None,
     mcp_failure_counts: dict[str, int] | None = None,
     loop_signals: dict[str, Any] | None = None,
+    tool_offer: ToolOffer | None = None,
 ) -> tuple[str | None, dict[str, Any] | None, int, int, str, int, int]:
     """Call LLM with workspace tools + close_session, looping on tool calls.
 
@@ -1736,6 +1759,7 @@ async def _call_llm_with_tools(
     token totals and the parent tool-call counter before the next iteration.
     """
     from app.core.tools import REGISTRY as _REGISTRY, ToolContext as _ToolContext
+    _ant_close, _oai_close = close_tools_for_role(context_role)
     from app.core.tools.registry import (
         ToolErrorGuard,
         canonicalize_tool_input,
@@ -2244,9 +2268,14 @@ async def _call_llm_with_tools(
     if uses_messages_wire(provider, model):
         if uses_anthropic_env_key(provider):
             api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
-        all_ant_tools = stable_tool_schemas(
-            [*(workspace_ant_tools or []), *(mcp_ant_tools or []), ANTHROPIC_CLOSE_TOOL]
-        )
+        def _ant_tools_now() -> list[dict[str, Any]]:
+            offered = [*(workspace_ant_tools or []), *(mcp_ant_tools or [])]
+            if tool_offer is not None:
+                offered = tool_offer.offered(offered, "anthropic")
+            return stable_tool_schemas([*offered, _ant_close])
+
+        all_ant_tools = _ant_tools_now()
+        _offer_version = tool_offer.version if tool_offer is not None else 0
         working: list[dict[str, Any]] = list(history)
         _working_ref["messages"] = working
 
@@ -2260,6 +2289,13 @@ async def _call_llm_with_tools(
             await _deliver_interjections(
                 lambda note: _task_interject.inject_anthropic(working, note)
             )
+            # The tool list changes only after load_tools (or a direct call of
+            # a deferred tool): one uncached step, then stable again.
+            if tool_offer is not None:
+                tool_offer.absorb(working)
+                if tool_offer.version != _offer_version:
+                    _offer_version = tool_offer.version
+                    all_ant_tools = _ant_tools_now()
             assembly = await _assemble_request(
                 working,
                 all_ant_tools,
@@ -2374,6 +2410,18 @@ async def _call_llm_with_tools(
                         "tool_use_id": tool_id,
                         "content": "Session closing.",
                     })
+                elif tool_name == LOAD_TOOLS and tool_offer is not None:
+                    await _emit_tool_call_event(
+                        room_id=room_id, session_id=session_id, task_id=task_id,
+                        agent_id=actor_agent_id, actor_label=actor_label,
+                        tool_name=tool_name, args=tool_input_data, db=db,
+                        subtask_activity=call_subtask_activity,
+                    )
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_id,
+                        "content": tool_offer.load(tool_input_data),
+                    })
                 elif mcp_bindings and tool_name in mcp_bindings:
                     await _touch_run_boundary()
                     await emit_status(
@@ -2471,6 +2519,7 @@ async def _call_llm_with_tools(
                         mcp_user_id=mcp_user_id,
                         subtask_activity=call_subtask_activity,
                         run_id=run_id,
+                        tool_offer=tool_offer,
                     )
                     result_text = await _execute_registry_tool(tool_name, _ctx, tool_input_data)
                     await _touch_run_boundary()
@@ -2714,7 +2763,7 @@ async def _call_llm_with_tools(
         try:
             close_assembly = await _assemble_request(
                 working,
-                [ANTHROPIC_CLOSE_TOOL],
+                [_ant_close],
                 request_kind="forced_close/anthropic",
             )
             if not close_assembly.allowed:
@@ -2728,7 +2777,7 @@ async def _call_llm_with_tools(
                     enabled=bool(llm_config.get("anthropic_prompt_caching")),
                 ),
                 "messages": close_messages,
-                "tools": [ANTHROPIC_CLOSE_TOOL],
+                "tools": [_ant_close],
                 "tool_choice": {"type": "tool", "name": "close_session"},
                 "max_tokens": 4096,
             }
@@ -2764,7 +2813,7 @@ async def _call_llm_with_tools(
                 last_window_in = request_in
             await _record_request(
                 close_messages,
-                [ANTHROPIC_CLOSE_TOOL],
+                [_ant_close],
                 request_in,
                 request_out,
                 tool_calls_from_anthropic(data.get("content", [])),
@@ -2789,9 +2838,14 @@ async def _call_llm_with_tools(
     client_kwargs["base_url"] = openai_base_url(provider, base_url)
     client_kwargs.update(openai_client_extras(client_kwargs["base_url"]))
 
-    all_oai_tools = stable_tool_schemas(
-        [*(workspace_oai_tools or []), *(mcp_oai_tools or []), OPENAI_CLOSE_TOOL]
-    )
+    def _oai_tools_now() -> list[dict[str, Any]]:
+        offered = [*(workspace_oai_tools or []), *(mcp_oai_tools or [])]
+        if tool_offer is not None:
+            offered = tool_offer.offered(offered, "openai")
+        return stable_tool_schemas([*offered, _oai_close])
+
+    all_oai_tools = _oai_tools_now()
+    _offer_version = tool_offer.version if tool_offer is not None else 0
     create_extra: dict[str, Any] = {}
     if provider == "openrouter" and llm_config.get("session_logging") and or_session_id:
         create_extra["extra_body"] = {"session_id": or_session_id}
@@ -2817,6 +2871,11 @@ async def _call_llm_with_tools(
         await _deliver_interjections(
             lambda note: _task_interject.inject_openai(working_oai, note)
         )
+        if tool_offer is not None:
+            tool_offer.absorb(working_oai)
+            if tool_offer.version != _offer_version:
+                _offer_version = tool_offer.version
+                all_oai_tools = _oai_tools_now()
         assembly_oai = await _assemble_request(
             working_oai,
             all_oai_tools,
@@ -2906,7 +2965,12 @@ async def _call_llm_with_tools(
                     session_id,
                     exc,
                 )
-                tool_args = {}
+                working_oai.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": malformed_arguments_result(tc.function.name, exc),
+                })
+                continue
             tool_args = canonicalize_tool_input(tc.function.name, tool_args)
             call_subtask_activity = new_subtask_activity(tc.function.name, tool_args) or subtask_activity
 
@@ -2927,6 +2991,18 @@ async def _call_llm_with_tools(
                     "role": "tool",
                     "tool_call_id": tc.id,
                     "content": "Session closing.",
+                })
+            elif tc.function.name == LOAD_TOOLS and tool_offer is not None:
+                await _emit_tool_call_event(
+                    room_id=room_id, session_id=session_id, task_id=task_id,
+                    agent_id=actor_agent_id, actor_label=actor_label,
+                    tool_name=tc.function.name, args=tool_args, db=db,
+                    subtask_activity=call_subtask_activity,
+                )
+                working_oai.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": tool_offer.load(tool_args),
                 })
             elif mcp_bindings and tc.function.name in mcp_bindings:
                 await _touch_run_boundary()
@@ -3019,6 +3095,7 @@ async def _call_llm_with_tools(
                     mcp_user_id=mcp_user_id,
                     subtask_activity=call_subtask_activity,
                     run_id=run_id,
+                    tool_offer=tool_offer,
                 )
                 result_text = await _execute_registry_tool(tc.function.name, _ctx, tool_args)
                 await _touch_run_boundary()
@@ -3233,7 +3310,7 @@ async def _call_llm_with_tools(
     try:
         close_assembly_oai = await _assemble_request(
             working_oai,
-            [OPENAI_CLOSE_TOOL],
+            [_oai_close],
             request_kind="forced_close/openai",
         )
         if not close_assembly_oai.allowed:
@@ -3247,7 +3324,7 @@ async def _call_llm_with_tools(
             lambda: oai.chat.completions.create(
                 model=model,
                 messages=close_messages_oai,
-                tools=[OPENAI_CLOSE_TOOL],
+                tools=[_oai_close],
                 tool_choice={"type": "function", "function": {"name": "close_session"}},
                 **create_extra,
             ),
@@ -3268,7 +3345,7 @@ async def _call_llm_with_tools(
             last_window_in = request_in
         await _record_request(
             close_assembly_oai.messages,
-            [OPENAI_CLOSE_TOOL],
+            [_oai_close],
             request_in,
             request_out,
             tool_calls_from_openai(resp.choices[0].message.tool_calls or []),
@@ -4457,6 +4534,23 @@ async def _run_proxy_loop(
     _agent_allowed = _agent_row.tools_allowed if _agent_row else None
     _cm_allowed = _cm_row.tools_allowed if _cm_row else None
 
+    # The agent's deferred tools, decided once for the whole run so the tool
+    # prefix stays cacheable (internal design notes S2/S3).
+    # The loaded set is rebuilt from the history inside the tool loop.
+    from app.core.tool_offer import plan_agent_offer, task_hints
+
+    _agent_offer = plan_agent_offer(
+        registry=_ws_registry,
+        allowed=_agent_allowed,
+        hints=await task_hints(
+            room_id=room_id,
+            task_id=task.id,
+            goal_id=getattr(task, "goal_id", None),
+            mcp_bindings=_agent_mcp_bindings,
+        ),
+        mcp_schemas=_agent_mcp_ant,
+    )
+
     _start_ts = datetime.now(timezone.utc)
     run_clock.reset(task.id)  # a retry starts with a clean wait credit
     _deadline_monotonic = (
@@ -4604,6 +4698,7 @@ async def _run_proxy_loop(
                         mcp_failure_counts=_mcp_failure_counts,
                         loop_signals=_loop_signals,
                         usage_stats=_agent_usage,
+                        tool_offer=_agent_offer,
                     ),
                     room_id=room_id,
                     agent_id=agent_session.agent_id,

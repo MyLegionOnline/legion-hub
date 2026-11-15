@@ -75,6 +75,41 @@ class TestMaybeCompleteGoal:
         assert goal.status == GoalStatus.COMPLETED
 
     @pytest.mark.asyncio
+    async def test_continued_source_with_completed_successor_completes(self):
+        """A task handed off / reworked sits in CONTINUED; it must not wedge its goal."""
+        goal = _make_goal()
+        db = _make_db(goal, [TaskState.CONTINUED, TaskState.COMPLETED])
+
+        with (
+            patch("app.core.goal_progress.emit_event", new_callable=AsyncMock),
+            patch(
+                "app.core.room_git_flow.maybe_open_goal_review",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            assert await maybe_complete_goal(_GOAL_ID, _ROOM_ID, db) is True
+        assert goal.status == GoalStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_continued_source_with_live_successor_keeps_goal_active(self):
+        goal = _make_goal()
+        db = _make_db(goal, [TaskState.CONTINUED, TaskState.IN_PROGRESS])
+
+        with patch("app.core.goal_progress.emit_event", new_callable=AsyncMock):
+            assert await maybe_complete_goal(_GOAL_ID, _ROOM_ID, db) is False
+        assert goal.status == GoalStatus.ACTIVE
+
+    @pytest.mark.asyncio
+    async def test_only_continued_is_not_completion(self):
+        goal = _make_goal()
+        db = _make_db(goal, [TaskState.CONTINUED])
+
+        with patch("app.core.goal_progress.emit_event", new_callable=AsyncMock):
+            assert await maybe_complete_goal(_GOAL_ID, _ROOM_ID, db) is False
+        assert goal.status == GoalStatus.ACTIVE
+
+    @pytest.mark.asyncio
     async def test_approved_regular_task_keeps_goal_active(self):
         goal = _make_goal()
         db = _make_db(goal, [TaskState.COMPLETED, TaskState.APPROVED])

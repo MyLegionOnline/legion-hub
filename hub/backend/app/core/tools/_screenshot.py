@@ -6,6 +6,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from app.core.screenshot import DEVICES, ENGINES, MAX_MEASURE_SELECTORS
 from app.core.tools.registry import REGISTRY, Tool, ToolContext
 
 logger = logging.getLogger(__name__)
@@ -14,28 +15,52 @@ logger = logging.getLogger(__name__)
 class ScreenshotTool(Tool):
     name = "screenshot"
     description = (
-        "Capture a PNG screenshot of a ready declared web/API workspace service "
-        "through the Browser service-origin gateway and save it in Repository. "
-        "Call workspace_service declare, start, and wait_ready first."
+        "Render a ready workspace service (declare, start, wait_ready first) in a real "
+        "browser on the Hub and save the PNG in the repository; checks layouts, phones "
+        "included. Do not install Playwright, Chromium or WebKit in the workspace: "
+        "browsers cannot run there."
     )
     input_schema: dict[str, Any] = {
         "type": "object",
         "properties": {
             "service_slug": {
                 "type": "string",
-                "description": "Slug returned by workspace_service declare/list (not an internal port)",
+                "description": "workspace_service slug (not a port).",
             },
             "path": {
                 "type": "string",
-                "description": "Absolute path to render on the service (default: its declared default_path)",
+                "description": "URL path (default: the service's default_path).",
             },
             "width": {
                 "type": "integer",
-                "description": "Viewport width in px, 320-3840 (default 1280). Use 375 to check a phone layout.",
+                "description": "CSS px, 320-3840 (default 1280).",
             },
             "height": {
                 "type": "integer",
-                "description": "Viewport height in px, 320-3840 (default 720).",
+                "description": "CSS px, 320-3840 (default 720).",
+            },
+            "engine": {
+                "type": "string",
+                "enum": list(ENGINES),
+                "description": "webkit reproduces Safari/iPhone-only bugs.",
+            },
+            "device": {
+                "type": "string",
+                "enum": list(DEVICES),
+                "description": "Phone preset (viewport, DPR, mobile UA, touch); pair iPhones with webkit.",
+            },
+            "full_page": {
+                "type": "boolean",
+                "description": "Capture the whole scrollable page instead of the first screen (default false).",
+            },
+            "measure": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": MAX_MEASURE_SELECTORS,
+                "description": (
+                    "CSS selectors: returns boxes, computed layout styles and page "
+                    "horizontal overflow as text (no vision needed)."
+                ),
             },
         },
         "required": ["service_slug"],
@@ -57,7 +82,7 @@ class ScreenshotTool(Tool):
             return "Error: screenshot requires an agent identity"
 
         try:
-            png = await capture_screenshot(
+            capture = await capture_screenshot(
                 ctx.room_id,
                 service_slug,
                 ctx.db,
@@ -65,6 +90,10 @@ class ScreenshotTool(Tool):
                 path=tool_input.get("path"),
                 width=tool_input.get("width"),
                 height=tool_input.get("height"),
+                engine=tool_input.get("engine"),
+                device=tool_input.get("device"),
+                full_page=bool(tool_input.get("full_page")),
+                measure=tool_input.get("measure"),
             )
         except ScreenshotError as exc:
             return f"Error: screenshot failed — {exc}"
@@ -79,7 +108,7 @@ class ScreenshotTool(Tool):
 
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         output_path = f"/project/screenshots/{service_slug}-{timestamp}.png"
-        data_uri = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+        data_uri = "data:image/png;base64," + base64.b64encode(capture.png).decode("ascii")
         try:
             await fs_write_file(
                 ctx.room_id, output_path, data_uri, ctx.db, agent_id=ctx.actor_agent_id
@@ -105,14 +134,18 @@ class ScreenshotTool(Tool):
 
         from app.core.vision_dispatch import agent_can_see_images
 
+        result = f"Screenshot saved to {output_path} ({capture.summary()})."
         if not await agent_can_see_images(ctx.llm_config, ctx.mcp_bindings):
-            return (
-                f"Screenshot saved to {output_path}. You cannot view images (no vision override, "
-                "no mcp-vision tool, model without image input), so you cannot judge this frame. "
-                "Do not report a visual verdict from it; if the task needs one, "
-                'call task_update(state="blocked", blocked_reason="needs_vision").'
+            result += (
+                " You cannot view images (no vision override, no mcp-vision tool, model "
+                "without image input), so you cannot judge this frame. Do not report a "
+                "visual verdict from it; use the measure parameter for layout facts, and if "
+                'the task needs a visual verdict, call task_update(state="blocked", '
+                'blocked_reason="needs_vision").'
             )
-        return f"Screenshot saved to {output_path}"
+        if capture.measurements:
+            result += "\n\n" + capture.measurements
+        return result
 
 
 REGISTRY.register(ScreenshotTool())

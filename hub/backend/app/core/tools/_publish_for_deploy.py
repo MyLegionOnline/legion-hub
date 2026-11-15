@@ -39,6 +39,7 @@ class PublishForDeployTool(Tool):
         },
     }
     roles: frozenset[str] = frozenset({"agent"})
+    offer_group = "deploy"
     requires_container: bool = False
     mutating: bool = True
 

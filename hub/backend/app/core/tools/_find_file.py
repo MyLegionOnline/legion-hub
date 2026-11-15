@@ -28,7 +28,7 @@ class FindFileTool(Tool):
         "properties": {
             "name": {
                 "type": "string",
-                "description": "Filename or glob pattern, e.g. 'schema.prisma' or '*.env'",
+                "description": "Filename or glob, e.g. 'schema.prisma'.",
             },
             "dir": {
                 "type": "string",

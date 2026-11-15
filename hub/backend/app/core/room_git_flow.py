@@ -744,6 +744,8 @@ async def commit_branch_worktree(
         return None
 
     sha = res.get("sha") if isinstance(res, Mapping) else None
+    if isinstance(res, Mapping) and res.get("held_back_count"):
+        await _emit_held_back_binaries(room_id, branch, res, db, task_id)
     if not sha:
         return None
 
@@ -763,6 +765,39 @@ async def commit_branch_worktree(
     except Exception as exc:
         logger.warning("commit_branch_worktree: FILE_CHANGED emit failed on %s: %s", branch, exc)
     return sha
+
+
+async def _emit_held_back_binaries(room_id, branch: str, res: Mapping, db, task_id) -> None:
+    """Tell the room (agent, ChatMaster, user) which machine binaries the
+    auto-commit kept out of git, so nobody wonders where they went and the
+    agent learns where such files belong."""
+    count = int(res.get("held_back_count") or 0)
+    paths = [str(p) for p in (res.get("held_back") or [])]
+    shown = ", ".join(paths[:5]) + (f" … (+{count - 5})" if count > 5 else "")
+    logger.info("commit_branch_worktree: %d machine binaries held back on %s", count, branch)
+    try:
+        from app.core.events import emit_event
+
+        rid = room_id if isinstance(room_id, UUID) else UUID(str(room_id))
+        await emit_event(
+            room_id=rid,
+            event_type="FILE_CHANGED",
+            content=(
+                f"{count} machine binaries (.deb/.so/ELF) kept out of git on {branch} and "
+                f"ignored locally: {shown}. Keep system libraries and caches under "
+                "/workspace/.legion/local/ — it persists and is never committed."
+            ),
+            db=db,
+            task_id=task_id,
+            metadata={
+                "source": "auto_commit",
+                "branch": branch,
+                "held_back": paths,
+                "held_back_count": count,
+            },
+        )
+    except Exception as exc:
+        logger.warning("commit_branch_worktree: held-back emit failed on %s: %s", branch, exc)
 
 
 async def commit_working_tree(room_id: "UUID | str", task, db, *, reason: str) -> str | None:

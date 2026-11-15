@@ -796,11 +796,22 @@ async def git_commit_workspace(room_id: str, req: GitCommitRequest):
     )
     if not is_git_repo(room_id):
         git_init(room_id)
+    from app.git_ops import _HOLD_BACK_REPORT_MAX
+
+    report: dict = {}
     try:
-        sha = git_commit(room_id, req.message, allow_main_commit=req.allow_main_commit)
+        sha = git_commit(
+            room_id, req.message, allow_main_commit=req.allow_main_commit, report=report
+        )
     except MainBranchProtectedError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
-    return GitCommitResponse(sha=sha, committed=sha is not None)
+    held = report.get("held_back") or []
+    return GitCommitResponse(
+        sha=sha,
+        committed=sha is not None,
+        held_back=held[:_HOLD_BACK_REPORT_MAX],
+        held_back_count=len(held),
+    )
 
 
 @app.put(

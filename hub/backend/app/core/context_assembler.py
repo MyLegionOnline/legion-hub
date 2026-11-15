@@ -33,6 +33,17 @@ _OBSERVATION_REF = re.compile(
     r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
 )
 
+# Lines that only stamp a ref, and the log a large bash output is saved to.
+_REF_LINE = re.compile(r"observation_ref=")
+_LOG_PATH = re.compile(r"/workspace/\.legion/logs/[\w.-]+\.log")
+
+# Excerpt of an evicted result kept in its receipt: first and last lines,
+# bounded so a receipt stays a small fraction of what it replaces.
+_EXCERPT_HEAD = 3
+_EXCERPT_TAIL = 8
+_EXCERPT_LINE_CHARS = 200
+_EXCERPT_MAX_CHARS = 1200
+
 # Bulky arguments of file-writing calls.  Once such a call has run, its payload
 # lives in the file itself, so a past call can keep its path and a receipt
 # instead of the whole file body — and must give way before fresh results do.
@@ -194,20 +205,67 @@ def _result_status(result: _ToolResult) -> str:
     return "ok"
 
 
+def _excerpt(text: str) -> str:
+    """Head and tail of an evicted output, deterministic and bounded.
+
+    A receipt that kept only a hash left the model unable to recall what a
+    command had printed (measurements, which browser actually ran), so it
+    re-ran expensive commands or reasoned from a wrong memory (prod Blog
+    room, 2026-11-14).  The excerpt keeps the lines that usually carry the
+    answer: the first ones and the last ones.
+    """
+    lines = [
+        line[:_EXCERPT_LINE_CHARS]
+        for line in text.splitlines()
+        if line.strip() and not _REF_LINE.search(line)
+    ]
+    if len(lines) > _EXCERPT_HEAD + _EXCERPT_TAIL:
+        omitted = len(lines) - _EXCERPT_HEAD - _EXCERPT_TAIL
+        lines = [
+            *lines[:_EXCERPT_HEAD],
+            f"… {omitted} lines omitted …",
+            *lines[-_EXCERPT_TAIL:],
+        ]
+    excerpt = "\n".join(lines)
+    if len(excerpt) > _EXCERPT_MAX_CHARS:
+        excerpt = excerpt[:_EXCERPT_MAX_CHARS] + " …"
+    return excerpt
+
+
 def _receipt(result: _ToolResult) -> str:
     target = _target(result.args)
     target_part = f"; target={target}" if target else ""
     range_part = ""
-    if result.tool_name in _READ_TOOLS:
+    is_read = result.tool_name in _READ_TOOLS
+    if is_read:
         offset = result.args.get("offset", 1)
         limit = result.args.get("limit", 100)
         range_part = f"; range={offset}+{limit}"
-    digest = hashlib.sha256(_text(result.content).encode("utf-8")).hexdigest()[:12]
+    text = _text(result.content)
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+    refs = _OBSERVATION_REF.findall(text)
+    log_path = _LOG_PATH.search(text)
+    if refs:
+        recover = (
+            f"The full output is stored: observation_read(ref=\"{refs[0]}\") pages it; "
+            "do not rerun the command just to see it again."
+        )
+    elif log_path:
+        recover = (
+            f"The full output is saved in {log_path.group(0)}; read_file pages it; "
+            "do not rerun the command just to see it again."
+        )
+    else:
+        recover = "Rerun a precise tool call only if the exact text is still needed."
+    # A read's text is the file on disk — read_file serves it again; for every
+    # other tool the excerpt is the only trace of what it printed.
+    excerpt = "" if is_read else _excerpt(text)
+    excerpt_part = f"\nExcerpt (head and tail):\n{excerpt}\n" if excerpt else " "
     return (
         f"[context receipt: tool={result.tool_name}{target_part}{range_part}; "
         f"status={_result_status(result)}; result_sha256={digest}; "
-        f"evicted_tokens={result.tokens}. Exact output is no longer active; "
-        "rerun a precise tool call only if it is still needed.]"
+        f"evicted_tokens={result.tokens}. Exact output is no longer active."
+        f"{excerpt_part}{recover}]"
     )
 
 
@@ -480,10 +538,14 @@ class ContextAssembler:
         evicted_tokens = 0
         evicted_results = 0
         for result_index, result in enumerate(results):
-            if result_index in keep:
+            if result_index in keep or _is_receipt(result):
+                continue
+            receipt = _receipt(result)
+            if self.counter.count(receipt) >= result.tokens:
+                # A short output is cheaper verbatim than as a receipt.
+                keep.add(result_index)
                 continue
             evicted_results += 1
-            receipt = _receipt(result)
             message = working[result.message_index]
             if result.block_index is None:
                 message["content"] = receipt
@@ -702,8 +764,12 @@ class ContextAssembler:
                 # Already a receipt from an earlier turn — evicting it again
                 # frees nothing and would only shrink the raw history further.
                 continue
+            gain = result.tokens - self.counter.count(_receipt(result))
+            if gain <= 0:
+                # A short output is cheaper verbatim than as a receipt.
+                continue
             keep.discard(index)
-            overflow -= max(0, result.tokens - self.counter.count(_receipt(result)))
+            overflow -= gain
         return keep
 
     def _total(

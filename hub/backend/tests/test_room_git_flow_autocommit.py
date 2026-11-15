@@ -89,6 +89,31 @@ async def test_no_event_when_nothing_to_commit(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_held_back_binaries_are_reported_even_without_a_commit(monkeypatch):
+    task = _task()
+    monkeypatch.setattr(room_git_flow, "_current_branch", AsyncMock(return_value=task.branch_name))
+    held = [f"libs/lib{i}.so.1" for i in range(7)]
+    monkeypatch.setattr(
+        "app.core.workspaced_client.git_commit_workspace",
+        AsyncMock(return_value={
+            "sha": None, "committed": False, "held_back": held, "held_back_count": 120,
+        }),
+    )
+    emit = AsyncMock()
+    monkeypatch.setattr("app.core.events.emit_event", emit)
+
+    sha = await room_git_flow.commit_working_tree(str(uuid4()), task, _FakeDB(), reason="x")
+
+    assert sha is None
+    emit.assert_awaited_once()
+    kw = emit.await_args.kwargs
+    assert kw["metadata"]["held_back_count"] == 120
+    assert kw["metadata"]["held_back"] == held
+    assert "120 machine binaries" in kw["content"]
+    assert ".legion/local/" in kw["content"]
+
+
+@pytest.mark.asyncio
 async def test_commit_transport_error_is_swallowed(monkeypatch):
     task = _task()
     monkeypatch.setattr(room_git_flow, "_current_branch", AsyncMock(return_value=task.branch_name))

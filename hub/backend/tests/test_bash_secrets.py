@@ -118,7 +118,9 @@ async def test_missing_secret_is_a_deterministic_error():
         env, secrets, secret_files, err = await tool._build_exec_env(ctx, ["DEPLOY_TOKEN"], None)
 
     assert env == {} and secrets == {} and secret_files == []
-    assert err == "Error: [secret_not_available] DEPLOY_TOKEN"
+    assert err.startswith("Error: [secret_not_available] DEPLOY_TOKEN\n")
+    # The guidance dropped from the schema is shown on the error instead.
+    assert "Room variables are already in env" in err
 
 
 @pytest.mark.asyncio
@@ -189,7 +191,7 @@ async def test_deploy_ssh_key_rejected_with_background():
             {"cmd": "git push", "background": True, "secrets": ["SSH_DEPLOY_KEY"]},
         )
 
-    assert result == "Error: deploy-key secrets cannot be used with background=true"
+    assert result.startswith("Error: deploy-key secrets cannot be used with background=true")
 
 
 # ── Stage 12: protected-environment gate raises an ask-user confirmation ────
@@ -332,7 +334,8 @@ async def test_secrets_param_rejects_non_list():
     tool = REGISTRY.get("bash")
     ctx = _make_ctx(None)
     result = await tool.execute(ctx, {"cmd": "echo hi", "secrets": "DEPLOY_TOKEN"})
-    assert result == "Error: secrets must be a list of strings"
+    assert result.startswith("Error: secrets must be a list of strings\n")
+    assert "takes names of Room secrets" in result
 
 
 @pytest.mark.asyncio

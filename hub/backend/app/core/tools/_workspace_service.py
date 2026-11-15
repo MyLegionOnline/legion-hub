@@ -33,14 +33,10 @@ class WorkspaceServiceToolError(ValueError):
 class WorkspaceServiceTool(Tool):
     name = "workspace_service"
     description = (
-        "Declare and operate a durable user-visible workspace service (web, API, or worker). "
-        "Use this instead of bash(background=true), nohup, or manually choosing a port for "
-        "an application a user should open. Call action=list FIRST to see services already "
-        "declared in this workspace — if one already matches the app you are about to expose, "
-        "reuse its exact slug (start/restart it) instead of declaring a new one; declaring under "
-        "a different slug for the same app creates a duplicate entry in the user's Browser tab. "
-        "Declare with argv/cwd/listen/readiness, then start, wait_ready, or request to verify it. "
-        "Returns compact state; use logs for a bounded tail."
+        "Run a user-visible app (web, API, worker) as a durable service — not bash background, "
+        "nohup or a hand-picked port. Call action=list first and reuse a matching slug "
+        "(start/restart): a new slug for the same app duplicates it in the user's Browser tab. "
+        "Then declare → start → wait_ready/request to verify; logs gives a bounded tail."
     )
     input_schema: dict[str, Any] = {
         "type": "object",
@@ -48,12 +44,12 @@ class WorkspaceServiceTool(Tool):
             "action": {
                 "type": "string",
                 "enum": ["list", "declare", "prepare", "start", "stop", "restart", "status", "logs", "wait_ready", "request"],
-                "description": "Operation to perform. Use list first to check for an existing service before declare.",
+                "description": "Operation; list before declare.",
             },
             "slug": {"type": "string", "description": "Declared service slug."},
             "service": {
                 "type": "object",
-                "description": "Required only for declare; shell command strings are not accepted.",
+                "description": "For declare only; argv, not a shell string.",
                 "properties": {
                     "slug": {"type": "string"}, "title": {"type": "string"},
                     "kind": {"type": "string", "enum": ["web", "api", "worker"]},
@@ -63,13 +59,7 @@ class WorkspaceServiceTool(Tool):
                     "secrets": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": (
-                            "Names of Room secrets (from the Room's Secrets & variables tab) to "
-                            "resolve into this service's env each time it starts. You only ever see "
-                            "the name, never the value. Room variables are already always in env; "
-                            "this is only for secrets. Not usable for a deploy SSH key — those exist "
-                            "only for a single bash exec, not a long-running service."
-                        ),
+                        "description": "Room secret names put in env on each start.",
                     },
                     "listen": {
                         "type": "object",
@@ -78,11 +68,8 @@ class WorkspaceServiceTool(Tool):
                             "port": {
                                 "oneOf": [{"type": "string", "enum": ["auto"]}, {"type": "integer"}],
                                 "description": (
-                                    "Prefer \"auto\". If set, argv MUST forward the assigned port "
-                                    "via the $PORT env var (e.g. --port $PORT); never hardcode a "
-                                    "port that only happens to match the tool's own default (like "
-                                    "Vite's 5173) without also passing --port $PORT, or the process "
-                                    "will ignore the reserved port and become unrecoverable."
+                                    "Prefer \"auto\"; argv must then pass $PORT (e.g. --port $PORT), "
+                                    "never rely on the tool's own default port."
                                 ),
                             },
                         },
@@ -92,11 +79,11 @@ class WorkspaceServiceTool(Tool):
                     "restart_policy": {"type": "string", "enum": ["manual", "on_workspace_restore"]},
                     "environment": {
                         "type": "object",
-                        "description": "Required reproducible dependency environment; selected profiles never accept a shell bootstrap command.",
+                        "description": "Reproducible dependency environment.",
                         "properties": {
                             "slug": {"type": "string"},
                             "profile": {"type": "string", "enum": ["python-pip", "node-npm", "node-pnpm", "node-yarn", "none"]},
-                            "root": {"type": "string", "description": "Project path relative to workspace root."},
+                            "root": {"type": "string", "description": "Workspace-relative project path."},
                             "manifests": {"type": "array", "items": {"type": "string"}},
                         },
                         "required": ["slug", "profile", "root", "manifests"],
@@ -107,10 +94,7 @@ class WorkspaceServiceTool(Tool):
             "path": {
                 "type": "string",
                 "default": "/",
-                "description": (
-                    "HTTP path for request, e.g. \"/article/first-article/\". "
-                    "A leading slash is added automatically if missing."
-                ),
+                "description": "HTTP path for request.",
             },
             "query": {"type": "string", "description": "Query string without leading ?."},
             "cursor": {"type": "integer", "minimum": 0, "default": 0},

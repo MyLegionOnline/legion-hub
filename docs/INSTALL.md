@@ -255,8 +255,8 @@ List them with `docker ps -a --filter name=ws-` and remove them with `docker rm 
   model accepts image input, and you can connect your own MCP servers for
   anything else. To use the Market's tools from a self-hosted Hub, link a Legion
   account (see [SEARCH.md](SEARCH.md) for how Market tools are paid for).
-- The Hub image is large (about 3 GB) because it contains a headless browser for
-  screenshots.
+- The Hub image is large (about 3 GB) because it contains headless Chromium and
+  WebKit for agent screenshots (including iPhone/Safari layout checks).
 
 ## Troubleshooting
 

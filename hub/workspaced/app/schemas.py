@@ -295,6 +295,10 @@ class GitIsTrackedResponse(BaseModel):
 class GitCommitResponse(BaseModel):
     sha: Optional[str] = None
     committed: bool
+    # Machine binaries (``.deb``/``.so``/ELF) kept out of the commit and
+    # ignored locally; ``held_back_count`` is the full count, the list is capped.
+    held_back: list[str] = []
+    held_back_count: int = 0
 
 
 class GitRevertRequest(BaseModel):

@@ -41,11 +41,11 @@ class WriteFileTool(Tool):
         "properties": {
             "path": {
                 "type": "string",
-                "description": "Destination path relative to the workspace root (legacy /workspace/... accepted)",
+                "description": "Workspace-relative path.",
             },
             "content": {
                 "type": "string",
-                "description": "UTF-8 text content to write",
+                "description": "UTF-8 text.",
             },
         },
         "required": ["path", "content"],

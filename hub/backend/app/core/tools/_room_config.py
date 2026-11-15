@@ -42,6 +42,9 @@ class RoomConfigTool(Tool):
         },
     }
     roles: frozenset[str] = frozenset({"agent", "cm"})
+    # The prompt already carries the Room variables/secrets block; this is
+    # its fallback once that block is cut, so agents load it on demand.
+    offer_group = "room_config"
     role_descriptions = {
         "cm": (
             "List this Room's variables (name and value) and secret names (name and "

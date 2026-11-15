@@ -31,6 +31,12 @@ def canonicalize_tool_input(tool_name: str, tool_input: dict[str, Any] | None) -
     its own path spelling.
     """
     value = dict(tool_input or {})
+    # Some models (DeepSeek v4.1 flash on prod, 2026-11-14) name bash's
+    # argument ``command`` on every other call.  Rejecting that with
+    # "cmd is required" made the agent guess at shell characters and burn
+    # whole ~90k-token steps on retries, so the spelling is accepted here.
+    if tool_name == "bash" and not value.get("cmd") and isinstance(value.get("command"), str):
+        value["cmd"] = value.pop("command")
     try:
         from app.core.path_contract import normalize_workspace_glob, normalize_workspace_path
 
@@ -138,6 +144,9 @@ class ToolContext:
     # the stop fence (``task_runtime.is_run_current``) reaches the child too —
     # without it a cancelled task kept running inside run_subtask.
     run_id: Optional[str] = None
+    # Deferred tools of the parent session (app/core/tool_offer.ToolOffer); a
+    # run_subtask child starts from a copy of it.
+    tool_offer: Any = None
 
     async def release_db(self, *, reason: str = "tool") -> bool:
         """Commit before a long external wait (stage 1.2.3, internal design notes §8.2).
@@ -168,6 +177,11 @@ class Tool(ABC):
     # Offered even when the agent has a tools_allowed list: a channel back to
     # the user, not a capability (internal design notes Stage 2).
     always_offered: bool = False
+    # Rarely needed tools name a group here.  An agent session whose task does
+    # not need the group gets the tool deferred behind ``load_tools`` instead of
+    # its full schema on every step (app/core/tool_offer.py,
+    # internal design notes S2).
+    offer_group: Optional[str] = None
 
     def ant_schema(self, role: str = "agent") -> dict[str, Any]:
         desc = self.role_descriptions.get(role, self.description)

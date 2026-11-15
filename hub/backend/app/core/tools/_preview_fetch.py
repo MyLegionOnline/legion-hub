@@ -26,16 +26,16 @@ class PreviewFetchTool(Tool):
         "properties": {
             "port": {
                 "type": "integer",
-                "description": "Port the dev server is listening on (inside the container)",
+                "description": "Port inside the workspace.",
             },
             "path": {
                 "type": "string",
-                "description": "URL path to request (default: '/')",
+                "description": "URL path.",
                 "default": "/",
             },
             "query": {
                 "type": "string",
-                "description": "Query string without the leading '?' (e.g. 'foo=bar&baz=1')",
+                "description": "Query string without '?'.",
             },
         },
         "required": ["port"],

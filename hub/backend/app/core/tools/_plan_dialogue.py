@@ -21,21 +21,18 @@ from app.core.tools.registry import REGISTRY, Tool, ToolContext
 class PlanDialogueTool(Tool):
     name = "plan_dialogue"
     description = (
-        "Read the archived user↔ChatMaster dialogue that defined this task/goal. "
-        "Use it whenever task_data is ambiguous, underspecified, or seems to "
-        "contradict the repository — the archive holds the user's own words, "
-        "pasted configs and reference links. These files are NOT in the "
-        "repository file list. "
-        'mode="search" (default): pass query, get matching turns with [#N] '
-        'markers. mode="digest": the agreed-requirements summary, attachments '
-        'index and links. mode="turns": pass turn_ids to get whole turns.'
+        "Read the archived user↔ChatMaster dialogue behind this task (the user's own words, "
+        "pasted configs, links; not in the repository) when the task is ambiguous or "
+        "contradicts the repository. "
+        'mode="search" (default): query → matching turns [#N]; "digest": agreed '
+        'requirements, attachments, links; "turns": whole turns by turn_ids.'
     )
     input_schema = {
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
-                "description": "What to look for (substring or regex). Required for mode=search.",
+                "description": "Substring or regex (mode=search).",
             },
             "mode": {
                 "type": "string",
@@ -45,16 +42,19 @@ class PlanDialogueTool(Tool):
             "turn_ids": {
                 "type": "array",
                 "items": {"type": "integer"},
-                "description": "Turn numbers to return in full. Required for mode=turns.",
+                "description": "For mode=turns.",
             },
             "max_chars": {
                 "type": "integer",
                 "default": 6000,
-                "description": "Output budget; large archives are trimmed to fit.",
+                "description": "Output budget.",
             },
         },
     }
     roles = frozenset({"agent", "cm"})
+    # In full only when the task has an archived dialogue (the prompt then
+    # points at this tool); otherwise deferred.
+    offer_group = "dialogue_archive"
     requires_container = False
     mutating = False
 

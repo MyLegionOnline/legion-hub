@@ -190,6 +190,7 @@ class RunSubtaskTool(Tool):
         "additionalProperties": False,
     }
     roles = frozenset({"agent"})
+    offer_group = "subtask"
     requires_container = False
     mutating = False
 
@@ -462,6 +463,10 @@ class RunSubtaskTool(Tool):
             for name, binding in (ctx.mcp_bindings or {}).items()
             if name != "run_subtask"
         }
+        # The child keeps the parent's deferral and what the parent already
+        # loaded; what it loads itself stays with the child.
+        parent_offer = getattr(ctx, "tool_offer", None)
+        child_offer = parent_offer.for_child(drop={"run_subtask"}) if parent_offer is not None else None
 
         llm_config = dict(ctx.llm_config or getattr(agent, "llm_config", {}) or {})
         secret_value = ctx.secret_value
@@ -520,6 +525,7 @@ class RunSubtaskTool(Tool):
                 secret_value=secret_value,
                 usage_stats=usage_stats,
                 subtask_activity=ctx.subtask_activity,
+                tool_offer=child_offer,
             )
             text, close_input, tokens_in, tokens_out, model, max_window, last_window, tool_calls_used = (
                 _unpack_llm_result(result)

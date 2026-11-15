@@ -15,36 +15,32 @@ from app.core.tools.registry import REGISTRY, Tool, ToolContext
 class EditFileTool(Tool):
     name = "edit_file"
     description = (
-        "Replace a specific string in a workspace file. "
-        "The current directory is the workspace root; use workspace-relative paths. "
-        "Legacy /workspace/... paths are accepted and normalized once. "
-        "The file MUST have been read with read_file first. "
-        "old_string must match exactly once (or set replace_all=true). "
-        "More efficient than write_file for targeted edits."
+        "Replace an exact string in a workspace file (read it with read_file first). "
+        "old_string must match once unless replace_all=true."
     )
     input_schema: dict[str, Any] = {
         "type": "object",
         "properties": {
             "path": {
                 "type": "string",
-                "description": "File path relative to the workspace root (legacy /workspace/... accepted)",
+                "description": "Workspace-relative path.",
             },
             "old_string": {
                 "type": "string",
-                "description": "Exact text to find and replace",
+                "description": "Exact text to replace.",
             },
             "new_string": {
                 "type": "string",
-                "description": "Text to replace old_string with",
+                "description": "Replacement text.",
             },
             "replace_all": {
                 "type": "boolean",
-                "description": "Replace every occurrence (default false — errors if more than one match)",
+                "description": "Replace every match.",
                 "default": False,
             },
             "expected_fingerprint": {
                 "type": "string",
-                "description": "Optional fingerprint from read_file; permits editing without an in-memory read marker and rejects stale content.",
+                "description": "Fingerprint from read_file: edit without a fresh read, reject stale content.",
             },
         },
         "required": ["path", "old_string", "new_string"],

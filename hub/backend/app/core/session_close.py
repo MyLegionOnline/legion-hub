@@ -659,6 +659,21 @@ class ToolArgumentsParseError(Exception):
     """Tool-call arguments returned by the LLM are not valid JSON."""
 
 
+def malformed_arguments_result(tool_name: str, exc: Exception) -> str:
+    """Tool result for a call whose arguments did not parse.
+
+    Running the tool on ``{}`` instead answered with a misleading
+    validation error ("cmd is required"), and the model then guessed at
+    the wrong cause.  Naming the real one lets it fix the call at once.
+    """
+    return (
+        f"Error: the arguments of this {tool_name} call are not valid JSON ({exc}); "
+        "the call was not executed. Re-send it as one JSON object with every string "
+        "properly escaped — inside a JSON string a backslash is written \\\\, a quote "
+        "\\\" and a newline \\n."
+    )
+
+
 def parse_tool_arguments(raw: str) -> dict[str, Any]:
     """Parse tool-call arguments, tolerating markdown fences around the JSON.
 

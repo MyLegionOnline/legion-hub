@@ -21,7 +21,12 @@ from app.models.task import Task, TaskState
 
 logger = logging.getLogger(__name__)
 
-_TERMINAL_STATES = {TaskState.COMPLETED, TaskState.CANCELLED}
+# CONTINUED counts as terminal: its work moved to a successor task (handoff or
+# divergence rework), and both paths create that successor in the same goal,
+# so the goal still waits for it. Left out, the stale source card wedged its
+# goal in ACTIVE forever — the goal gate never opened and goal/<id> was never
+# merged into the working branch.
+_TERMINAL_STATES = {TaskState.COMPLETED, TaskState.CANCELLED, TaskState.CONTINUED}
 
 
 async def maybe_complete_goal(goal_id: UUID, room_id: UUID, db: AsyncSession) -> bool:

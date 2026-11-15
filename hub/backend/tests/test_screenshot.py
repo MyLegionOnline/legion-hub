@@ -119,11 +119,14 @@ async def test_capture_uses_ready_service_origin_ticket_and_isolated_context(mon
         uuid4(), "catalog-web", db, user_id=uuid4(), path="/dashboard?tab=errors"
     )
 
-    assert result == b"png-bytes"
+    assert result.png == b"png-bytes"
+    assert result.engine == "chromium"
+    assert result.measurements is None
     page.goto.assert_awaited_once()
     browser.new_context.assert_awaited_once_with(
         viewport={"width": 1280, "height": 720}, device_scale_factor=1
     )
+    page.screenshot.assert_awaited_once_with(type="png", animations="disabled", scale="css")
     assert page.goto.await_args.args[0].endswith(
         "/dashboard?tab=errors&ticket=one-time-ticket"
     )
@@ -188,14 +191,20 @@ async def test_tool_saves_png_data_uri_and_emits_file_changed(monkeypatch):
     saved_file = SimpleNamespace(id=uuid4())
 
     with (
-        patch("app.core.screenshot.capture_screenshot", new_callable=AsyncMock, return_value=b"png-bytes"),
+        patch(
+            "app.core.screenshot.capture_screenshot",
+            new_callable=AsyncMock,
+            return_value=screenshot.ScreenshotCapture(
+                png=b"png-bytes", viewport={"width": 1280, "height": 720}
+            ),
+        ),
         patch("app.core.workspace_fs.fs_write_file", new_callable=AsyncMock, return_value=saved_file) as upsert,
         patch("app.core.events.emit_event", new_callable=AsyncMock) as emit,
     ):
         result = await ScreenshotTool().execute(ctx, {"service_slug": "catalog-web"})
 
     assert result.startswith("Screenshot saved to /project/screenshots/catalog-web-")
-    assert result.endswith(".png")
+    assert ".png (chromium, viewport 1280x720)." in result
     assert upsert.await_args.args[0] == ctx.room_id
     assert upsert.await_args.args[1].startswith("/project/screenshots/catalog-web-")
     assert upsert.await_args.args[2] == "data:image/png;base64,cG5nLWJ5dGVz"

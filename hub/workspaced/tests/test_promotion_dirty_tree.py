@@ -52,8 +52,11 @@ def test_volatile_legion_paths_are_excluded():
     assert set(git_ops._VOLATILE_LEGION_PATHS) == {".legion/generation.json", ".legion/runs"}
     # background job logs: excluded and untracked, but never deleted on disk
     assert ".legion/bg/" in lines
-    assert ".legion/bg" in git_ops._UNTRACK_LEGION_PATHS
     assert ".legion/bg" not in git_ops._VOLATILE_LEGION_PATHS
+    # the whole of `.legion/` is untracked, except the shared configs
+    assert git_ops._UNTRACK_LEGION_PATHS[0] == ".legion"
+    for kept in git_ops._TRACKED_LEGION_FILES:
+        assert f":(exclude){kept}" in git_ops._UNTRACK_LEGION_PATHS
 
 
 def test_fresh_room_keeps_volatile_metadata_out_of_git(repo):

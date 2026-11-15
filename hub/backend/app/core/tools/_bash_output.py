@@ -11,31 +11,29 @@ from app.core.tools.registry import REGISTRY, Tool, ToolContext
 class BashOutputTool(Tool):
     name = "bash_output"
     description = (
-        "Read the accumulated log output of a background process started with bash(background=true). "
-        "Log is stored at /workspace/.legion/bg/<bg_id>.log and read via file API (no exec needed). "
-        "Check status field: 'running' means still alive, 'killed'/'failed' means stopped."
+        "Read the log of a background bash process; status 'running' means still alive."
     )
     input_schema: dict[str, Any] = {
         "type": "object",
         "properties": {
             "bg_id": {
                 "type": "string",
-                "description": "Background process ID returned by bash(background=true)",
+                "description": "From bash(background=true).",
             },
             "tail": {
                 "type": "integer",
                 "default": 100,
-                "description": "Number of lines to return from the end of the log (1–1000)",
+                "description": "Last N lines (1–1000).",
             },
             "cursor": {
                 "type": "integer",
                 "default": 0,
-                "description": "Read from this 0-based line cursor; returns next_cursor for paging",
+                "description": "0-based line cursor; the result gives next_cursor.",
             },
             "limit": {
                 "type": "integer",
                 "default": 100,
-                "description": "Number of lines after cursor (1–1000)",
+                "description": "Lines after cursor (1–1000).",
             },
         },
         "required": ["bg_id"],

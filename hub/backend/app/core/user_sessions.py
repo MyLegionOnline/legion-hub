@@ -93,6 +93,7 @@ from app.core.provider_cache import (
     tool_schema_version,
 )
 from app.core.router import OpenSessionContext, RouteDecision
+from app.core.tool_offer import LOAD_TOOLS
 from app.core.session_close import (
     ANTHROPIC_CLOSE_TOOL,
     OPENAI_CLOSE_TOOL,
@@ -100,6 +101,7 @@ from app.core.session_close import (
     SessionCloseActions,
     ToolArgumentsParseError,
     apply_close_actions,
+    malformed_arguments_result,
     clean_reply_text,
     close_tool_for_kind,
     extract_close_actions_from_tool_use,
@@ -3226,6 +3228,7 @@ async def _call_with_ws_loop_impl(
     budget_used: int = 0,
     secret_value: SecretValue | None = None,
     before_tool: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
+    tool_offer: Any = None,
 ) -> _LLMTurnResult:
     """Call LLM in a loop until text or a validated session-level tool call.
 
@@ -3239,6 +3242,11 @@ async def _call_with_ws_loop_impl(
     from app.core.tools import REGISTRY as _ws_registry, ToolContext
 
     history = _modernize_tool_notes(history)
+    if tool_offer is not None:
+        # Earlier turns keep load_tools only as text notes; read them back so
+        # the tool list a new turn starts with is the one the last turn ended with.
+        tool_offer.absorb_notes(history)
+        tool_offer.absorb(history)
     mcp_ant_tools = mcp_ant_tools or []
     mcp_oai_tools = mcp_oai_tools or []
     mcp_bindings = mcp_bindings or {}
@@ -3702,13 +3710,21 @@ async def _call_with_ws_loop_impl(
     if uses_messages_wire(provider, model):
         if uses_anthropic_env_key(provider):
             api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
-        all_tools = stable_tool_schemas([*ant_ws_tools, *mcp_ant_tools, ant_close])
-        if include_propose_plan:
-            all_tools = stable_tool_schemas(
-                [*all_tools, PROPOSE_PLAN_TOOL_ANTHROPIC, OFFER_PLAN_TOOL_ANTHROPIC]
-            )
-        if include_task_change:
-            all_tools = stable_tool_schemas([*all_tools, PROPOSE_TASK_CHANGE_TOOL_ANTHROPIC])
+        def _ant_tools_now() -> list[dict[str, Any]]:
+            offered = [*ant_ws_tools, *mcp_ant_tools]
+            if tool_offer is not None:
+                offered = tool_offer.offered(offered, "anthropic")
+            tools = stable_tool_schemas([*offered, ant_close])
+            if include_propose_plan:
+                tools = stable_tool_schemas(
+                    [*tools, PROPOSE_PLAN_TOOL_ANTHROPIC, OFFER_PLAN_TOOL_ANTHROPIC]
+                )
+            if include_task_change:
+                tools = stable_tool_schemas([*tools, PROPOSE_TASK_CHANGE_TOOL_ANTHROPIC])
+            return tools
+
+        all_tools = _ant_tools_now()
+        _offer_version = tool_offer.version if tool_offer is not None else 0
         working: list[dict[str, Any]] = list(history)
 
         _wait_refunds = 0
@@ -3726,6 +3742,11 @@ async def _call_with_ws_loop_impl(
             _note = await _take_and_mark_interjections()
             if _note is not None:
                 session_interject.append_user_note(working, _note)
+            if tool_offer is not None:
+                tool_offer.absorb(working)
+                if tool_offer.version != _offer_version:
+                    _offer_version = tool_offer.version
+                    all_tools = _ant_tools_now()
             if not _budget_left():
                 return _result(
                     None, None, total_in, total_out, model,
@@ -3949,6 +3970,17 @@ async def _call_with_ws_loop_impl(
                         "tool_use_id": tool_id,
                         "content": "Ok.",
                     })
+                elif tool_name == LOAD_TOOLS and tool_offer is not None:
+                    await _emit_tool_call(tool_name, tool_input_data)
+                    result_text = tool_offer.load(tool_input_data)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_id,
+                        "content": result_text,
+                    })
+                    args_str = json.dumps(tool_input_data, ensure_ascii=False, default=str)[:300]
+                    note_calls.append(f"{tool_name}({args_str})")
+                    note_results.append(f"### {tool_name} {args_str}\n{result_text}")
                 elif _ws_registry.is_registered(tool_name):
                     if tool_name not in allowed_workspace_tool_names:
                         result_text = f"Error: tool {tool_name!r} is not available in this context"
@@ -4065,13 +4097,19 @@ async def _call_with_ws_loop_impl(
     client_kwargs.update(openai_client_extras(client_kwargs["base_url"]))
 
     oai = llm_client(provider, chat_client_factory=AsyncOpenAI, **client_kwargs)
-    all_oai_tools = stable_tool_schemas([*oai_ws_tools, *mcp_oai_tools, oai_close])
-    if include_propose_plan:
-        all_oai_tools = stable_tool_schemas(
-            [*all_oai_tools, PROPOSE_PLAN_TOOL_OPENAI, OFFER_PLAN_TOOL_OPENAI]
-        )
-    if include_task_change:
-        all_oai_tools = stable_tool_schemas([*all_oai_tools, PROPOSE_TASK_CHANGE_TOOL_OPENAI])
+    def _oai_tools_now() -> list[dict[str, Any]]:
+        offered = [*oai_ws_tools, *mcp_oai_tools]
+        if tool_offer is not None:
+            offered = tool_offer.offered(offered, "openai")
+        tools = stable_tool_schemas([*offered, oai_close])
+        if include_propose_plan:
+            tools = stable_tool_schemas([*tools, PROPOSE_PLAN_TOOL_OPENAI, OFFER_PLAN_TOOL_OPENAI])
+        if include_task_change:
+            tools = stable_tool_schemas([*tools, PROPOSE_TASK_CHANGE_TOOL_OPENAI])
+        return tools
+
+    all_oai_tools = _oai_tools_now()
+    _offer_version = tool_offer.version if tool_offer is not None else 0
     working_oai: list[dict[str, Any]] = list(history)
 
     _wait_refunds = 0
@@ -4088,6 +4126,11 @@ async def _call_with_ws_loop_impl(
         _note = await _take_and_mark_interjections()
         if _note is not None:
             session_interject.append_user_note(working_oai, _note)
+        if tool_offer is not None:
+            tool_offer.absorb(working_oai)
+            if tool_offer.version != _offer_version:
+                _offer_version = tool_offer.version
+                all_oai_tools = _oai_tools_now()
         if not _budget_left():
             return _result(
                 None, None, total_in, total_out, model,
@@ -4239,8 +4282,13 @@ async def _call_with_ws_loop_impl(
                 return stopped
             try:
                 tool_args = parse_tool_arguments(tc.function.arguments)
-            except ToolArgumentsParseError:
-                tool_args = {}
+            except ToolArgumentsParseError as exc:
+                working_oai.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": malformed_arguments_result(tc.function.name, exc),
+                })
+                continue
 
             if tc.function.name == "propose_task_change":
                 validation_session = SimpleNamespace(
@@ -4277,6 +4325,17 @@ async def _call_with_ws_loop_impl(
                     "tool_call_id": tc.id,
                     "content": "Ok.",
                 })
+            elif tc.function.name == LOAD_TOOLS and tool_offer is not None:
+                await _emit_tool_call(tc.function.name, tool_args)
+                result_text = tool_offer.load(tool_args)
+                working_oai.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result_text,
+                })
+                args_str = json.dumps(tool_args, ensure_ascii=False, default=str)[:300]
+                note_calls_oai.append(f"{tc.function.name}({args_str})")
+                note_results_oai.append(f"### {tc.function.name} {args_str}\n{result_text}")
             elif _ws_registry.is_registered(tc.function.name):
                 if tc.function.name not in allowed_workspace_tool_names:
                     result_text = (
@@ -4797,6 +4856,25 @@ async def _process_user_turn(
         workspace_allowed = _workspace_tool_names_for_session(
             session, workspace_role, _ws_registry
         )
+        # A direct agent dialogue defers rare tools like a task session does;
+        # ChatMaster keeps its own CM set (internal design notes S3).
+        dialogue_offer = None
+        if workspace_role == "agent":
+            from app.core.tool_offer import plan_agent_offer, task_hints
+
+            # workspace_allowed is the whole role set here (direct sessions do
+            # not apply the agent's tools_allowed), so it names no explicit choice.
+            dialogue_offer = plan_agent_offer(
+                registry=_ws_registry,
+                allowed=None,
+                hints=await task_hints(
+                    room_id=session.room_id,
+                    task_id=None,
+                    goal_id=getattr(session, "goal_id", None),
+                    mcp_bindings=mcp_bindings,
+                ),
+                mcp_schemas=mcp_ant_tools,
+            )
         result = await _call_with_ws_loop(
             llm_config, system_prompt, history, mk,
             session.room_id, session.id, agent_id, db,
@@ -4815,6 +4893,7 @@ async def _process_user_turn(
             goal_id=getattr(session, "goal_id", None),
             budget_used=session.tokens_in + session.tokens_out,
             before_tool=_pin_before_tool if _ws_available else None,
+            tool_offer=dialogue_offer,
         )
     else:
         assembly = await _preflight_direct_user_request(

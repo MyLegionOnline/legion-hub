@@ -25,27 +25,25 @@ _SCHEMA: dict[str, Any] = {
         "task_id": {
             "type": "string",
             "format": "uuid",
-            "description": "UUID of the task to update (get it from task_list).",
+            "description": "From task_list.",
         },
         "state": {
             "type": "string",
             "description": (
-                "New task state. Must follow allowed transitions: "
-                "assigned→in_progress, in_progress→waiting_review/blocked/cancelled, "
-                "waiting_review→completed/in_progress."
+                "assigned→in_progress, in_progress→waiting_review|blocked|cancelled, "
+                "waiting_review→completed|in_progress."
             ),
         },
         "blocked_reason": {
             "type": "string",
             "enum": ["needs_vision"],
             "description": (
-                "With state=blocked: why the task cannot proceed. 'needs_vision' — the task "
-                "requires looking at an image/screenshot and you cannot see images. The task "
-                "is closed as blocked and your session ends."
+                "With state=blocked: needs_vision = the task needs seeing an image and you "
+                "cannot; this ends your session."
             ),
         },
-        "title": {"type": "string", "description": "New title (optional)."},
-        "description": {"type": "string", "description": "New description (optional)."},
+        "title": {"type": "string"},
+        "description": {"type": "string"},
     },
     "required": ["task_id"],
 }
@@ -54,10 +52,8 @@ _SCHEMA: dict[str, Any] = {
 class TaskUpdateTool(Tool):
     name = "task_update"
     description = (
-        "Update a task's state, title, or description immediately (mid-session). "
-        "Mark a task 'in_progress' when you start it, 'waiting_review' when done, "
-        "'completed' on approval. "
-        "Call task_list first to confirm the task_id and its current state."
+        "Update a task's state, title or description now: 'in_progress' when you start, "
+        "'waiting_review' when done."
     )
     input_schema = _SCHEMA
     roles = frozenset({"agent", "cm"})

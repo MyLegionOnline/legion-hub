@@ -26,42 +26,34 @@ _CONTENT_MAX = 30
 class GrepTool(Tool):
     name = "grep"
     description = (
-        "Search for a regex pattern in workspace files. "
-        "Use this BEFORE read_file to find where something is defined or used — "
-        "it is much faster than reading files one by one. "
-        "output_mode='files' (default) for a quick file list, 'content' for matching lines."
+        "Regex search over workspace files — use it BEFORE read_file to find where "
+        "something is defined or used."
     )
     input_schema: dict[str, Any] = {
         "type": "object",
         "properties": {
             "pattern": {
                 "type": "string",
-                "description": "Regex pattern to search for",
+                "description": "Regex.",
             },
             "glob": {
                 "type": "string",
-                "description": (
-                    "Glob pattern to restrict which files are searched "
-                    "(e.g. '**/*.py', 'src/**/*.ts'). Default: all files."
-                ),
+                "description": "Restrict files, e.g. 'src/**/*.ts'.",
             },
             "output_mode": {
                 "type": "string",
                 "enum": ["files", "content"],
-                "description": (
-                    "'content' returns matching lines with file:line: prefix; "
-                    "'files' returns only the paths of matching files."
-                ),
+                "description": "files: paths only; content: file:line: matching lines.",
                 "default": "files",
             },
             "max_results": {
                 "type": "integer",
-                "description": "Max results (files: 20, content: 30)",
+                "description": "Default files 20, content 30.",
                 "default": _DEFAULT_MAX,
             },
             "path_prefix": {
                 "type": "string",
-                "description": "Optional workspace-relative directory/file prefix to narrow the search",
+                "description": "Workspace-relative dir/file prefix.",
             },
         },
         "required": ["pattern"],

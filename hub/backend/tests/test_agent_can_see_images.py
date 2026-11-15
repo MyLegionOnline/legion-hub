@@ -80,6 +80,7 @@ def test_no_vision_note_names_the_task_and_the_block_reason():
 
 @pytest.mark.asyncio
 async def test_screenshot_result_tells_a_blind_agent_it_cannot_judge_the_frame():
+    from app.core.screenshot import ScreenshotCapture
     from app.core.tools._screenshot import ScreenshotTool
 
     def _ctx(llm_config):
@@ -95,7 +96,11 @@ async def test_screenshot_result_tells_a_blind_agent_it_cannot_judge_the_frame()
 
     async def _run(llm_config) -> str:
         with (
-            patch("app.core.screenshot.capture_screenshot", new_callable=AsyncMock, return_value=b"png"),
+            patch(
+                "app.core.screenshot.capture_screenshot",
+                new_callable=AsyncMock,
+                return_value=ScreenshotCapture(png=b"png", viewport={"width": 1280, "height": 720}),
+            ),
             patch("app.core.workspace_fs.fs_write_file", new_callable=AsyncMock, return_value=SimpleNamespace(id=uuid4())),
             patch("app.core.events.emit_event", new_callable=AsyncMock),
             patch(
@@ -112,4 +117,5 @@ async def test_screenshot_result_tells_a_blind_agent_it_cannot_judge_the_frame()
     assert 'blocked_reason="needs_vision"' in blind
 
     sighted = await _run({**_OPENROUTER, "vision": _OVERRIDE})
-    assert sighted.endswith(".png")
+    assert sighted.startswith("Screenshot saved to /project/screenshots/catalog-web-")
+    assert "cannot view images" not in sighted

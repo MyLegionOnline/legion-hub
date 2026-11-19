@@ -94,7 +94,7 @@ async def test_process_user_turn_discovers_room_mcp_tools_without_a_task():
 
     assert still_open is True
     # Discovery ran for THIS session's room/owner, not gated on a task/plan.
-    mock_discover.assert_awaited_once_with(session.room_id, owner_id, db)
+    mock_discover.assert_awaited_once_with(session.room_id, owner_id, db, agent_id=session.agent_id)
     # The discovered bindings/schemas must reach the ws loop even though
     # workspace tools are unavailable — MCP alone is enough to enter it.
     assert mock_loop.call_args.kwargs["mcp_user_id"] == owner_id
@@ -134,7 +134,7 @@ async def test_process_user_turn_discovers_room_mcp_tools_for_chat_master_sessio
         still_open = await process_user_turn(session, "hi", db)
 
     assert still_open is True
-    mock_discover.assert_awaited_once_with(session.room_id, owner_id, db)
+    mock_discover.assert_awaited_once_with(session.room_id, owner_id, db, agent_id=session.chat_master_agent_id)
     assert mock_loop.call_args.kwargs["mcp_user_id"] == owner_id
     assert "mcp__mcp-vision__describe_image" in mock_loop.call_args.kwargs["mcp_bindings"]
 

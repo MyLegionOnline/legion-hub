@@ -29,6 +29,7 @@ RestartMode = Literal["retry", "resume"]
 _AUTO_RETRY_ACTIONS: dict[str, RestartMode] = {
     "provider_error": "retry",
     "timeout": "retry",
+    "cm_answer_failed": "retry",
     "orphaned_restart": "retry",
     "tool_calls": "resume",
     "context_window": "resume",
@@ -38,7 +39,7 @@ _BACKOFF_SECONDS = (30, 120, 480)
 
 def auto_retry_action(reason: str, http_status: int | None = None) -> RestartMode | None:
     """Return the automatic restart action for an eligible interruption."""
-    if reason == "provider_error" and http_status is not None:
+    if reason in ("provider_error", "cm_answer_failed") and http_status is not None:
         if http_status != 429 and not 500 <= http_status < 600:
             return None
     return _AUTO_RETRY_ACTIONS.get(reason)

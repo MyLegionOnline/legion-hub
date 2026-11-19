@@ -82,6 +82,7 @@ import logging
 import re
 import time
 from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Mapping
@@ -614,6 +615,143 @@ async def _current_branch(room_id: "UUID | str") -> str | None:
         return None
 
 
+# A task whose agent may be mid-session right now. ``continued`` is left out on
+# purpose: such a task handed its work to a continuation (or a divergence
+# rework) that runs on a branch of its own, so nobody is writing on its branch.
+_AGENT_ACTIVE_TASK_STATES = _LIVE_TASK_STATES - {"continued"}
+
+
+async def _active_task_for_branch(branch: str | None, db):
+    """The task that owns ``task/<id>`` when its agent may still be working."""
+    if not branch or not branch.startswith(TASK_BRANCH_PREFIX):
+        return None
+    try:
+        task_id = UUID(branch[len(TASK_BRANCH_PREFIX):])
+    except ValueError:
+        return None
+
+    from sqlalchemy.future import select
+
+    from app.models.task import Task
+
+    task = (await db.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
+    if task is None:
+        return None
+    state = str(getattr(task.state, "value", task.state))
+    return task if state in _AGENT_ACTIVE_TASK_STATES else None
+
+
+async def _head_held_by_live_work(room_id: "UUID | str", branch: str | None, db) -> bool:
+    """True when ``branch`` is where a running task or an open dialogue writes."""
+    if await _active_task_for_branch(branch, db) is not None:
+        return True
+    return await _live_session_owns_head(room_id, branch, db)
+
+
+async def return_head_to_live_work(
+    room_id: "UUID | str", head_before: str | None, db, *, merged_branch: str | None = None
+) -> bool:
+    """Put HEAD back on the branch a live agent was writing on before a merge.
+
+    The room has a single working tree. Every gate merge (task → goal, goal →
+    working branch, working branch → ``main``) checks out its target and used
+    to leave HEAD there. When another task of the room was still running, its
+    agent's next ``write_file`` / ``edit_file`` auto-commit then landed on the
+    merge target instead of its own task branch: the task branch froze, the
+    target got the rest of the work, and the task's own merge later hit a
+    "divergence" with itself (prod 2026-11-16, goal ec3cc5aa — the rework
+    redid the whole task).
+
+    Only a branch a running task or an open dialogue still holds is restored;
+    ``merged_branch`` (the one just folded in) never is. Best-effort.
+    """
+    if not head_before or head_before == merged_branch:
+        return False
+    try:
+        if not await _head_held_by_live_work(room_id, head_before, db):
+            return False
+    except Exception as exc:  # noqa: BLE001 — a lookup failure must not fail the merge
+        logger.warning("return_head_to_live_work: room %s lookup failed: %s", room_id, exc)
+        return False
+    current = await _current_branch(room_id)
+    if current is None or current == head_before:
+        return False
+
+    from app.core import workspaced_client as wsd
+
+    try:
+        result = await wsd.create_workspace_branch(str(room_id), head_before)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "return_head_to_live_work: room %s could not return HEAD to %s: %s",
+            room_id, head_before, exc,
+        )
+        return False
+    if isinstance(result, Mapping) and result.get("ok") is False:
+        logger.warning(
+            "return_head_to_live_work: room %s checkout of %s refused", room_id, head_before
+        )
+        return False
+    logger.info(
+        "return_head_to_live_work: room %s HEAD %s → %s (live work resumes there)",
+        room_id, current, head_before,
+    )
+    return True
+
+
+@asynccontextmanager
+async def keep_live_head(room_id: "UUID | str", db, *, merged_branch: str | None = None):
+    """Wrap a gate merge so a running agent's branch stays checked out after it."""
+    head_before = await _current_branch(room_id)
+    try:
+        yield
+    finally:
+        await return_head_to_live_work(room_id, head_before, db, merged_branch=merged_branch)
+
+
+async def pin_task_head(room_id: "UUID | str", task_id, db) -> str | None:
+    """Check out a running task's branch before its agent writes.
+
+    Defence in depth for the single working tree: whatever moved HEAD away
+    (a gate merge, a promotion, a user action) a task's write must commit onto
+    ``task/<id>``, never onto the goal / working branch it happens to find.
+    Another live task's or dialogue's branch is left alone — yanking it would
+    strand that agent instead. Returns the branch HEAD is on for the task, or
+    ``None`` when nothing was pinned. Best-effort, never raises.
+    """
+    if room_id is None or task_id is None or db is None:
+        return None
+    try:
+        from sqlalchemy.future import select
+
+        from app.models.task import Task
+
+        task = (await db.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
+        if task is None:
+            return None
+        state = str(getattr(task.state, "value", task.state))
+        if state not in _AGENT_ACTIVE_TASK_STATES:
+            return None
+        branch = getattr(task, "branch_name", None) or task_branch_name(task.id)
+        current = await _current_branch(room_id)
+        if current is None or current == branch:
+            return current
+        if await _head_held_by_live_work(room_id, current, db):
+            logger.warning(
+                "pin_task_head: room %s HEAD is on live %s, task %s writes there",
+                room_id, current, task_id,
+            )
+            return None
+        logger.warning(
+            "pin_task_head: room %s HEAD was on %s, returning it to %s before task %s writes",
+            room_id, current, branch, task_id,
+        )
+        return await ensure_task_branch(room_id, task, db)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("pin_task_head: room %s task %s: %s", room_id, task_id, exc)
+        return None
+
+
 async def ensure_session_branch(room_id: "UUID | str", session, db) -> str | None:
     """Pin the workspace HEAD for a direct user ↔ agent session.
 
@@ -645,24 +783,18 @@ async def ensure_session_branch(room_id: "UUID | str", session, db) -> str | Non
     ``None`` when nothing was pinned (no repo, live task, failed checkout) — the
     caller carries on, since refusing the turn over a git detail would be worse.
     """
+    from app.core import session_work
     from app.core import workspaced_client as wsd
 
-    task_id = getattr(session, "task_id", None)
-    if task_id is not None:
-        from sqlalchemy.future import select
-
-        from app.models.task import Task
-
-        task = (
-            await db.execute(select(Task).where(Task.id == task_id))
-        ).scalar_one_or_none()
-        if task is not None:
-            return await ensure_task_branch(room_id, task, db)
+    # A finished bound task is skipped: re-checking out its merged branch
+    # would strand every write of this dialogue there (era_of_valera, 11-19).
+    task = await session_work.live_bound_task(session, db)
+    if task is not None:
+        return await ensure_task_branch(room_id, task, db)
 
     # The dialogue's own unfinished work outranks the working branch: its task
     # is still open (or its branch not yet adopted), so this turn continues
     # where the previous one stopped instead of starting over on `dev`.
-    from app.core import session_work
 
     own_task = await session_work.open_dialogue_task(session, db)
     if own_task is not None:
@@ -809,6 +941,14 @@ async def commit_working_tree(room_id: "UUID | str", task, db, *, reason: str) -
 
 
 async def merge_task_branch(room_id: "UUID | str", task, db) -> dict[str, Any]:
+    """Merge the task branch into its base; HEAD goes back to a sibling task
+    that is still running (see ``return_head_to_live_work``)."""
+    branch = getattr(task, "branch_name", None) or task_branch_name(task.id)
+    async with keep_live_head(room_id, db, merged_branch=branch):
+        return await _merge_task_branch(room_id, task, db)
+
+
+async def _merge_task_branch(room_id: "UUID | str", task, db) -> dict[str, Any]:
     """Merge the task branch into its base (goal branch or ``working_branch``).
 
     First refreshes the task branch against its base with a plain 3-way merge —
@@ -2541,6 +2681,7 @@ async def resolve_promotion(
             return pr_out
         merge_sha = pr_out.get("sha")
     else:
+        head_before = await _current_branch(room_id)
         merge = await wsd.merge_workspace_branch(
             str(room_id),
             promotion.from_branch,
@@ -2555,6 +2696,7 @@ async def resolve_promotion(
             # room could fold `main` into `dev` to fix the conflict. Return
             # HEAD to the working branch, as the success path does.
             await _restore_working_branch(room_id, promotion.from_branch)
+            await return_head_to_live_work(room_id, head_before, db)
             promotion.state = PROMOTION_CONFLICT
             db.add(promotion)
             await db.flush()
@@ -2571,11 +2713,14 @@ async def resolve_promotion(
             return {"ok": False, "conflict": True, "state": PROMOTION_CONFLICT}
 
         if not merge.get("ok"):
+            await return_head_to_live_work(room_id, head_before, db)
             return {"ok": False, "error": merge.get("stderr") or "merge failed"}
 
         # The merge left the working tree checked out on `main`, where agent /
         # auto commits are refused (§0.1). Put HEAD back on the working branch.
         await _restore_working_branch(room_id, promotion.from_branch)
+        # …and on to a task still running in the room, if HEAD was on one.
+        await return_head_to_live_work(room_id, head_before, db)
         merge_sha = merge.get("sha")
 
     promotion.state = PROMOTION_APPROVED
@@ -2915,13 +3060,14 @@ async def _promote_goal_branch_to_dev(
     room = await _load_room(room_id, db)
     cfg = get_flow_config(room)
 
-    merge = await wsd.merge_workspace_branch(
-        str(room_id),
-        goal.branch_name,
-        target=cfg.working_branch,
-        theirs=False,
-        message=f"merge goal: {goal.branch_name} → {cfg.working_branch} — {goal.title}",
-    )
+    async with keep_live_head(room_id, db, merged_branch=goal.branch_name):
+        merge = await wsd.merge_workspace_branch(
+            str(room_id),
+            goal.branch_name,
+            target=cfg.working_branch,
+            theirs=False,
+            message=f"merge goal: {goal.branch_name} → {cfg.working_branch} — {goal.title}",
+        )
 
     if merge.get("conflict"):
         await emit_event(

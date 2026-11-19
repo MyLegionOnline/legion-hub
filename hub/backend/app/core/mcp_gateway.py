@@ -20,7 +20,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, true as sa_true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core import legion_wallet
@@ -28,7 +28,7 @@ from app.core.events import emit_event
 from app.db.release import release_db
 from app.core.image_bytes import sniff_image_mime, split_image_data_uri
 from app.core.secret_config import configured_secret
-from app.models.market import RoomMcpServer, UserDefaultProvision, UserInstalledItem
+from app.models.market import RoomMcpScope, RoomMcpScopeAgent, RoomMcpServer, UserInstalledItem
 from app.models.personal_mcp import PersonalMcpRuntime
 from app.models.room import Room, RoomUserLink
 from app.core.personal_mcp import record_event, transition_runtime
@@ -568,19 +568,138 @@ def format_mcp_failure_note(failures: list[McpCapabilityFailure]) -> str:
     return "\n".join(lines)
 
 
+def _mcp_name_tokens(display_name: str) -> list[str]:
+    tokens = re.findall(r"[^\W_]{4,}", str(display_name or "").casefold())
+    return [token for token in tokens if token not in {"read", "only", "http", "mcp"}]
+
+
+def text_mentions_mcp(task_text: str, display_name: str) -> bool:
+    """Whether *task_text* names the MCP server *display_name* (word tokens)."""
+
+    normalized = str(task_text or "").casefold()
+    return any(token in normalized for token in _mcp_name_tokens(display_name))
+
+
 def task_requires_mcp_capability(
     task_text: str,
     failures: list[McpCapabilityFailure],
 ) -> bool:
     """Conservatively detect an explicit request for a failed MCP resource."""
 
-    normalized = str(task_text or "").casefold()
-    for failure in failures:
-        tokens = re.findall(r"[^\W_]{4,}", failure.display_name.casefold())
-        tokens = [token for token in tokens if token not in {"read", "only", "http", "mcp"}]
-        if any(token in normalized for token in tokens):
-            return True
-    return False
+    return any(text_mentions_mcp(task_text, failure.display_name) for failure in failures)
+
+
+@dataclass(frozen=True)
+class RoomMcpBrief:
+    """One room MCP server as ChatMaster sees it: a name and who may use it.
+
+    internal design notes §4.1 — built from the
+    database only (no discovery, no schemas), so it is cheap enough for every
+    prompt that lists the room's agents.
+    """
+
+    installed_item_id: UUID
+    name: str
+    market_slug: str | None
+    mode: str  # "all" | "selected"
+    agent_ids: frozenset[UUID]
+
+    @property
+    def vision(self) -> bool:
+        from app.core.vision_dispatch import _VISION_MARKET_SLUG
+
+        return self.market_slug == _VISION_MARKET_SLUG
+
+    def available_to(self, agent_id: UUID | None) -> bool:
+        return self.mode != "selected" or (agent_id is not None and agent_id in self.agent_ids)
+
+
+async def room_mcp_briefs(room_id: UUID, db: AsyncSession) -> list[RoomMcpBrief]:
+    """Active MCP servers attached to *room_id*, with their agent scope.
+
+    Same eligibility as :func:`room_mcp_tools` (a ``room_mcp_server`` row, an
+    active ``mcp`` item) minus the live checks: a server that fails its check
+    is still listed — the failure note at run time covers that.
+    """
+    rows = (
+        await db.execute(
+            select(UserInstalledItem, RoomMcpScope.mode)
+            .join(
+                RoomMcpServer,
+                and_(
+                    RoomMcpServer.user_installed_item_id == UserInstalledItem.id,
+                    RoomMcpServer.room_id == room_id,
+                ),
+            )
+            .outerjoin(
+                RoomMcpScope,
+                and_(
+                    RoomMcpScope.user_installed_item_id == UserInstalledItem.id,
+                    RoomMcpScope.room_id == room_id,
+                ),
+            )
+            .where(UserInstalledItem.type == "mcp", UserInstalledItem.status == "active")
+            .order_by(UserInstalledItem.name, UserInstalledItem.id)
+        )
+    ).all()
+    if not rows:
+        return []
+    selected: dict[UUID, set[UUID]] = {}
+    scope_rows = (
+        await db.execute(
+            select(RoomMcpScopeAgent.user_installed_item_id, RoomMcpScopeAgent.agent_id).where(
+                RoomMcpScopeAgent.room_id == room_id
+            )
+        )
+    ).all()
+    for item_id, agent_id in scope_rows:
+        selected.setdefault(item_id, set()).add(agent_id)
+    return [
+        RoomMcpBrief(
+            installed_item_id=item.id,
+            name=_safe_mcp_display_name(item),
+            market_slug=item.market_slug,
+            mode=mode if mode == "selected" else "all",
+            agent_ids=frozenset(selected.get(item.id, ())),
+        )
+        for item, mode in rows
+    ]
+
+
+#: An image file in a task text, or the Hub's own screenshot tool — language
+#: neutral on purpose (no natural-language "look at" words, see the
+#: multilingual rule): it only feeds a soft warning, never a block.
+_VISUAL_TASK_RE = re.compile(r"\.(?:png|jpe?g|webp|gif|bmp|svg)\b|\bscreenshots?\b", re.IGNORECASE)
+
+
+def assignment_capability_warnings(
+    *,
+    task_text: str,
+    nickname: str,
+    agent_id: UUID,
+    vision_hint: str,
+    briefs: list[RoomMcpBrief],
+) -> list[str]:
+    """Soft warnings for assigning *task_text* to an agent that lacks a capability.
+
+    Only servers attached to the room but outside the agent's scope can warn —
+    a server every agent has is never a reason. ``vision_hint`` is
+    :func:`app.core.vision_dispatch.agent_vision_hint` for that agent.
+    """
+    warnings: list[str] = []
+    for brief in briefs:
+        if not brief.available_to(agent_id) and text_mentions_mcp(task_text, brief.name):
+            owners = "assigned to other agents" if brief.agent_ids else "assigned to no agent"
+            warnings.append(
+                f"@{nickname} has no access to MCP server '{brief.name}' ({owners}); "
+                "reassign the task or ask the user to change the server's agents."
+            )
+    if vision_hint == "no" and _VISUAL_TASK_RE.search(str(task_text or "")):
+        warnings.append(
+            f"@{nickname} cannot view images (no vision model, override or image-analysis MCP); "
+            "if the task needs looking at images, reassign it to an agent with 'sees images: yes'."
+        )
+    return warnings
 
 
 def _failure_from_status(item: Any, status: Any) -> McpCapabilityFailure:
@@ -855,11 +974,35 @@ async def _notify_hidden_mcp_items(
         logger.warning("Failed to post MCP credits hidden notice for room %s", room_id, exc_info=True)
 
 
+def agent_scope_clause(room_id: Any, agent_id: UUID | None) -> Any:
+    """SQL condition: the room's ``room_mcp_server`` item is in *agent_id*'s scope.
+
+    internal design notes §3.1. Use with an outer
+    join of :class:`RoomMcpScope` on (room, item). No scope row or ``all`` →
+    every agent; ``selected`` → only the listed agents (none listed → nobody).
+    ``agent_id=None`` is "no agent filter" and is only for Hub-internal
+    callers that are not an agent.
+    """
+    if agent_id is None:
+        return sa_true()
+    selected = (
+        select(RoomMcpScopeAgent.agent_id)
+        .where(
+            RoomMcpScopeAgent.room_id == room_id,
+            RoomMcpScopeAgent.user_installed_item_id == UserInstalledItem.id,
+            RoomMcpScopeAgent.agent_id == agent_id,
+        )
+        .exists()
+    )
+    return or_(RoomMcpScope.mode.is_(None), RoomMcpScope.mode == "all", selected)
+
+
 async def room_mcp_tools(
     room_id: UUID,
     user_id: UUID,
     db: AsyncSession,
     *,
+    agent_id: UUID | None,
     _failures: list[McpCapabilityFailure] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, McpToolBinding]]:
     """Return room MCP schemas, using verified snapshots for HTTP links.
@@ -868,6 +1011,11 @@ async def room_mcp_tools(
     Gateway discovery behavior.  A custom HTTP link is different: its
     snapshot is the source of truth, and an unavailable link contributes a
     value-free diagnostic instead of exposing a live endpoint to the agent.
+
+    *agent_id* is required (keyword, no default) so no caller loses the
+    per-agent filter by accident: servers outside the agent's scope are
+    dropped before any discovery, so they cost no probe, no failure note and
+    no hidden-credits notice for that agent. ``None`` disables the filter.
     """
     room_access = await db.execute(
         select(Room.id)
@@ -879,13 +1027,13 @@ async def room_mcp_tools(
     )
     if room_access.first() is None:
         return [], [], {}
-    # A default Market item is globally installed for the user but does not
-    # need one RoomMcpServer row per room. UserDefaultProvision is the local
-    # source of truth for the user's opt-in/opt-out decision; the MCP item
-    # itself is still filtered to active status below.
+    # The room_mcp_server row is the only source of truth, defaults included:
+    # a default Market MCP gets its row in every room when it is installed or
+    # a room is created (core/skill_defaults.py), and user_default_provision
+    # is just the "offered once" ledger (room_mcp_agent_scope_plan §3.0).
     result = await db.execute(
         select(UserInstalledItem, RoomMcpServer)
-        .outerjoin(
+        .join(
             RoomMcpServer,
             and_(
                 RoomMcpServer.user_installed_item_id == UserInstalledItem.id,
@@ -893,20 +1041,17 @@ async def room_mcp_tools(
             ),
         )
         .outerjoin(
-            UserDefaultProvision,
+            RoomMcpScope,
             and_(
-                UserDefaultProvision.user_id == user_id,
-                UserDefaultProvision.market_item_id == UserInstalledItem.market_item_id,
+                RoomMcpScope.user_installed_item_id == UserInstalledItem.id,
+                RoomMcpScope.room_id == room_id,
             ),
         )
         .where(
             UserInstalledItem.user_id == user_id,
             UserInstalledItem.type == "mcp",
             UserInstalledItem.status == "active",
-            or_(
-                RoomMcpServer.room_id.is_not(None),
-                UserDefaultProvision.user_id.is_not(None),
-            ),
+            agent_scope_clause(room_id, agent_id),
         )
         .order_by(UserInstalledItem.name, UserInstalledItem.id)
     )
@@ -1175,6 +1320,8 @@ async def room_mcp_capabilities(
     room_id: UUID,
     user_id: UUID,
     db: AsyncSession,
+    *,
+    agent_id: UUID | None,
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -1188,6 +1335,7 @@ async def room_mcp_capabilities(
         room_id,
         user_id,
         db,
+        agent_id=agent_id,
         _failures=failures,
     )
     return ant, oai, bindings, failures
@@ -2569,26 +2717,20 @@ async def vps_service_binding(
     """The Room's ``legion-vps-mcp`` install, as a binding for one tool.
 
     Narrowed copy of ``room_mcp_tools``'s eligibility query: the item must be
-    this user's, active, and either attached to this Room or provisioned by
-    default for them. Deliberately not a discovery call — the tool names are
-    ours and static (§3.2), so nothing here depends on what the service
-    reports about itself.
+    this user's, active, and attached to this Room. Deliberately not a
+    discovery call — the tool names are ours and static (§3.2), so nothing
+    here depends on what the service reports about itself. No agent scope:
+    the only caller is the preparation wizard, whose actor is the Hub, not an
+    agent (room_mcp_agent_scope_plan §1a).
     """
     row = (
         await db.execute(
             select(UserInstalledItem)
-            .outerjoin(
+            .join(
                 RoomMcpServer,
                 and_(
                     RoomMcpServer.user_installed_item_id == UserInstalledItem.id,
                     RoomMcpServer.room_id == room_id,
-                ),
-            )
-            .outerjoin(
-                UserDefaultProvision,
-                and_(
-                    UserDefaultProvision.user_id == user_id,
-                    UserDefaultProvision.market_item_id == UserInstalledItem.market_item_id,
                 ),
             )
             .where(
@@ -2596,10 +2738,6 @@ async def vps_service_binding(
                 UserInstalledItem.type == "mcp",
                 UserInstalledItem.status == "active",
                 UserInstalledItem.market_slug == _VPS_MCP_MARKET_SLUG,
-                or_(
-                    RoomMcpServer.room_id.is_not(None),
-                    UserDefaultProvision.user_id.is_not(None),
-                ),
             )
             .limit(1)
         )

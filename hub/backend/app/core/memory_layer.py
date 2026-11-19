@@ -665,12 +665,16 @@ async def build_memory_layer(session: Session, db: AsyncSession) -> dict[str, An
     room_mem = await _room_memory(room_id, db)
     repo_snap = await _repo_snapshot(room_id, db)
     agents = await _agents_list_short(room_id, db)
+    mcp_unassigned = await _attach_agents_mcp(room_id, agents, db)
+    await _refresh_vision_hints(agents)
 
     base: dict[str, Any] = {
         "room_memory": room_mem,
         "repo_snapshot": repo_snap,
         "agents_list": agents,
     }
+    if mcp_unassigned:
+        base["mcp_unassigned"] = mcp_unassigned
 
     if kind == "user_agent_p1":
         goal_id: UUID = session.goal_id  # type: ignore[attr-defined]
@@ -839,7 +843,7 @@ def build_system_prompt(memory_layer: dict[str, Any], kind: str) -> str:
         parts.append(_render_repo_snapshot(memory_layer["repo_snapshot"]))
 
     if "agents_list" in memory_layer:
-        parts.append(_render_agents_list(memory_layer["agents_list"]))
+        parts.append(_render_agents_list(memory_layer["agents_list"], memory_layer.get("mcp_unassigned")))
 
     if "board_snapshot" in memory_layer:
         parts.append(render_board_snapshot(memory_layer["board_snapshot"]))
@@ -931,6 +935,8 @@ async def _repo_snapshot(room_id: UUID, db: AsyncSession) -> dict[str, Any]:
 
 
 async def _agents_list_short(room_id: UUID, db: AsyncSession) -> list[dict[str, Any]]:
+    from app.core.vision_dispatch import agent_vision_hint, vision_catalog_key
+
     result = await db.execute(
         sa.select(Agent.id, Agent.nickname, Agent.short_description, Agent.llm_config)
         .join(RoomAgentLink, Agent.id == RoomAgentLink.agent_id)
@@ -943,9 +949,72 @@ async def _agents_list_short(room_id: UUID, db: AsyncSession) -> list[dict[str, 
             "nickname": row.nickname,
             "short_description": row.short_description,
             "capability": ((row.llm_config or {}).get("media") or {}).get("capability") or "text",
+            # Vision from the agent's own model/override; a vision MCP server in
+            # its scope turns this into "yes" in _attach_agents_mcp.
+            "sees_images": agent_vision_hint(row.llm_config, has_vision_server=False),
+            # Popped by _refresh_vision_hints — never rendered or stored.
+            "_vision_key": vision_catalog_key(row.llm_config),
         }
         for row in result
     ]
+
+
+async def _refresh_vision_hints(agents: list[dict[str, Any]]) -> None:
+    """Turn ``unknown`` vision hints into yes/no from the OpenRouter catalog.
+
+    Bounded warm-up (vision_dispatch.warm_vision_catalog) so a text-only
+    model reads ``sees images: no`` even on a fresh process. Always drops the
+    private ``_vision_key``.
+    """
+    from app.core.media_size import cached_chat_model_supports_image_input
+    from app.core.vision_dispatch import warm_vision_catalog
+
+    keys = [a["_vision_key"] for a in agents if a.get("sees_images") == "unknown" and a.get("_vision_key")]
+    if keys:
+        await warm_vision_catalog(keys)
+    for a in agents:
+        key = a.pop("_vision_key", None)
+        if a.get("sees_images") == "unknown" and key:
+            cached = cached_chat_model_supports_image_input(*key)
+            if cached is not None:
+                a["sees_images"] = "yes" if cached else "no"
+
+
+async def _attach_agents_mcp(
+    room_id: UUID, agents: list[dict[str, Any]], db: AsyncSession
+) -> list[str]:
+    """Add each agent's room MCP server names to *agents*, in place.
+
+    internal design notes §4.2 — names only, never
+    schemas, so ChatMaster can route an MCP or image task to an agent that
+    can do it. Returns the servers no listed agent may use. Best effort: a
+    failure leaves the list as it was.
+    """
+    if not agents:
+        return []
+    try:
+        from app.core.mcp_gateway import room_mcp_briefs
+
+        briefs = await room_mcp_briefs(room_id, db)
+        if not isinstance(briefs, list) or not briefs:
+            return []
+        agent_ids = {UUID(str(a["id"])) for a in agents}
+        for a in agents:
+            agent_id = UUID(str(a["id"]))
+            own = [b for b in briefs if b.available_to(agent_id)]
+            a["mcp"] = [b.name for b in own]
+            if any(b.vision for b in own):
+                a["sees_images"] = "yes"
+        return [
+            b.name
+            for b in briefs
+            if b.mode == "selected" and not (b.agent_ids & agent_ids)
+        ]
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).warning("memory_layer: room MCP summary failed for room %s", room_id, exc_info=True)
+        return []
 
 
 async def _goal(goal_id: Optional[UUID], db: AsyncSession) -> Optional[dict[str, Any]]:
@@ -1227,7 +1296,7 @@ def _render_repo_snapshot(snapshot: Any) -> str:
     return f"## Repository Snapshot\n\n{lines}"
 
 
-def _render_agents_list(agents: list[dict[str, Any]]) -> str:
+def _render_agents_list(agents: list[dict[str, Any]], mcp_unassigned: list[str] | None = None) -> str:
     if not agents:
         return "## Agents in Room\n\n*(none)*"
     lines_list = []
@@ -1235,7 +1304,23 @@ def _render_agents_list(agents: list[dict[str, Any]]) -> str:
         cap = a.get("capability", "text")
         cap_label = f" [**{cap}**]" if cap != "text" else ""
         line = f"- **@{a['nickname']}** (`{a['id']}`){cap_label}: " + (a["short_description"] or "*(no description)*")
+        extras = []
+        if "mcp" in a:
+            extras.append("MCP: " + (", ".join(a["mcp"]) or "none"))
+        if a.get("sees_images") in ("yes", "no"):
+            extras.append(f"sees images: {a['sees_images']}")
+        if extras:
+            line += "\n  " + " · ".join(extras)
         lines_list.append(line)
+    if mcp_unassigned:
+        lines_list.append("MCP connected but assigned to no agent: " + ", ".join(mcp_unassigned))
+    if any("mcp" in a or a.get("sees_images") in ("yes", "no") for a in agents):
+        lines_list.append(
+            "Give a task that needs an MCP server only to an agent that lists it, and a task "
+            "that needs looking at images or screenshots never to an agent with 'sees images: no'. "
+            "'MCP' lists only extra servers: built-in tools (bash, files, web_fetch, screenshot "
+            "of a declared service) are available to every agent."
+        )
     return "## Agents in Room\n\n" + "\n".join(lines_list)
 
 

@@ -678,10 +678,13 @@ async def resolve_divergence(
             return {"ok": False, "detail": fresh.get("error") or "the divergence cannot be read"}
 
     if decision == "take_branch":
-        merge = await wsd.merge_workspace_branch(
-            str(rid), branch, target=base, theirs=True,
-            message=f"divergence: take {branch} over {base} — {task.title}",
-        )
+        from app.core.room_git_flow import keep_live_head
+
+        async with keep_live_head(rid, db, merged_branch=branch):
+            merge = await wsd.merge_workspace_branch(
+                str(rid), branch, target=base, theirs=True,
+                message=f"divergence: take {branch} over {base} — {task.title}",
+            )
         if merge.get("busy"):
             return {"ok": False, "detail": "the working tree is busy, try again"}
         if merge.get("conflict") or not merge.get("ok"):

@@ -18,6 +18,7 @@ from app.models.task import Task, TaskState
     ("reason", "action"),
     [
         ("timeout", "retry"),
+        ("cm_answer_failed", "retry"),
         ("orphaned_restart", "retry"),
         ("tool_calls", "resume"),
         ("context_window", "resume"),
@@ -55,6 +56,7 @@ def test_transient_provider_errors_retry(status):
 @pytest.mark.parametrize("status", [200, 400, 401, 402, 403, 404, 408, 409, 422])
 def test_other_provider_statuses_do_not_retry(status):
     assert auto_retry_action("provider_error", status) is None
+    assert auto_retry_action("cm_answer_failed", status) is None
 
 
 @pytest.mark.parametrize(("attempt", "base_delay"), [(1, 30), (2, 120), (3, 480), (10, 480)])

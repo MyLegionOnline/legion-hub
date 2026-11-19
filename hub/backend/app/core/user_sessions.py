@@ -4809,8 +4809,9 @@ async def _process_user_turn(
             try:
                 from app.core.mcp_gateway import room_mcp_tools
 
+                # Scoped to this dialogue's agent (room_mcp_agent_scope_plan §3.2).
                 mcp_ant_tools, mcp_oai_tools, mcp_bindings = await room_mcp_tools(
-                    session.room_id, mcp_user_id, db
+                    session.room_id, mcp_user_id, db, agent_id=agent_id
                 )
             except Exception:
                 logger.warning(

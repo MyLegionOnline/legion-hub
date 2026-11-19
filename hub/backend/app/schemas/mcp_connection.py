@@ -56,7 +56,26 @@ class McpRoomBindingOut(BaseModel):
     status: Literal["available", "unavailable"]
 
 
+class McpAgentScopeOut(BaseModel):
+    """Which agents of a room get one room MCP server's tools.
+
+    internal design notes §3.5. ``all`` → every agent
+    of the room (``agent_ids`` is empty); ``selected`` → only ``agent_ids``
+    (empty means nobody).
+    """
+
+    mode: Literal["all", "selected"] = "all"
+    agent_ids: list[UUID] = Field(default_factory=list)
+
+
+class McpAgentScopeIn(BaseModel):
+    mode: Literal["all", "selected"]
+    agent_ids: list[UUID] = Field(default_factory=list, max_length=200)
+
+
 __all__ = [
+    "McpAgentScopeIn",
+    "McpAgentScopeOut",
     "McpConnectionStatusOut",
     "McpRoomBindingOut",
     "McpSafeErrorOut",

@@ -76,7 +76,7 @@ class TestRemoveRefusals:
     async def test_master_key_without_coordinator_does_not_block(self):
         """has_coordinator=False: a stale master id in the config is not a ChatMaster."""
         agent = _agent()
-        db = _db(agent, [_result(), _result(), _result(), _result()])
+        db = _db(agent, [_result(), _result(), _result(), _result(), _result()])
         with patch.object(rm, "agent_in_room", AsyncMock(return_value=True)), \
              patch.object(rm, "active_tasks_of_agent", AsyncMock(return_value=[])):
             await rm.remove_agent_from_room(
@@ -134,6 +134,7 @@ class TestRemoveSuccess:
             _result(all_rows=[dialogue]),   # open direct dialogues
             _result(rowcount=2),            # unassign unstarted plan steps
             _result(),                      # delete AgentMemory
+            _result(),                      # delete RoomMcpScopeAgent
             _result(),                      # delete RoomAgentLink
         ])
         order: list[str] = []
@@ -159,7 +160,8 @@ class TestRemoveSuccess:
         statements = [str(c.args[0]) for c in db.execute.await_args_list]
         assert "UPDATE goal_plan_step" in statements[1]
         assert statements[2].startswith("DELETE FROM agentmemory")
-        assert statements[3].startswith("DELETE FROM roomagentlink")
+        assert statements[3].startswith("DELETE FROM room_mcp_scope_agent")
+        assert statements[4].startswith("DELETE FROM roomagentlink")
 
 
 class TestAdd:

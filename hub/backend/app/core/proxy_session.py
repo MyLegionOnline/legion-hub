@@ -177,8 +177,10 @@ _QA_SOFT_LIMIT = int(os.getenv("PROXY_QA_SOFT_LIMIT", "6"))
 # Turns left before the cap at which the agent is told to wrap up and close.
 _TURN_WARNING_MARGIN = 2
 # A task may use many short LLM/tool turns, but it may not keep a worker alive
-# indefinitely.  The watchdog remains a second, durable safety net.
-_PROXY_MAX_DURATION_SECONDS = float(os.getenv("PROXY_MAX_DURATION_SECONDS", "2400"))
+# indefinitely.  150 min: a run that must first read a dozen documents still
+# has time to write; a shorter cap restarted it and re-paid the reading.
+# The watchdog remains a second, durable safety net.
+_PROXY_MAX_DURATION_SECONDS = float(os.getenv("PROXY_MAX_DURATION_SECONDS", "9000"))
 _MCP_FAILURE_CIRCUIT_LIMIT = int(os.getenv("MCP_FAILURE_CIRCUIT_LIMIT", "2"))
 # Calls that never spend the tool-call budget: closing the session, and
 # ``bash_wait`` (blocks on a background process; its time is credited back to
@@ -1157,7 +1159,7 @@ _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 529})
 # internal design notes Stage 0.1: a ceiling on ONE model request.  The
 # clients' ``timeout=120`` is a per-read timeout, and OpenRouter keeps a
 # non-streamed request alive with whitespace, so a request the upstream never
-# answers used to hang until PROXY_MAX_DURATION_SECONDS (40 min).  Generous on
+# answers used to hang until PROXY_MAX_DURATION_SECONDS (then 40 min).  Generous on
 # purpose: high-effort reasoning legitimately runs for minutes.
 _LLM_ATTEMPT_TIMEOUT_S = float(os.getenv("LLM_ATTEMPT_TIMEOUT_S", "600"))
 
@@ -4456,30 +4458,27 @@ async def _run_proxy_loop(
     _ws_available = await workspace_tools_available(room_id, db)
 
     # MCP tools are dynamic: discover only servers explicitly attached to this
-    # room and owned by the agent's user. HTTP links use the verified snapshot
-    # preflight; a stale snapshot gets at most one bounded probe.
-    _mcp_ant_tools: list[dict[str, Any]] = []
-    _mcp_oai_tools: list[dict[str, Any]] = []
-    _mcp_bindings: dict[str, Any] = {}
-    _mcp_failures: list[Any] = []
+    # room, owned by the agent's user and in each side's own agent scope
+    # (internal design notes §3.2): the executor and
+    # ChatMaster get separate sets, so a server selected only for the executor
+    # never reaches ChatMaster's tools and vice versa. HTTP links use the
+    # verified snapshot preflight; a stale snapshot gets at most one bounded probe.
     _mcp_user_id = _agent_row.owner_id if _agent_row else None
-    if _mcp_user_id:
+
+    async def _discover_mcp(scope_agent_id: UUID | None) -> tuple[list, list, dict, list]:
+        if not _mcp_user_id:
+            return [], [], {}, []
         try:
             from app.core.mcp_gateway import room_mcp_capabilities
 
-            (
-                _mcp_ant_tools,
-                _mcp_oai_tools,
-                _mcp_bindings,
-                _mcp_failures,
-            ) = await room_mcp_capabilities(
-                room_id, _mcp_user_id, db
+            return await room_mcp_capabilities(
+                room_id, _mcp_user_id, db, agent_id=scope_agent_id
             )
         except Exception:
             logger.warning("MCP room tool discovery failed for room %s", room_id, exc_info=True)
             from app.core.mcp_gateway import McpCapabilityFailure
 
-            _mcp_failures = [
+            return [], [], {}, [
                 McpCapabilityFailure(
                     installed_item_id=UUID(int=0),
                     display_name="MCP capability",
@@ -4489,10 +4488,20 @@ async def _run_proxy_loop(
                 )
             ]
 
+    _mcp_ant_tools, _mcp_oai_tools, _mcp_bindings, _mcp_failures = await _discover_mcp(
+        agent_session.agent_id
+    )
+    if cm_session.agent_id == agent_session.agent_id:
+        _cm_mcp_base = (_mcp_ant_tools, _mcp_oai_tools, _mcp_bindings, _mcp_failures)
+    else:
+        _cm_mcp_base = await _discover_mcp(cm_session.agent_id)
+
+    from app.core.mcp_gateway import format_mcp_failure_note, task_requires_mcp_capability
+
+    # Only the executor's own failures can block the task: a server outside
+    # its scope is not its capability, broken or not.
     _mcp_failure_note = ""
     if _mcp_failures:
-        from app.core.mcp_gateway import format_mcp_failure_note, task_requires_mcp_capability
-
         _mcp_failure_note = format_mcp_failure_note(_mcp_failures)
         if task_requires_mcp_capability(
             f"{task.title}\n{task.description}",
@@ -4509,7 +4518,8 @@ async def _run_proxy_loop(
             )
             return True
         agent_sys = f"{agent_sys}\n\n{_mcp_failure_note}"
-        cm_sys = f"{cm_sys}\n\n{_mcp_failure_note}"
+    if _cm_mcp_base[3]:
+        cm_sys = f"{cm_sys}\n\n{format_mcp_failure_note(_cm_mcp_base[3])}"
 
     from app.core.vision_dispatch import (
         agent_can_see_images,
@@ -4518,13 +4528,13 @@ async def _run_proxy_loop(
     )
 
     # Each side gets the mcp-vision tools its own vision override can run;
-    # the shared room list is not mutated. Without an owner the BYOK key
-    # cannot be resolved, so nothing is added.
+    # neither side's list is mutated. Without an owner the BYOK key cannot be
+    # resolved, so nothing is added.
     _agent_mcp_ant, _agent_mcp_oai, _agent_mcp_bindings = with_vision_override_tools(
         agent_llm_config if _mcp_user_id else None, _mcp_ant_tools, _mcp_oai_tools, _mcp_bindings
     )
     _cm_mcp_ant, _cm_mcp_oai, _cm_mcp_bindings = with_vision_override_tools(
-        cm_llm_config if _mcp_user_id else None, _mcp_ant_tools, _mcp_oai_tools, _mcp_bindings
+        cm_llm_config if _mcp_user_id else None, _cm_mcp_base[0], _cm_mcp_base[1], _cm_mcp_base[2]
     )
 
     if not await agent_can_see_images(agent_llm_config, _agent_mcp_bindings):
@@ -5334,18 +5344,38 @@ async def _run_proxy_loop(
                 # The agent is mid-task and waiting for an answer that will now
                 # never arrive. Breaking out here would leave its session open
                 # and the task IN_PROGRESS with no coroutine behind it.
+                # Classified like the agent side so the chat card can name the
+                # cause and auto-retry only takes transient provider failures.
+                failure_reason, safe_error, http_status = _classify_llm_failure(exc)
+                retry_after = (
+                    retry_after_seconds(exc.response.headers.get("Retry-After"))
+                    if http_status == 429 else None
+                )
+                retryable_failure = (
+                    http_status is not None
+                    or failure_reason == "timeout"
+                    or isinstance(exc, (httpx.TransportError, APIConnectionError))
+                )
                 await _block_proxy_for_runtime_failure(
                     agent_session,
                     cm_session,
                     task,
                     db,
                     reason="cm_answer_failed",
+                    retry_after=retry_after,
+                    allow_auto_retry=retryable_failure,
                     content=(
                         f"Task '{task.title}' stopped: ChatMaster could not "
                         "answer the agent (LLM error). Press Retry to "
                         "restart it."
                     ),
-                    metadata={"capability_error_code": "cm_answer_failed"},
+                    metadata={
+                        "capability_error_code": "cm_answer_failed",
+                        "task_title": task.title,
+                        "safe_error": safe_error,
+                        "http_status": http_status,
+                        "cm_failure": failure_reason,
+                    },
                 )
                 return True
             # Agent already finished but CM failed — move task to WAITING_REVIEW

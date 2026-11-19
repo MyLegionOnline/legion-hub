@@ -161,6 +161,80 @@ async def install_market_mcp_for_user(
     return item
 
 
+def _user_room_ids_query(user_id: UUID):
+    from sqlalchemy import union
+
+    from app.models.room import Room, RoomUserLink
+
+    return union(
+        select(Room.id).where(Room.creator_id == user_id),
+        select(RoomUserLink.room_id).where(RoomUserLink.user_id == user_id),
+    )
+
+
+async def attach_mcp_to_user_rooms(installed_item_id: UUID, user_id: UUID, db: AsyncSession) -> None:
+    """Give one MCP a ``room_mcp_server`` row in every room of the user.
+
+    internal design notes §3.0: a default MCP is an
+    ordinary room assignment the Hub makes on the user's behalf. Adds to the
+    session without committing; existing rows are left alone.
+    """
+    from app.models.market import RoomMcpServer
+
+    room_ids = set((await db.execute(_user_room_ids_query(user_id))).scalars().all())
+    if not room_ids:
+        return
+    existing = set(
+        (
+            await db.execute(
+                select(RoomMcpServer.room_id).where(
+                    RoomMcpServer.user_installed_item_id == installed_item_id,
+                    RoomMcpServer.room_id.in_(room_ids),
+                )
+            )
+        ).scalars().all()
+    )
+    for room_id in room_ids - existing:
+        db.add(RoomMcpServer(room_id=room_id, user_installed_item_id=installed_item_id, added_by=user_id))
+
+
+async def attach_default_mcps_to_room(room_id: UUID, user_id: UUID, db: AsyncSession) -> None:
+    """Assign the user's default Market MCPs to a newly created room.
+
+    "Default" = an active MCP install whose Market item is in the user's
+    ``user_default_provision`` ledger (matched by id or slug, like
+    ``_provisioned``). Adds to the session without committing.
+    """
+    from sqlalchemy import and_
+
+    from app.models.market import RoomMcpServer
+
+    item_ids = (
+        await db.execute(
+            select(UserInstalledItem.id)
+            .join(
+                UserDefaultProvision,
+                and_(
+                    UserDefaultProvision.user_id == UserInstalledItem.user_id,
+                    or_(
+                        UserDefaultProvision.market_item_id == UserInstalledItem.market_item_id,
+                        UserDefaultProvision.market_slug == UserInstalledItem.market_slug,
+                    ),
+                ),
+            )
+            .where(
+                UserInstalledItem.user_id == user_id,
+                UserInstalledItem.type == "mcp",
+                UserInstalledItem.status == "active",
+            )
+            .distinct()
+        )
+    ).scalars().all()
+    for item_id in item_ids:
+        if await db.get(RoomMcpServer, (room_id, item_id)) is None:
+            db.add(RoomMcpServer(room_id=room_id, user_installed_item_id=item_id, added_by=user_id))
+
+
 async def reconcile_default_mcps(user_id: UUID, db: AsyncSession) -> None:
     """Provision default Market MCPs once per user.
 
@@ -195,7 +269,7 @@ async def reconcile_default_mcps(user_id: UUID, db: AsyncSession) -> None:
             continue
 
         try:
-            await install_market_mcp_for_user(user_id, item, db)
+            installed = await install_market_mcp_for_user(user_id, item, db)
         except Exception:
             await db.rollback()
             logger.exception(
@@ -206,6 +280,10 @@ async def reconcile_default_mcps(user_id: UUID, db: AsyncSession) -> None:
 
         try:
             db.add(UserDefaultProvision(user_id=user_id, market_item_id=item_id, market_slug=slug))
+            # §3.0: the first install is the only moment a default reaches every
+            # room; a later reconcile skips it via the ledger, so a server the
+            # user disabled in one room stays disabled there.
+            await attach_mcp_to_user_rooms(installed.id, user_id, db)
             await db.commit()
         except Exception:
             await db.rollback()

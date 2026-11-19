@@ -123,7 +123,7 @@ async def test_host_failure_stays_hidden_from_room_tools(monkeypatch):
         return {"tools": [{"name": "search"}]}
 
     monkeypatch.setattr("app.core.mcp_gateway._gateway_get", gateway_get)
-    ant, oai, bindings = await room_mcp_tools(room_id, runtime.owner_id, db)
+    ant, oai, bindings = await room_mcp_tools(room_id, runtime.owner_id, db, agent_id=None)
 
     assert ant == []
     assert oai == []
@@ -153,7 +153,7 @@ async def test_runner_failure_marks_verified_runtime_unavailable(monkeypatch):
         raise RuntimeError("runner down")
 
     monkeypatch.setattr("app.core.mcp_gateway._gateway_get", gateway_get)
-    assert await room_mcp_tools(uuid4(), runtime.owner_id, db) == ([], [], {})
+    assert await room_mcp_tools(uuid4(), runtime.owner_id, db, agent_id=None) == ([], [], {})
     assert runtime.actual_status == "error"
     assert runtime.last_error_code == "runner_unavailable"
 
@@ -182,7 +182,7 @@ async def test_unauthorized_room_cannot_discover_personal_mcp(monkeypatch):
         return {"tools": []}
 
     monkeypatch.setattr("app.core.mcp_gateway._gateway_get", gateway_get)
-    result = await room_mcp_tools(uuid4(), runtime.owner_id, db)
+    result = await room_mcp_tools(uuid4(), runtime.owner_id, db, agent_id=None)
 
     assert result == ([], [], {})
     assert called is False

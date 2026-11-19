@@ -643,7 +643,7 @@ class TestChargingDB:
         monkeypatch.setattr("app.core.mcp_gateway.emit_event", AsyncMock())
 
         with patch("app.core.mcp_gateway.record_mcp_credits_denied") as mock_denied:
-            ant, oai, bindings = await room_mcp_tools(room_id, user_id, db_session)
+            ant, oai, bindings = await room_mcp_tools(room_id, user_id, db_session, agent_id=None)
 
         assert ant == []
         assert oai == []

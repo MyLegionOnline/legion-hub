@@ -89,6 +89,7 @@ HANDLED_TABLES: dict[str, tuple[str, str]] = {
     "roomuserlink": (ERASE, "membership; go with the room"),
     "message": (ERASE, "dialogue; goes with the room"),
     "room_mcp_server": (ERASE, "MCPs attached to a room"),
+    "room_mcp_scope": (ERASE, "which agents get a room MCP; goes with the room and the item (FK cascade), updated_by is SET NULL"),
     "room_variable": (ERASE, "room variables; go with the room"),
     "room_environment_unlock": (ERASE, "go with the room"),
     "promotion": (ERASE, "go with the room"),

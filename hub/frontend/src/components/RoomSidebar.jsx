@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Edit2, Brain, Save, X, RefreshCw, Zap, Cpu, ChevronDown, ChevronUp, Server, Check, Loader, Play, LogIn, UserPlus, UserMinus } from 'lucide-react';
+import { Edit2, Brain, Save, X, RefreshCw, Zap, Cpu, ChevronDown, ChevronUp, Loader, UserPlus, UserMinus } from 'lucide-react';
 import { ConfirmDialog } from './ConfirmDialog';
 import { ModalPortal } from './shared';
 import { notifyRoomAgentsChanged, onRoomAgentsChanged } from '../lib/roomAgents';
@@ -7,16 +7,9 @@ import { TaskPanel } from './TaskPanel';
 import { RepoPanel } from './RepoPanel';
 import { GoalsPanel } from './GoalsPanel';
 import { GitPanel } from './GitPanel';
+import { RoomMcpPanel } from './RoomMcpPanel';
 import { describeStatus, useTicker, BUSY_KINDS } from '../hooks/useAgentStatuses';
 import { AgentAvatarSlot } from '../lib/AgentAvatar';
-import {
-  checkingMcpStatus,
-  errorMcpStatus,
-  isVerifiedMcpStatus,
-  mcpStatusView,
-  startMcpOAuthPopup,
-  verifyMcpConnection,
-} from '../api/mcp';
 
 /* ── helpers ── */
 function MemberAvatar({ name, agentId, isMaster, size = 'md' }) {
@@ -183,122 +176,6 @@ function MemberRow({ member, roomId, token, activity, onRemove }) {
       {isAgent && memoryOpen && (
         <AgentMemoryPanel roomId={roomId} agentId={member.id} token={token} />
       )}
-    </div>
-  );
-}
-
-/* ── room-level MCP assignments ── */
-function RoomMcpServersPanel({ roomId, token, user }) {
-  const [items, setItems] = useState([]);
-  const [personalItems, setPersonalItems] = useState([]);
-  const [assignedIds, setAssignedIds] = useState([]);
-  const [busyId, setBusyId] = useState(null);
-  const [error, setError] = useState('');
-  const ownerLabel = user?.full_name || user?.email || 'you';
-
-  useEffect(() => {
-    if (!roomId || !token) return;
-    let cancelled = false;
-    const headers = { Authorization: `Bearer ${token}` };
-    Promise.all([
-      fetch('/api/v1/user-installed-items/', { headers }),
-      fetch(`/api/v1/rooms/${roomId}/mcp-servers`, { headers }),
-      fetch('/api/v1/personal-mcps', { headers }),
-    ]).then(async ([registry, assigned, personal]) => {
-      if (cancelled) return;
-      const [registryRows, assignedRows, personalRows] = await Promise.all([
-        registry.ok ? registry.json() : [],
-        assigned.ok ? assigned.json() : [],
-        personal.ok ? personal.json() : [],
-      ]);
-      setItems(registryRows.filter(item => item.type === 'mcp' && item.status === 'active' && item.origin !== 'personal_stdio'));
-      setPersonalItems(personalRows);
-      setAssignedIds(assignedRows.map(item => item.id));
-    }).catch(() => { if (!cancelled) setError('Could not load MCP servers.'); });
-    return () => { cancelled = true; };
-  }, [roomId, token]);
-
-  const startManaged = async (item) => {
-    setBusyId(item.id); setError('');
-    try {
-      const response = await fetch(`/api/v1/personal-mcps/${item.id}/start`, {
-        method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      });
-      if (!response.ok) throw new Error('MCP failed the check. Run it again from the connections card.');
-      const updated = await response.json();
-      setPersonalItems(current => current.map(row => row.id === item.id ? updated : row));
-    } catch (errorValue) { setError(errorValue.message || 'Could not start the MCP check.'); } finally { setBusyId(null); }
-  };
-
-  const verifyLink = async (item) => {
-    setBusyId(item.id); setError('');
-    setItems(current => current.map(row => row.id === item.id ? { ...row, mcp_status: checkingMcpStatus(item.id, row.mcp_status) } : row));
-    try {
-      const mcpStatus = await verifyMcpConnection(item.id, token);
-      setItems(current => current.map(row => row.id === item.id ? { ...row, mcp_status: mcpStatus } : row));
-    } catch (errorValue) {
-      setItems(current => current.map(row => row.id === item.id ? { ...row, mcp_status: errorMcpStatus(item.id, errorValue.code) } : row));
-    } finally { setBusyId(null); }
-  };
-
-  const loginLink = async (item) => {
-    setBusyId(item.id); setError('');
-    try {
-      await startMcpOAuthPopup(item.id, token);
-      const mcpStatus = await verifyMcpConnection(item.id, token);
-      setItems(current => current.map(row => row.id === item.id ? { ...row, needs_reauth: false, mcp_status: mcpStatus } : row));
-    } catch {
-      setItems(current => current.map(row => row.id === item.id ? { ...row, mcp_status: errorMcpStatus(item.id, 'mcp_oauth_required') } : row));
-    } finally { setBusyId(null); }
-  };
-
-  const toggle = async (item) => {
-    const assigned = assignedIds.includes(item.id);
-    const managed = item.actual_status !== undefined;
-    const link = item.origin === 'link';
-    const verified = link ? isVerifiedMcpStatus(item.mcp_status) : managed && item.actual_status === 'verified';
-    if ((managed || link) && !assigned && !verified) {
-      setError(link ? mcpStatusView(item.mcp_status).description : 'MCP is unavailable to the room until it passes a check. Start and check it.');
-      return;
-    }
-    setBusyId(item.id); setError('');
-    try {
-      const response = managed
-        ? await fetch(assigned ? `/api/v1/personal-mcps/${item.id}/room-bindings/${roomId}` : `/api/v1/personal-mcps/${item.id}/room-bindings`, {
-          method: assigned ? 'DELETE' : 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-          ...(!assigned ? { body: JSON.stringify({ room_id: roomId }) } : {}),
-        })
-        : await fetch(`/api/v1/rooms/${roomId}/mcp-servers/${item.id}`, {
-          method: assigned ? 'DELETE' : 'PUT', headers: { Authorization: `Bearer ${token}` },
-        });
-      if (!response.ok && response.status !== 204) throw new Error();
-      setAssignedIds(current => assigned ? current.filter(id => id !== item.id) : [...current, item.id]);
-    } catch (errorValue) {
-      setError(errorValue.message || 'Could not update the room MCP servers.');
-    } finally { setBusyId(null); }
-  };
-
-  const allItems = [...personalItems, ...items];
-  return (
-    <div className="rounded-2xl p-3 space-y-2" style={{ background: 'var(--bg-card)', border: '1px solid var(--border)' }}>
-      {!allItems.length ? <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>No connected MCP servers. Add them in "My connections".</p> : allItems.map(item => {
-        const selected = assignedIds.includes(item.id);
-        const managed = item.actual_status !== undefined;
-        const link = item.origin === 'link';
-        const verified = link ? isVerifiedMcpStatus(item.mcp_status) : managed ? item.actual_status === 'verified' : true;
-        const unavailable = (managed || link) && !verified;
-        const linkStatus = link ? mcpStatusView(item.mcp_status) : null;
-        const isOAuth = link && item.auth_mode === 'oauth';
-        const needsReauth = isOAuth && item.needs_reauth;
-        const needsLogin = isOAuth && !needsReauth && linkStatus?.key === 'mcp_oauth_required';
-        const showLogin = needsReauth || needsLogin;
-        return <div key={item.id} className="rounded-lg px-2 py-1.5" style={{ background: selected ? 'var(--accent-dim)' : 'transparent', opacity: busyId === item.id ? 0.55 : 1 }}>
-          <div className="flex items-center justify-between gap-2"><span className="flex items-center gap-1.5 min-w-0 text-xs" style={{ color: selected ? 'var(--accent-light)' : 'var(--text-secondary)' }}><Server size={12} /><span className="truncate">{item.name}</span></span>{selected && <Check size={13} style={{ color: 'var(--accent-light)' }} />}</div>
-          {isOAuth && <p className="text-[10px] truncate" style={{ color: 'var(--text-muted)' }}>Acting on behalf of: {ownerLabel}</p>}
-          <div className="flex items-center justify-between gap-2 mt-1"><span className="text-[10px] truncate" style={{ color: unavailable ? '#fbbf24' : 'var(--text-muted)' }}>{needsReauth ? 'Sign-in required again' : selected ? (unavailable ? `Linked, but unavailable: ${link ? linkStatus.label : 'check needed'}` : 'Available to agents') : unavailable ? (link ? linkStatus.label : 'Unavailable until checked') : 'Not assigned'}</span>{(!unavailable || selected) && <button type="button" disabled={busyId === item.id} onClick={() => toggle(item)} className="text-[10px] px-2 py-1 rounded" style={{ background: selected ? 'var(--bg-hover)' : 'var(--accent-dim)', color: selected ? 'var(--text-secondary)' : 'var(--accent-light)' }}>{busyId === item.id ? <Loader size={11} className="animate-spin" /> : selected ? 'Disable' : 'Assign'}</button>}{unavailable && link && showLogin && <button type="button" disabled={busyId === item.id} onClick={() => loginLink(item)} className="flex items-center gap-1 text-[10px] px-2 py-1 rounded" style={{ background: 'rgba(251,191,36,0.12)', color: '#fbbf24' }}>{busyId === item.id ? <Loader size={11} className="animate-spin" /> : <LogIn size={10} />}{needsReauth ? 'Re-authorize' : 'Sign in'}</button>}{unavailable && link && !showLogin && <button type="button" disabled={busyId === item.id} onClick={() => verifyLink(item)} className="flex items-center gap-1 text-[10px] px-2 py-1 rounded" style={{ background: 'rgba(251,191,36,0.12)', color: '#fbbf24' }}>{busyId === item.id ? <Loader size={11} className="animate-spin" /> : <RefreshCw size={10} />}Check again</button>}{unavailable && !link && !selected && <button type="button" disabled={busyId === item.id} onClick={() => startManaged(item)} className="flex items-center gap-1 text-[10px] px-2 py-1 rounded" style={{ background: 'rgba(251,191,36,0.12)', color: '#fbbf24' }}>{busyId === item.id ? <Loader size={11} className="animate-spin" /> : <Play size={10} />}Check</button>}</div>
-        </div>;
-      })}
-      {error && <p className="text-[11px]" style={{ color: '#f87171' }}>{error}</p>}
     </div>
   );
 }
@@ -791,7 +668,7 @@ export function RoomSidebar({ room, token, user, taskRefreshKey = 0, goalRefresh
         {realRoomId && (
           <section>
             {sectionTitle('MCP servers')}
-            <RoomMcpServersPanel roomId={realRoomId} token={token} user={user} />
+            <RoomMcpPanel roomId={realRoomId} token={token} user={user} roomAgents={roomAgents} />
           </section>
         )}
 

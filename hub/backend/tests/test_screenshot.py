@@ -86,6 +86,32 @@ def test_gateway_host_rule_maps_preview_domain_to_gateway(monkeypatch):
     assert not any(arg.startswith("--host-resolver-rules") for arg in screenshot._launch_args())
 
 
+def test_https_preview_is_not_mapped_onto_a_plain_http_gateway(monkeypatch):
+    # Prod: https previews behind nginx, gateway default http://backend:8000.
+    # Mapping would send TLS to a plain-HTTP port (ERR_SSL_PROTOCOL_ERROR).
+    monkeypatch.setenv("WORKSPACE_PREVIEW_DOMAIN", "mylegion.online")
+    monkeypatch.setenv("WORKSPACE_PREVIEW_SCHEME", "https")
+    monkeypatch.setenv("WORKSPACE_SCREENSHOT_GATEWAY_URL", "http://backend:8000")
+    assert screenshot._screenshot_gateway_url() is None
+    assert screenshot._gateway_host_rule() is None
+    assert not any(arg.startswith("--host-resolver-rules") for arg in screenshot._launch_args())
+
+    monkeypatch.setenv("WORKSPACE_SCREENSHOT_GATEWAY_URL", "https://proxy:443")
+    assert screenshot._gateway_host_rule() == "--host-resolver-rules=MAP *.mylegion.online proxy:443"
+
+
+def test_load_failure_message_names_the_browser_error():
+    exc = Exception("Page.goto: net::ERR_SSL_PROTOCOL_ERROR at https://svc-x.mylegion.online/")
+    assert screenshot._browser_error_code(exc) == "net::ERR_SSL_PROTOCOL_ERROR"
+    message = screenshot._load_failure_message(exc)
+    assert "net::ERR_SSL_PROTOCOL_ERROR" in message
+    assert "Hub-side" in message
+
+    timeout = Exception("Page.goto: Timeout 30000ms exceeded.")
+    assert screenshot._browser_error_code(timeout) == "timeout"
+    assert "timed out" in screenshot._load_failure_message(timeout)
+
+
 def test_screenshot_url_path_is_not_canonicalized_as_a_workspace_file():
     assert canonicalize_tool_input(
         "screenshot", {"service_slug": "catalog-web", "path": "/dashboard?tab=errors"}

@@ -87,6 +87,12 @@ class EditFileTool(Tool):
                 "Call read_file first — this ensures you are editing the current content."
             )
 
+        if ctx.task_id:
+            # Read and commit on this task's own branch even if a gate merge
+            # moved the shared checkout elsewhere meanwhile.
+            from app.core.room_git_flow import pin_task_head
+
+            await pin_task_head(ctx.room_id, ctx.task_id, ctx.db)
         content = await wsd.read_workspace_file(str(ctx.room_id), path)
         if content is None:
             try:

@@ -133,6 +133,84 @@ async def test_session_bound_to_a_task_uses_the_task_branch(monkeypatch):
     ensure_task.assert_awaited_once()
 
 
+@pytest.mark.parametrize(
+    "state, merge_commit",
+    [
+        (TaskState.COMPLETED, "0b72b9c"),
+        (TaskState.COMPLETED, None),
+        (TaskState.CANCELLED, None),
+        (TaskState.CONTINUED, None),
+    ],
+)
+@pytest.mark.asyncio
+async def test_session_bound_to_a_finished_task_opens_its_own_branch(
+    monkeypatch, state, merge_commit
+):
+    """era_of_valera, 11-19: the router attached an @-mention to a task that was
+    already merged, and the edit landed on that dead ``task/<id>`` branch — no
+    task of its own, no Gate 1, nothing in ``dev``. A finished bound task must
+    send the dialogue down its ordinary path instead."""
+    tid = uuid4()
+    task = SimpleNamespace(
+        id=tid, goal_id=None, branch_name=f"task/{tid}", state=state, merge_commit=merge_commit
+    )
+    create, _ = _patch_git(monkeypatch, head=f"task/{tid}")
+    ensure_task = AsyncMock(return_value=f"task/{tid}")
+    monkeypatch.setattr(room_git_flow, "ensure_task_branch", ensure_task)
+
+    session = _session(kind="user_agent_p1", task_id=tid)
+    branch = await session_work.ensure_worktree_branch(session, _FakeDB(scalar_result=task))
+
+    assert branch == f"session/{session.id}"
+    ensure_task.assert_not_awaited()
+    create.assert_awaited_once_with("room-1", f"session/{session.id}", base="dev")
+    assert session.context_snapshot[session_work.SNAPSHOT_WORK_BRANCH] == branch
+
+
+@pytest.mark.asyncio
+async def test_session_pin_skips_a_finished_bound_task(monkeypatch):
+    """The turn-start pin must not re-check out the merged branch either."""
+    tid = uuid4()
+    task = SimpleNamespace(
+        id=tid, goal_id=None, branch_name=f"task/{tid}",
+        state=TaskState.COMPLETED, merge_commit="0b72b9c",
+    )
+    monkeypatch.setattr(room_git_flow, "_working_branch", AsyncMock(return_value="dev"))
+    create, _ = _patch_git(monkeypatch, head=f"task/{tid}")
+    ensure_task = AsyncMock(return_value=f"task/{tid}")
+    monkeypatch.setattr(room_git_flow, "ensure_task_branch", ensure_task)
+    monkeypatch.setattr(room_git_flow, "_live_task_owns_head", AsyncMock(return_value=False))
+
+    session = _session(kind="user_agent_p1", task_id=tid)
+    branch = await room_git_flow.ensure_session_branch("room-1", session, _FakeDB(task))
+
+    assert branch == "dev"
+    ensure_task.assert_not_awaited()
+    create.assert_awaited_once_with("room-1", "dev")
+
+
+class _GoalDB(_FakeDB):
+    def __init__(self, goal):
+        super().__init__()
+        self._goal = goal
+
+    async def get(self, _model, _id):
+        return self._goal
+
+
+@pytest.mark.parametrize(
+    "status, kept", [("active", True), ("completed", False), ("cancelled", False)]
+)
+@pytest.mark.asyncio
+async def test_dialogue_task_does_not_join_a_closed_goal(status, kept):
+    """A task recorded into a finished goal would merge into a goal branch that
+    is already folded into ``dev`` — the same dead end one level up."""
+    gid = uuid4()
+    db = _GoalDB(SimpleNamespace(id=gid, status=status))
+    got = await session_work._open_goal_id(_session(goal_id=gid), db)
+    assert got == (gid if kept else None)
+
+
 @pytest.mark.asyncio
 async def test_unfinished_dialogue_task_is_continued(monkeypatch):
     """A task this dialogue already opened (red checks, or waiting for review)

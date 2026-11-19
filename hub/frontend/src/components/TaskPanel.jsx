@@ -59,6 +59,7 @@ export const INTERRUPTION_REASON_LABELS = {
   repeated_tool_error: 'Repeated tool error',
   provider_error: 'Model provider error',
   timeout: 'Model provider timed out',
+  cm_answer_failed: 'ChatMaster could not answer',
 };
 
 /** Human title for an interruption reason; falls back to the tool_calls default. */
@@ -84,6 +85,9 @@ export function describeInterruption(meta) {
   // the detail. The chat card renders its own sentence for them.
   if (reason === 'timeout') return 'no answer within the time limit';
   if (reason === 'provider_error') return safe_error || 'the provider returned an error';
+  if (reason === 'cm_answer_failed') {
+    return `was left without an answer from ChatMaster${safe_error ? ` (${safe_error})` : ''}`;
+  }
   if (reason === 'repeated_tool_error') {
     if (!trigger_tool) return 'repeated the same tool error';
     const repeats = repeat_count ? ` (${repeat_count}× in a row)` : '';

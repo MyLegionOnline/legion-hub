@@ -24,6 +24,14 @@ def _room_input():
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_default_mcps(monkeypatch):
+    """Room creation also attaches default MCPs (room_mcp_agent_scope_plan §3.0); not under test here."""
+    from app.core import skill_defaults
+
+    monkeypatch.setattr(skill_defaults, "attach_default_mcps_to_room", AsyncMock())
+
+
 def _db():
     db = AsyncMock()
     db.add = MagicMock()

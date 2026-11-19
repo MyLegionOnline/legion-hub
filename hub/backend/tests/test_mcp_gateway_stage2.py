@@ -263,7 +263,7 @@ async def test_discovery_resolves_secret_once_and_sends_only_gateway_header(monk
         patch("app.core.mcp_gateway._gateway_post", post),
         patch("app.core.mcp_gateway._gateway_get", new_callable=AsyncMock) as legacy_get,
     ):
-        ant, oai, bindings = await room_mcp_tools(uuid4(), owner_id, _RoomDb(item))
+        ant, oai, bindings = await room_mcp_tools(uuid4(), owner_id, _RoomDb(item), agent_id=None)
 
     assert [tool["name"] for tool in ant] == ["mcp__GitHub_read-only__get_commit"]
     assert oai[0]["function"]["name"] == ant[0]["name"]

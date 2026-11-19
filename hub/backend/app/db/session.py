@@ -1304,6 +1304,37 @@ END $$""",
     # ── internal design notes stage 13: erasing a user's data ─────────────────────
     # user_erasure itself comes from create_all.
     'ALTER TABLE "user" ADD COLUMN IF NOT EXISTS erased_at TIMESTAMPTZ',
+    # ── internal design notes §3.0: a default MCP is a ──
+    # room_mcp_server row in every room, not a ledger lookup. Before this,
+    # room_mcp_tools also accepted any MCP whose Market item was in
+    # user_default_provision, so such a server reached agents in every room
+    # and "Disable" in the sidebar did nothing. This backfill gives each such
+    # pair its row, which keeps today's behaviour for everyone. It must run
+    # exactly ONCE: on a later startup a missing row means the user disabled
+    # the server in that room. hub_data_migration records that it ran.
+    """CREATE TABLE IF NOT EXISTS hub_data_migration (
+        name VARCHAR(128) PRIMARY KEY,
+        applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )""",
+    """DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM hub_data_migration WHERE name = 'room_mcp_default_rows_v1') THEN
+        INSERT INTO room_mcp_server (room_id, user_installed_item_id, added_by, created_at)
+        SELECT DISTINCT r.room_id, i.id, i.user_id, now()
+        FROM user_installed_item i
+        JOIN user_default_provision p
+          ON p.user_id = i.user_id
+         AND (p.market_item_id = i.market_item_id OR p.market_slug = i.market_slug)
+        JOIN (
+            SELECT id AS room_id, creator_id AS user_id FROM room
+            UNION
+            SELECT room_id, user_id FROM roomuserlink
+        ) r ON r.user_id = i.user_id
+        WHERE i.type = 'mcp' AND i.status = 'active'
+        ON CONFLICT DO NOTHING;
+        INSERT INTO hub_data_migration (name) VALUES ('room_mcp_default_rows_v1');
+    END IF;
+END $$""",
 ]
 
 

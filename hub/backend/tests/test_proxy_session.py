@@ -1121,6 +1121,43 @@ class TestAgentLlmFailureIsPersisted:
         assert "SECRET123" not in str(meta)
 
     @pytest.mark.asyncio
+    async def test_chat_master_failure_mid_question_is_classified(self):
+        """The agent asks a question and ChatMaster's own LLM call fails: the
+        stall keeps reason cm_answer_failed but carries the provider status,
+        so a bad key is not auto-retried and the card can name the cause."""
+        import httpx
+
+        request = httpx.Request("POST", "https://llm.example.com/v1/messages?key=SECRET123")
+        exc = httpx.HTTPStatusError(
+            "boom", request=request, response=httpx.Response(401, request=request)
+        )
+        block = await self._run([
+            ("Which database should I use?", None, 100, 80, "claude-haiku-4-5-20251001", 100, 100),
+            exc,
+        ])
+
+        block.assert_awaited_once()
+        kwargs = block.await_args.kwargs
+        assert kwargs["reason"] == "cm_answer_failed"
+        assert kwargs["allow_auto_retry"] is True
+        meta = kwargs["metadata"]
+        assert meta["http_status"] == 401
+        assert meta["safe_error"] == "HTTP 401 Unauthorized"
+        assert meta["task_title"]
+        assert "SECRET123" not in str(meta)
+
+    @pytest.mark.asyncio
+    async def test_chat_master_local_failure_is_not_auto_retried(self):
+        block = await self._run([
+            ("Which database should I use?", None, 100, 80, "claude-haiku-4-5-20251001", 100, 100),
+            ValueError("malformed model response"),
+        ])
+
+        kwargs = block.await_args.kwargs
+        assert kwargs["reason"] == "cm_answer_failed"
+        assert kwargs["allow_auto_retry"] is False
+
+    @pytest.mark.asyncio
     async def test_attempt_timeout_becomes_timeout(self):
         from app.core.proxy_session import LLMAttemptTimeout
 

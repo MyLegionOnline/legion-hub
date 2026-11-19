@@ -184,10 +184,14 @@ async def test_reconcile_default_mcps_installs_item_and_records_ledger(monkeypat
     db.add = MagicMock()
     install = AsyncMock()
     monkeypatch.setattr(skill_defaults, "install_market_mcp_for_user", install)
+    attach = AsyncMock()
+    monkeypatch.setattr(skill_defaults, "attach_mcp_to_user_rooms", attach)
 
     await skill_defaults.reconcile_default_mcps(user_id, db)
 
     install.assert_awaited_once_with(user_id, item, db)
+    # room_mcp_agent_scope_plan §3.0: the first install reaches every room.
+    attach.assert_awaited_once_with(install.return_value.id, user_id, db)
     ledger_rows = [call.args[0] for call in db.add.call_args_list]
     assert len(ledger_rows) == 1
     assert isinstance(ledger_rows[0], UserDefaultProvision)

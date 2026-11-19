@@ -15,7 +15,7 @@ from .agent_session import AgentSession
 from .user_quota import UserQuota, DEFAULT_PLAN_TIER
 from .plan import Plan
 from .skill import Skill, SkillFile
-from .market import UserInstalledItem, RoomMcpServer, AgentSkill, UserDefaultProvision
+from .market import UserInstalledItem, RoomMcpServer, RoomMcpScope, RoomMcpScopeAgent, AgentSkill, UserDefaultProvision
 from .goal import RoomGoal, GoalStatus
 from .room_variable import RoomVariable  # noqa: F401 — internal design notes Stage 0
 from .provider_connection import ProviderConnection  # noqa: F401 — Settings → Providers, per account
@@ -101,7 +101,7 @@ __all__ = [
     "UserQuota", "DEFAULT_PLAN_TIER",
     "Plan",
     "Skill", "SkillFile",
-    "UserInstalledItem", "RoomMcpServer", "AgentSkill", "UserDefaultProvision",
+    "UserInstalledItem", "RoomMcpServer", "RoomMcpScope", "RoomMcpScopeAgent", "AgentSkill", "UserDefaultProvision",
     "RoomGoal", "GoalStatus",
     "RoomVariable",
     "RoomEnvironmentConfig", "RoomEnvironmentUnlock",

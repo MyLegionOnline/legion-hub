@@ -149,7 +149,7 @@ async def test_stage6_smoke_create_bind_verify_room_and_call(monkeypatch):
         verified = await mcp_discovery.verify_mcp_connection(db, item, force=True)
 
     room_db = _RoomDb(item, db.snapshot)
-    ant, _oai, bindings = await room_mcp_tools(uuid4(), item.user_id, room_db)
+    ant, _oai, bindings = await room_mcp_tools(uuid4(), item.user_id, room_db, agent_id=None)
     assert verified.available is True
     assert [tool["name"] for tool in ant] == ["mcp__GitHub_read-only__get_commit"]
 

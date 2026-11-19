@@ -76,6 +76,12 @@ class WriteFileTool(Tool):
             refusal = await room_storage_refusal(ctx.room_id, ctx.db)
             if refusal is not None:
                 return f"Error: {refusal}"
+        if ctx.task_id:
+            # A gate merge may have moved the shared checkout off this task's
+            # branch; the commit below must land on task/<id> regardless.
+            from app.core.room_git_flow import pin_task_head
+
+            await pin_task_head(ctx.room_id, ctx.task_id, ctx.db)
         task_ref = f" (task/{ctx.task_id})" if ctx.task_id else ""
         commit_msg = f"session:{ctx.session_id}: write {boundary_path}{task_ref}"
         try:

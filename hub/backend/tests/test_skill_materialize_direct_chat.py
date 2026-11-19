@@ -119,7 +119,7 @@ async def test_process_user_turn_equips_chat_master_sessions_like_agent_ones():
 
     db.get.assert_any_await(Agent, session.chat_master_agent_id)
     mock_materialize.assert_awaited_once_with(session.room_id, cm_row, db)
-    mock_discover.assert_awaited_once_with(session.room_id, cm_row.owner_id, db)
+    mock_discover.assert_awaited_once_with(session.room_id, cm_row.owner_id, db, agent_id=session.chat_master_agent_id)
 
 
 @pytest.mark.asyncio

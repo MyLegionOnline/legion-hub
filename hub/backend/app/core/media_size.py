@@ -281,6 +281,19 @@ def _get_chat_vision_lock() -> asyncio.Lock:
     return _chat_vision_lock
 
 
+def cached_chat_model_supports_image_input(base_url: str, model: str) -> bool | None:
+    """The last :func:`chat_model_supports_image_input` answer, if still fresh.
+
+    No fetch and no lock (a plain dict read on the event loop): ``None`` when
+    the model has not been looked up yet, the entry expired, or it was unknown.
+    """
+    cached = _chat_vision_cache.get((str(base_url), str(model)))
+    if cached is None:
+        return None
+    ts, data = cached
+    return data if time.monotonic() - ts < _MEDIA_IMAGE_MODELS_TTL_S else None
+
+
 async def chat_model_supports_image_input(base_url: str, model: str) -> bool | None:
     """True/False per OpenRouter's public model catalog; ``None`` if unknown.
 

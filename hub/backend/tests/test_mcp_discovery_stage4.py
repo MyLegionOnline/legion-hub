@@ -95,7 +95,7 @@ async def test_room_tools_use_fresh_verified_snapshot_without_gateway_call():
     db = _RoomDb(item, _verified_snapshot(item))
 
     with patch("app.core.mcp_gateway._gateway_post", new_callable=AsyncMock) as gateway:
-        ant, oai, bindings = await room_mcp_tools(uuid4(), item.user_id, db)
+        ant, oai, bindings = await room_mcp_tools(uuid4(), item.user_id, db, agent_id=None)
 
     assert [tool["name"] for tool in ant] == ["mcp__GitHub_read-only__get_commit"]
     assert oai[0]["function"]["name"] == ant[0]["name"]

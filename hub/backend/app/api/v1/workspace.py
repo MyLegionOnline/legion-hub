@@ -947,9 +947,12 @@ async def workspace_git_merge_branch(
             status_code=422,
             detail=f"main merges only through a promotion gate",
         )
-    result = await wsd.merge_workspace_branch(
-        str(room_id), body.name, message=body.message, target=target
-    )
+    from app.core.room_git_flow import keep_live_head
+
+    async with keep_live_head(room_id, db, merged_branch=body.name):
+        result = await wsd.merge_workspace_branch(
+            str(room_id), body.name, message=body.message, target=target
+        )
     if result.get("conflict"):
         await emit_event(
             room_id=room_id,

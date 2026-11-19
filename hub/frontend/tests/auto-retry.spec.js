@@ -217,3 +217,41 @@ test('a skipped attempt leaves the manual actions on the card', async ({ page })
   await expect(card.getByTestId('auto-retry-badge')).toHaveCount(0);
   await expect(card.getByRole('button', { name: /Retry$/ })).toBeEnabled();
 });
+
+test('a manual restart settles the card after a reload', async ({ page }) => {
+  await installHarness(page, [
+    interruption(),
+    taskEvent('TASK_RETRIED', 'Task re-queued for retry (attempt 2).'),
+  ]);
+  await page.goto('/');
+  await page.getByRole('button', { name: room.name, exact: true }).click();
+
+  await expect(page.getByTestId('system-event-task_retried')).toBeVisible();
+  await expect(page.getByTestId('provider-error-card').getByRole('button', { name: /Retry$/ })).toHaveCount(0);
+});
+
+test('a newer interruption leaves actions only on the latest card', async ({ page }) => {
+  await installHarness(page, [interruption(), interruption('tool_calls')]);
+  await page.goto('/');
+  await page.getByRole('button', { name: room.name, exact: true }).click();
+
+  await expect(page.getByTestId('provider-error-card').getByRole('button', { name: /Retry$/ })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: /Continue the current session/ })).toBeEnabled();
+});
+
+test('a ChatMaster answer failure gets a Retry card', async ({ page }) => {
+  const task = await installHarness(page, [
+    taskEvent('TASK_STALLED', 'ChatMaster could not answer the agent.', {
+      reason: 'cm_answer_failed', task_title: 'Recover the task', safe_error: 'HTTP 401 Unauthorized', http_status: 401,
+    }),
+  ]);
+  await page.goto('/');
+  await page.getByRole('button', { name: room.name, exact: true }).click();
+
+  const card = page.getByTestId('provider-error-card');
+  await expect(card).toContainText('ChatMaster could not answer');
+  await expect(card).toContainText("Check the provider API key in ChatMaster's settings.");
+  await card.getByRole('button', { name: /Retry$/ }).click();
+  await expect(card).toContainText('Task restarted');
+  expect(task.manualRetries).toBe(1);
+});

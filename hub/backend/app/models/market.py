@@ -110,6 +110,74 @@ class RoomMcpServer(SQLModel, table=True):
     )
 
 
+class RoomMcpScope(SQLModel, table=True):
+    """Which agents of a room get one room MCP server's tools.
+
+    internal design notes §2. No row means ``all``
+    (every agent of the room, the behaviour before scopes existed). ``selected``
+    with no :class:`RoomMcpScopeAgent` rows means nobody — removing the last
+    selected agent from the room must never widen access back to ``all``.
+    Deliberately not keyed off ``room_mcp_server``: unassigning the server
+    removes the scope explicitly (``rooms.unassign_room_mcp_server``).
+    """
+
+    __tablename__ = "room_mcp_scope"
+    __table_args__ = (
+        sa.CheckConstraint("mode IN ('all', 'selected')", name="ck_room_mcp_scope_mode"),
+    )
+
+    room_id: UUID = Field(
+        sa_column=sa.Column(
+            sa.Uuid,
+            sa.ForeignKey("room.id", ondelete="CASCADE"),
+            primary_key=True,
+            nullable=False,
+        )
+    )
+    user_installed_item_id: UUID = Field(
+        sa_column=sa.Column(
+            sa.Uuid,
+            sa.ForeignKey("user_installed_item.id", ondelete="CASCADE"),
+            primary_key=True,
+            nullable=False,
+        )
+    )
+    mode: str = Field(default="all", sa_column=sa.Column(sa.String(16), nullable=False, server_default="all"))
+    updated_by: Optional[UUID] = Field(
+        default=None,
+        sa_column=sa.Column(sa.Uuid, sa.ForeignKey("user.id", ondelete="SET NULL"), nullable=True),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=sa.Column(sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
+    )
+
+
+class RoomMcpScopeAgent(SQLModel, table=True):
+    """One agent selected for a ``selected`` :class:`RoomMcpScope`."""
+
+    __tablename__ = "room_mcp_scope_agent"
+    __table_args__ = (
+        sa.ForeignKeyConstraint(
+            ["room_id", "user_installed_item_id"],
+            ["room_mcp_scope.room_id", "room_mcp_scope.user_installed_item_id"],
+            ondelete="CASCADE",
+            name="fk_room_mcp_scope_agent_scope",
+        ),
+    )
+
+    room_id: UUID = Field(sa_column=sa.Column(sa.Uuid, primary_key=True, nullable=False))
+    user_installed_item_id: UUID = Field(sa_column=sa.Column(sa.Uuid, primary_key=True, nullable=False))
+    agent_id: UUID = Field(
+        sa_column=sa.Column(
+            sa.Uuid,
+            sa.ForeignKey("agent.id", ondelete="CASCADE"),
+            primary_key=True,
+            nullable=False,
+        )
+    )
+
+
 class AgentSkill(SQLModel, table=True):
     """Skills explicitly assigned to an agent."""
 

@@ -52,6 +52,76 @@ SNAPSHOT_WORK_TOUCHED = "work_touched"
 # COMPLETED / CANCELLED close the burst; the next write starts a fresh branch.
 _OPEN_TASK_STATES = frozenset({"in_progress", "waiting_review", "blocked"})
 
+# A task in one of these states is finished: its branch has been merged (or
+# abandoned) and nothing will ever read it again. A ``user_agent_p1`` dialogue
+# the router attached to such a task must not write on that branch — the work
+# would sit there unseen, with no task of its own and no Gate 1.
+_CLOSED_TASK_STATES = frozenset({"completed", "cancelled", "continued", "rejected"})
+_CLOSED_GOAL_STATES = frozenset({"completed", "cancelled"})
+
+
+def _state_value(obj, attr: str = "state") -> str:
+    raw = getattr(obj, attr, None)
+    return str(getattr(raw, "value", raw) or "")
+
+
+def task_accepts_work(task) -> bool:
+    """True while *task*'s branch is still the place its work belongs."""
+    if task is None or getattr(task, "merge_commit", None):
+        return False
+    return _state_value(task) not in _CLOSED_TASK_STATES
+
+
+async def live_bound_task(session, db):
+    """The task a ``user_agent_p1`` dialogue is bound to, while it is still open.
+
+    ``None`` when the session is not bound, the row is gone, or the task is
+    finished — the dialogue then works like any other: its own branch first,
+    a task of its own once there are commits.
+    """
+    task_id = getattr(session, "task_id", None)
+    if task_id is None:
+        return None
+
+    from sqlalchemy.future import select
+
+    from app.models.task import Task
+
+    task = (await db.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
+    if task is None:
+        return None
+    if not task_accepts_work(task):
+        logger.info(
+            "session_work: session %s is bound to finished task %s — "
+            "its writes go to a work branch of its own",
+            getattr(session, "id", None), task_id,
+        )
+        return None
+    return task
+
+
+async def _open_goal_id(session, db):
+    """The session's goal, unless that goal is already closed.
+
+    A task recorded into a finished goal would merge into a goal branch that
+    has already been folded into the working branch — the same dead end as a
+    finished task's branch.
+    """
+    goal_id = getattr(session, "goal_id", None)
+    if goal_id is None:
+        return None
+    try:
+        from app.models.goal import RoomGoal
+
+        goal = await db.get(RoomGoal, goal_id)
+    except Exception:
+        return goal_id
+    if goal is None:
+        return None
+    if _state_value(goal, "status") in _CLOSED_GOAL_STATES:
+        return None
+    return goal_id
+
 # Tools that cannot touch the working tree. Everything *not* listed here pins
 # the branch before it runs — default-deny, so a tool added later lands on the
 # safe side (it gets a branch) instead of silently writing on `dev`. This is
@@ -258,16 +328,11 @@ async def ensure_worktree_branch(session, db, *, user_request: str | None = None
         return None
 
     # A session bound to a task (``user_agent_p1``) already has a branch, and
-    # its work merges through that task's own Gate 1.
-    task_id = getattr(session, "task_id", None)
-    if task_id is not None:
-        from sqlalchemy.future import select
-
-        from app.models.task import Task
-
-        task = (await db.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
-        if task is not None:
-            return await ensure_task_branch(room_id, task, db)
+    # its work merges through that task's own Gate 1 — but only while that task
+    # is still open. A finished one falls through to the dialogue's own branch.
+    task = await live_bound_task(session, db)
+    if task is not None:
+        return await ensure_task_branch(room_id, task, db)
 
     # Work this dialogue already opened a task for and that has not been merged
     # yet: keep building on it rather than opening a second branch for the same
@@ -519,9 +584,10 @@ async def adopt_session_branch_as_task(
 
     request = user_request or recorded_work_request(session)
     agent_id = getattr(session, "agent_id", None)
+    goal_id = await _open_goal_id(session, db)
     task = Task(
         room_id=room_id,
-        goal_id=getattr(session, "goal_id", None),
+        goal_id=goal_id,
         title=derive_task_title(request),
         description=derive_task_description(request, agent_reply),
         state=TaskState.IN_PROGRESS,
@@ -596,7 +662,7 @@ async def adopt_session_branch_as_task(
 
         await plan_dialogue.archive_for_task(
             room_id, task.id, session, db,
-            goal_id=getattr(session, "goal_id", None),
+            goal_id=goal_id,
             task_title=task.title,
         )
     except Exception as exc:  # pragma: no cover - defensive

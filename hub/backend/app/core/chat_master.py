@@ -877,6 +877,20 @@ _PLAN_SCHEMA: Dict[str, Any] = {
 }
 
 
+def _agent_capability_suffix(agent: Any, briefs: list[Any]) -> str:
+    """`` · MCP: a, b · sees images: yes`` for *agent*, or ``""``."""
+    from app.core.vision_dispatch import agent_vision_hint
+
+    own = [b for b in briefs if b.available_to(agent.id)]
+    parts: list[str] = []
+    if briefs:
+        parts.append("MCP: " + (", ".join(b.name for b in own) or "none"))
+    seen = agent_vision_hint(getattr(agent, "llm_config", None), has_vision_server=any(b.vision for b in own))
+    if seen in ("yes", "no"):
+        parts.append(f"sees images: {seen}")
+    return "".join(f" · {p}" for p in parts)
+
+
 async def plan_tasks(
     room: Room,
     user_request: str,
@@ -889,8 +903,24 @@ async def plan_tasks(
     the response is always valid JSON — no manual parsing needed.
     Returns parsed plan dict or None on failure.
     """
+    # internal design notes §4.2 — names of the MCP
+    # servers each agent may use, so an MCP or image task goes to an agent
+    # that can do it. Best effort: planning never fails over this.
+    mcp_briefs: list[Any] = []
+    try:
+        from app.core.mcp_gateway import room_mcp_briefs
+
+        mcp_briefs = await room_mcp_briefs(room.id, db)
+    except Exception:
+        logger.warning("plan_tasks: room MCP summary failed for room %s", room.id, exc_info=True)
+    from app.core.vision_dispatch import vision_catalog_key, warm_vision_catalog
+
+    await warm_vision_catalog(
+        key for a in room_agents if (key := vision_catalog_key(getattr(a, "llm_config", None)))
+    )
     agents_info = "\n".join([
         f"- nickname: {a.nickname}" + (f" — {a.short_description}" if a.short_description else "")
+        + _agent_capability_suffix(a, mcp_briefs)
         for a in room_agents
     ])
     memory = await get_project_memory(room.id, db)
@@ -917,6 +947,7 @@ RULES:
 - SIMPLE QUESTIONS / GREETINGS / STATUS → needs_tasks: false, set reply="your answer", confirmation_message=null, tasks=[].
 - ANYTHING that requires building, writing, designing, or creating → needs_tasks: true, set reply=null, fill confirmation_message and tasks.
 - agent_nickname MUST exactly match one of the nicknames listed above.
+- Assign a task that needs an MCP server only to an agent whose "MCP:" list has it; a task that requires looking at images or screenshots never to an agent with "sees images: no". If no agent has the capability, say so in confirmation_message instead of assigning it. "MCP:" lists only extra servers; built-in tools (bash, files, web_fetch, screenshot of a declared service) are available to every agent.
 - When the task involves files from the repository, include their exact paths in the task description (e.g. "read /files/botinki.md and /files/valentki.md") — the agent will fetch the content itself.
 - If the user's request contains [File: path] blocks, copy them verbatim into the task description.
 - When the task requires writing or updating a file, explicitly state in the task description which file path must be saved (e.g. "save the result to /html/index.html").

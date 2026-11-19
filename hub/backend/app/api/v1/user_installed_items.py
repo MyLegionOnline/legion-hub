@@ -38,7 +38,7 @@ from app.core.mcp_discovery import (
     mcp_connection_status,
     verify_mcp_connection,
 )
-from app.schemas.mcp_connection import McpConnectionStatusOut, McpRoomBindingOut
+from app.schemas.mcp_connection import McpAgentScopeOut, McpConnectionStatusOut, McpRoomBindingOut
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +93,9 @@ class InstalledItemOut(BaseModel):
     tool_prices: dict[str, float] | None = None
     mcp_status: McpConnectionStatusOut | None = None
     room_bindings: list[McpRoomBindingOut] = Field(default_factory=list)
+    # Only on GET /rooms/{id}/mcp-servers: who in that room gets the server
+    # (internal design notes §3.5).
+    agent_scope: McpAgentScopeOut | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -103,6 +106,7 @@ def _as_out(
     *,
     mcp_status: McpConnectionStatusOut | None = None,
     room_bindings: list[McpRoomBindingOut] | None = None,
+    agent_scope: McpAgentScopeOut | None = None,
 ) -> InstalledItemOut:
     """Keep custom_config private: it can contain bearer tokens or API keys."""
     config = item.custom_config or {}
@@ -148,6 +152,7 @@ def _as_out(
         tool_prices=tool_prices,
         mcp_status=mcp_status,
         room_bindings=room_bindings or [],
+        agent_scope=agent_scope,
         created_at=item.created_at,
         updated_at=item.updated_at,
     )

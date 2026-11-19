@@ -19,6 +19,7 @@ import { useGitState } from '../context/GitStateContext';
 // and renders the uploaded avatar, falling back to the initials circle.
 import { AgentAvatarSlot } from '../lib/AgentAvatar';
 import { NOT_IN_ROOM_LABEL, notifyRoomAgentsChanged, onRoomAgentsChanged } from '../lib/roomAgents';
+import { notifyRoomMcpChanged } from '../lib/roomMcp';
 import StorageBanner from './StorageBanner';
 import { RenewPlanLink } from './PlanBanner';
 
@@ -61,6 +62,7 @@ function makeProxyGroupKey(sid1, sid2) {
 
 /* ─── Auto-growing composer textarea ─── */
 const COMPOSER_MAX_HEIGHT = 200;
+const QUESTION_ANSWER_MAX_HEIGHT = 160;
 
 function useAutoGrowTextarea(ref, value, maxHeight) {
   useEffect(() => {
@@ -830,7 +832,7 @@ function ToolLimitCard({ msg, taskActions, autoRetryBadge, autoRetryResolved }) 
  * is wrong with the task itself, so the one honest action is Retry — not the
  * Resume/Handoff choices of a limit card.
  */
-const PROVIDER_FAILURE_REASONS = ['provider_error', 'timeout'];
+const PROVIDER_FAILURE_REASONS = ['provider_error', 'timeout', 'cm_answer_failed'];
 
 function ProviderErrorCard({ msg, taskActions, autoRetryBadge, autoRetryResolved }) {
   const [retried, setRetried] = useState(false);
@@ -863,12 +865,22 @@ function ProviderErrorCard({ msg, taskActions, autoRetryBadge, autoRetryResolved
             <span className="font-semibold" style={{ color: '#ef4444' }}>{interruptionTitle(reason)}</span>
             <p className="mt-0.5 leading-snug" style={{ color: 'var(--text-secondary)' }}>
               The task <span className="font-medium" style={{ color: 'var(--text-primary)' }}>"{task_title || '…'}"</span>{' '}
-              was stopped: the agent{' '}
-              <span className="font-medium" style={{ color: 'var(--accent-light)' }}>@{agent_nickname || 'agent'}</span>{' '}
-              {reason === 'timeout'
-                ? 'got no answer from the model provider in time.'
-                : `got an error from the model provider${safe_error ? ` (${safe_error})` : ''}.`}
-              {(http_status === 401 || http_status === 403) && ' Check the provider API key in the agent settings.'}
+              {reason === 'cm_answer_failed' ? (
+                <>
+                  was stopped: ChatMaster could not answer the agent's question because its model provider
+                  {safe_error ? ` failed (${safe_error}).` : ' failed.'}
+                  {(http_status === 401 || http_status === 403) && " Check the provider API key in ChatMaster's settings."}
+                </>
+              ) : (
+                <>
+                  was stopped: the agent{' '}
+                  <span className="font-medium" style={{ color: 'var(--accent-light)' }}>@{agent_nickname || 'agent'}</span>{' '}
+                  {reason === 'timeout'
+                    ? 'got no answer from the model provider in time.'
+                    : `got an error from the model provider${safe_error ? ` (${safe_error})` : ''}.`}
+                  {(http_status === 401 || http_status === 403) && ' Check the provider API key in the agent settings.'}
+                </>
+              )}
               {' '}Files already written stay in the workspace.
             </p>
           </div>
@@ -1114,6 +1126,8 @@ function AgentQuestionCard({ msg, token, roomId }) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState(null);
   const [freeText, setFreeText] = useState('');
+  const freeTextRef = useRef(null);
+  useAutoGrowTextarea(freeTextRef, freeText, QUESTION_ANSWER_MAX_HEIGHT);
   const [selected, setSelected] = useState([]); // indices of selected options (first question)
   const [secondSelected, setSecondSelected] = useState([]);
   const [showFree, setShowFree] = useState(false);
@@ -1337,14 +1351,21 @@ function AgentQuestionCard({ msg, token, roomId }) {
             )}
 
             {showFree ? (
-              <div className="flex gap-2">
-                <input
-                  className="flex-1 px-2 py-1.5 rounded-lg text-[11px]"
+              <div className="flex gap-2 items-end">
+                <textarea
+                  ref={freeTextRef}
+                  rows={1}
+                  className="flex-1 px-2 py-1.5 rounded-lg text-[11px] resize-none leading-snug"
                   style={{ background: 'var(--bg-input)', border: '1px solid var(--border)', color: 'var(--text-primary)', outline: 'none' }}
-                  placeholder="Enter an answer…"
+                  placeholder="Enter an answer… (Shift+Enter for a new line)"
                   value={freeText}
                   onChange={e => setFreeText(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && doFreeText()}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                      e.preventDefault();
+                      doFreeText();
+                    }
+                  }}
                   disabled={pending || !!answered}
                   autoFocus
                 />
@@ -4348,6 +4369,8 @@ function RoomChat({ room, token, pullConflictFocus, onDelete, onRoomStateChange,
         if (eventType === 'STORAGE_FULL' || eventType === 'STORAGE_FREED') setStorageRefresh(n => n + 1);
         // Membership changed (maybe in another tab) — every members cache refetches.
         if (eventType === 'ROOM_AGENTS_CHANGED') notifyRoomAgentsChanged(room.id);
+        // Room MCP scope changed (maybe in another tab) — the MCP panel refetches.
+        if (eventType === 'ROOM_MCP_SCOPE_CHANGED') notifyRoomMcpChanged(room.id);
 
         // Live planning indicator (PlanningIndicator) — mirror of
         // reconstructPlanningPhase, kept in sync with it.
@@ -5067,6 +5090,9 @@ function RoomChat({ room, token, pullConflictFocus, onDelete, onRoomStateChange,
       if (!taskId) continue;
       const event = message.eventType;
       if (event === 'TASK_STALLED' || event === 'TOOL_LIMIT_REACHED') {
+        // A newer interruption supersedes the older card: acting on the old
+        // one would restart a task that has since moved on.
+        if (retryMessageIds.has(taskId)) resolvedRetryMessages.add(retryMessageIds.get(taskId));
         retryMessageIds.set(taskId, message.id);
         anchored.add(taskId);
       } else if (event === 'TASK_AUTO_RETRY_SCHEDULED') {
@@ -5076,7 +5102,12 @@ function RoomChat({ room, token, pullConflictFocus, onDelete, onRoomStateChange,
           anchored.add(taskId);
         }
       } else if (event === 'TASK_AUTO_RETRIED' || event === 'TASK_RETRIED' || event === 'TASK_RESUMED') {
-        if (scheduled.delete(taskId)) resolvedRetryMessages.add(retryMessageIds.get(taskId));
+        // Any restart settles the card, manual or automatic, so a reload does
+        // not offer Retry again for a task that is already running.
+        scheduled.delete(taskId);
+        // Checked against the card itself, not `anchored`: a cancelled or
+        // skipped schedule drops the anchor but leaves the card actionable.
+        if (retryMessageIds.has(taskId)) resolvedRetryMessages.add(retryMessageIds.get(taskId));
         anchored.delete(taskId);
       } else if (
         event === 'TASK_AUTO_RETRY_CANCELLED' || event === 'TASK_AUTO_RETRY_EXHAUSTED'

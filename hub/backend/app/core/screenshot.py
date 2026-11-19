@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote, urlsplit
@@ -25,6 +26,7 @@ from sqlalchemy.future import select
 from app.core.preview_gateway import (
     _clean_preview_query,
     _domain as _preview_domain,
+    _scheme as _preview_scheme,
     issue_ticket,
     preview_cookie_name,
     preview_enabled,
@@ -42,6 +44,7 @@ _BROWSERS: dict[str, Any] = {}
 # Loopback forward proxy that gives WebKit the gateway mapping Chromium gets
 # from ``--host-resolver-rules``; started with the first WebKit launch.
 _WEBKIT_PROXY: "_GatewayProxy | None" = None
+_GATEWAY_SCHEME_WARNED = False
 
 ENGINES = ("chromium", "webkit")
 
@@ -651,7 +654,53 @@ def _screenshot_gateway_url() -> str | None:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.path not in {"", "/"}:
         logger.warning("screenshot: ignoring invalid WORKSPACE_SCREENSHOT_GATEWAY_URL")
         return None
+    preview_scheme = _preview_scheme()
+    if parsed.scheme != preview_scheme:
+        # The browser keeps the service origin's scheme when its host is mapped
+        # to the gateway, so an https preview mapped onto a plain-http gateway
+        # fails the TLS handshake (ERR_SSL_PROTOCOL_ERROR).  Behind a TLS
+        # terminator the public origin itself is reachable; use it unmapped.
+        global _GATEWAY_SCHEME_WARNED
+        if not _GATEWAY_SCHEME_WARNED:
+            _GATEWAY_SCHEME_WARNED = True
+            logger.info(
+                "screenshot: WORKSPACE_SCREENSHOT_GATEWAY_URL is %s but previews are %s; "
+                "browsers load the public preview origin directly",
+                parsed.scheme,
+                preview_scheme,
+            )
+        return None
     return f"{parsed.scheme}://{parsed.netloc}"
+
+
+_NET_ERROR_RE = re.compile(r"\b(NS_ERROR_[A-Z_]+|net::ERR_[A-Z0-9_]+)")
+
+
+def _browser_error_code(exc: BaseException) -> str:
+    """The engine's network error code (``net::ERR_…``), ``timeout`` or ``-``."""
+    match = _NET_ERROR_RE.search(str(exc))
+    if match:
+        return match.group(1)
+    first_line = (str(exc).splitlines() or [""])[0]
+    if type(exc).__name__ == "TimeoutError" or "Timeout" in first_line:
+        return "timeout"
+    return "-"
+
+
+def _load_failure_message(exc: BaseException) -> str:
+    """Agent-facing text: say where the failure is so the room is not 'fixed'."""
+    code = _browser_error_code(exc)
+    if code == "timeout":
+        return (
+            "preview page could not be loaded (timed out). Check that the service "
+            "answers on its declared port; retry once after workspace_service wait_ready"
+        )
+    detail = f" ({code})" if code != "-" else ""
+    return (
+        f"preview page could not be loaded{detail}. If the service is ready and answers "
+        "locally, this is a Hub-side browser or gateway problem, not something to fix "
+        "inside the room; do not install browsers in the workspace — report it instead"
+    )
 
 
 async def _service_for(db: AsyncSession, room_id: UUID, service_slug: str):
@@ -778,13 +827,14 @@ async def capture_screenshot(
             raise
         except Exception as exc:
             logger.warning(
-                "screenshot: preview navigation failed room=%s service=%s engine=%s (%s)",
+                "screenshot: preview navigation failed room=%s service=%s engine=%s (%s %s)",
                 room_id,
                 slug,
                 engine_name,
                 type(exc).__name__,
+                _browser_error_code(exc),
             )
-            raise ScreenshotError("preview page could not be loaded") from exc
+            raise ScreenshotError(_load_failure_message(exc)) from exc
     finally:
         if context is not None:
             try:

@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 from uuid import UUID
 
@@ -304,6 +304,71 @@ async def agent_can_see_images(
 
     base_url = str(config.get("base_url") or "").strip() or "https://openrouter.ai/api/v1"
     return await chat_model_supports_image_input(base_url, model) is not False
+
+
+def agent_vision_hint(llm_config: Mapping[str, Any] | None, *, has_vision_server: bool) -> str:
+    """``"yes"`` / ``"no"`` / ``"unknown"``: can this agent look at images?
+
+    The prompt-side twin of :func:`agent_can_see_images` for ChatMaster's
+    agent list (internal design notes §4.1): it never
+    makes a network call, so a model the OpenRouter catalog has not been
+    asked about yet is ``"unknown"``, not the run-time optimistic ``True``.
+    *has_vision_server* — an ``mcp-vision`` server is in the agent's scope.
+    """
+
+    if has_vision_override(llm_config) or has_vision_server:
+        return "yes"
+    config = llm_config or {}
+    if str(config.get("provider") or "").strip().lower() != "openrouter":
+        return "unknown"
+    model = str(config.get("model") or "").strip()
+    if not model:
+        return "unknown"
+    from app.core.media_size import cached_chat_model_supports_image_input
+
+    base_url = str(config.get("base_url") or "").strip() or "https://openrouter.ai/api/v1"
+    cached = cached_chat_model_supports_image_input(base_url, model)
+    return "yes" if cached is True else "no" if cached is False else "unknown"
+
+
+def vision_catalog_key(llm_config: Mapping[str, Any] | None) -> tuple[str, str] | None:
+    """(base_url, model) whose OpenRouter catalog entry decides vision, else ``None``."""
+
+    config = llm_config or {}
+    if str(config.get("provider") or "").strip().lower() != "openrouter":
+        return None
+    model = str(config.get("model") or "").strip()
+    if not model:
+        return None
+    return (str(config.get("base_url") or "").strip() or "https://openrouter.ai/api/v1", model)
+
+
+async def warm_vision_catalog(keys: Iterable[tuple[str, str]], *, timeout: float = 3.0) -> None:
+    """Fetch the OpenRouter catalog answer for each cold (base_url, model).
+
+    So :func:`agent_vision_hint` can tell ChatMaster ``no`` for a text-only
+    model on a fresh process instead of ``unknown`` (live run 7.4 of
+    internal design notes). One catalog request
+    serves every model (it is cached per model); bounded by *timeout*, and any
+    failure just leaves the hint ``unknown``.
+    """
+    import asyncio
+
+    from app.core.media_size import (
+        cached_chat_model_supports_image_input,
+        chat_model_supports_image_input,
+    )
+
+    cold = [key for key in dict.fromkeys(keys) if cached_chat_model_supports_image_input(*key) is None]
+    if not cold:
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(chat_model_supports_image_input(*key) for key in cold), return_exceptions=True),
+            timeout,
+        )
+    except Exception:
+        logger.info("vision catalog warm-up did not finish for %d model(s)", len(cold))
 
 
 NEEDS_VISION_BLOCK_REASON = "needs_vision"

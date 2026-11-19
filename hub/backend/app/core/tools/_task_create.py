@@ -202,17 +202,52 @@ class TaskCreateTool(Tool):
             else:
                 dispatch_scheduled = True
 
-        return json.dumps(
-            {
-                "task_id": str(created.id),
-                "title": created.title,
-                "state": created.state.value,
-                "created": True,
-                "dispatch": "scheduled" if dispatch_scheduled else "not_scheduled",
-                "dispatch_error": dispatch_error,
-            },
-            ensure_ascii=False,
+        result: dict[str, Any] = {
+            "task_id": str(created.id),
+            "title": created.title,
+            "state": created.state.value,
+            "created": True,
+            "dispatch": "scheduled" if dispatch_scheduled else "not_scheduled",
+            "dispatch_error": dispatch_error,
+        }
+        warnings = await _assignee_capability_warnings(ctx, created)
+        if warnings:
+            result["warnings"] = warnings
+        return json.dumps(result, ensure_ascii=False)
+
+
+async def _assignee_capability_warnings(ctx: ToolContext, task: Any) -> list[str]:
+    """Soft MCP / vision warnings for the task's assignee (never blocks).
+
+    internal design notes §4.2 — the task is already
+    created; the warning tells ChatMaster to reassign it or ask the user.
+    """
+    if task.assigned_agent_id is None:
+        return []
+    try:
+        from app.core.mcp_gateway import assignment_capability_warnings, room_mcp_briefs
+        from app.core.vision_dispatch import agent_vision_hint
+        from app.models.agent import Agent
+
+        agent = await ctx.db.get(Agent, task.assigned_agent_id)
+        if agent is None:
+            return []
+        briefs = await room_mcp_briefs(ctx.room_id, ctx.db)
+        from app.core.vision_dispatch import vision_catalog_key, warm_vision_catalog
+
+        if (key := vision_catalog_key(agent.llm_config)) is not None:
+            await warm_vision_catalog([key])
+        own_vision = any(b.vision and b.available_to(agent.id) for b in briefs)
+        return assignment_capability_warnings(
+            task_text=f"{task.title}\n{task.description or ''}",
+            nickname=agent.nickname,
+            agent_id=agent.id,
+            vision_hint=agent_vision_hint(agent.llm_config, has_vision_server=own_vision),
+            briefs=briefs,
         )
+    except Exception:
+        logger.warning("task_create: capability check failed for task %s", task.id, exc_info=True)
+        return []
 
 
 _DIALOGUE_KINDS = frozenset({"user_cm_p1", "user_cm_p2", "user_agent_p1", "user_agent_p2"})

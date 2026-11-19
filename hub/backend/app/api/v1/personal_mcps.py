@@ -40,7 +40,7 @@ from app.core.secrets.lease import ManagedMcpSecretLeaseService, SecretLeaseErro
 from app.core.secrets.room_secrets import EnvironmentLocked
 from app.core.secrets.store import PostgresEncryptedSecretStore, SecretStoreError
 from app.db.session import get_session
-from app.models.market import RoomMcpServer, UserInstalledItem
+from app.models.market import RoomMcpScope, RoomMcpServer, UserInstalledItem
 from app.models.personal_mcp import PersonalMcpEvent, PersonalMcpImportPreview, PersonalMcpRuntime
 from app.models.room import Room
 from app.models.secret import (
@@ -1284,6 +1284,7 @@ async def _finish_runtime_delete(
     runtime.last_error_safe = None
     item.status = "disabled"
     await db.execute(delete(RoomMcpServer).where(RoomMcpServer.user_installed_item_id == runtime.installed_item_id))
+    await db.execute(delete(RoomMcpScope).where(RoomMcpScope.user_installed_item_id == runtime.installed_item_id))
     await db.execute(
         delete(SecretBinding).where(
             SecretBinding.owner_id == owner_id,
@@ -1451,6 +1452,13 @@ async def detach_personal_mcp_from_room(
     )
     if not result.rowcount:
         raise _error("personal_mcp_not_found", "Room binding not found.", "Check the list of bindings.", status_code=404)
+    # A re-bound server starts from "all agents" (room_mcp_agent_scope_plan §2).
+    await db.execute(
+        delete(RoomMcpScope).where(
+            RoomMcpScope.room_id == room_id,
+            RoomMcpScope.user_installed_item_id == runtime.installed_item_id,
+        )
+    )
     await db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 

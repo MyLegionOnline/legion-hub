@@ -236,6 +236,16 @@ async def remove_agent_from_room(room: Room, agent_id: UUID, db: AsyncSession) -
     await db.execute(
         delete(AgentMemory).where(AgentMemory.room_id == room.id, AgentMemory.agent_id == agent_id)
     )
+    # Selected MCP scopes drop the agent; the scope stays "selected", so a
+    # server whose last selected agent leaves reaches nobody rather than
+    # everybody (room_mcp_agent_scope_plan §2, S2).
+    from app.models.market import RoomMcpScopeAgent
+
+    await db.execute(
+        delete(RoomMcpScopeAgent).where(
+            RoomMcpScopeAgent.room_id == room.id, RoomMcpScopeAgent.agent_id == agent_id
+        )
+    )
     await db.execute(
         delete(RoomAgentLink).where(
             RoomAgentLink.room_id == room.id, RoomAgentLink.agent_id == agent_id

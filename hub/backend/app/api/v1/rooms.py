@@ -17,13 +17,13 @@ from app.models.message import Message
 from app.models.agent import Agent
 from app.models.agent_memory import AgentMemory
 from app.models.user import User
-from app.models.market import RoomMcpServer, UserInstalledItem
+from app.models.market import RoomMcpScope, RoomMcpScopeAgent, RoomMcpServer, UserInstalledItem
 from app.models.workspace import Workspace, WorkspaceUsage
 from app.models.personal_mcp import PersonalMcpRuntime
 from app.api.v1.user_installed_items import InstalledItemOut, _as_out
 from app.core.mcp_discovery import is_http_link, mcp_connection_status
 from app.models.mcp_connection import McpConnectionSnapshot
-from app.schemas.mcp_connection import McpRoomBindingOut
+from app.schemas.mcp_connection import McpAgentScopeIn, McpAgentScopeOut, McpRoomBindingOut
 from app.schemas.room import RoomCreate, RoomOut, RoomUpdate, RoomStateUpdate
 from app.core.room_members import (
     RoomAgentMembershipError,
@@ -31,6 +31,7 @@ from app.core.room_members import (
     former_agents,
     remove_agent_from_room,
     room_agent_ids,
+    room_chat_master_id,
 )
 
 
@@ -107,6 +108,7 @@ async def list_room_mcp_servers(
             snapshot.installed_item_id: snapshot
             for snapshot in snapshot_result.scalars().all()
         }
+    scopes = await _room_mcp_scopes(room_id, [item.id for item in items], db)
     output: list[InstalledItemOut] = []
     for item in items:
         connection = await mcp_connection_status(
@@ -126,9 +128,111 @@ async def list_room_mcp_servers(
                         status="available" if available else "unavailable",
                     )
                 ],
+                agent_scope=scopes.get(item.id) or McpAgentScopeOut(),
             )
         )
     return output
+
+
+async def _room_mcp_scopes(
+    room_id: UUID, item_ids: list[UUID], db: AsyncSession
+) -> dict[UUID, McpAgentScopeOut]:
+    """Scopes of *item_ids* in one room; an item without a row is ``all``."""
+    if not item_ids:
+        return {}
+    rows = await db.execute(
+        select(RoomMcpScope).where(
+            RoomMcpScope.room_id == room_id,
+            RoomMcpScope.user_installed_item_id.in_(item_ids),
+        )
+    )
+    scopes = {
+        scope.user_installed_item_id: McpAgentScopeOut(mode=scope.mode)
+        for scope in rows.scalars().all()
+    }
+    agents = await db.execute(
+        select(RoomMcpScopeAgent.user_installed_item_id, RoomMcpScopeAgent.agent_id)
+        .where(
+            RoomMcpScopeAgent.room_id == room_id,
+            RoomMcpScopeAgent.user_installed_item_id.in_(list(scopes)),
+        )
+        .order_by(RoomMcpScopeAgent.agent_id)
+    ) if scopes else None
+    for item_id, agent_id in (agents.all() if agents is not None else []):
+        scope = scopes[item_id]
+        if scope.mode == "selected":
+            scope.agent_ids.append(agent_id)
+    return scopes
+
+
+@router.put("/{room_id}/mcp-servers/{installed_item_id}/scope", response_model=McpAgentScopeOut)
+async def set_room_mcp_server_scope(
+    room_id: UUID,
+    installed_item_id: UUID,
+    body: McpAgentScopeIn,
+    db: AsyncSession = Depends(get_session),
+    current_user: User = Depends(deps.get_current_user),
+) -> McpAgentScopeOut:
+    """Set which agents of the room get one attached MCP server's tools.
+
+    internal design notes §3.5. ``all`` clears the
+    agent list; ``selected`` with an empty list is allowed and means nobody.
+    The new scope applies from the next agent turn / task conversation — the
+    tool set is resolved once per turn (``user_sessions``) and once per task
+    conversation (``proxy_session``).
+    """
+    room = await _require_room_member(room_id, current_user.id, db)
+    item = await _require_owned_active_mcp(installed_item_id, current_user.id, db, require_active=False)
+    if await db.get(RoomMcpServer, (room_id, installed_item_id)) is None:
+        raise HTTPException(status_code=409, detail="The MCP server is not attached to this room")
+    agent_ids = list(dict.fromkeys(body.agent_ids)) if body.mode == "selected" else []
+    allowed = await room_agent_ids(room_id, db)
+    chat_master_id = room_chat_master_id(room)
+    if chat_master_id is not None:
+        allowed.add(chat_master_id)
+    unknown = [str(agent_id) for agent_id in agent_ids if agent_id not in allowed]
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "agent_not_in_room", "agent_ids": unknown},
+        )
+
+    await db.execute(
+        delete(RoomMcpScopeAgent).where(
+            RoomMcpScopeAgent.room_id == room_id,
+            RoomMcpScopeAgent.user_installed_item_id == installed_item_id,
+        )
+    )
+    scope = await db.get(RoomMcpScope, (room_id, installed_item_id))
+    if scope is None:
+        scope = RoomMcpScope(room_id=room_id, user_installed_item_id=installed_item_id)
+        db.add(scope)
+    scope.mode = body.mode
+    scope.updated_by = current_user.id
+    scope.updated_at = datetime.now(timezone.utc)
+    await db.flush()
+    for agent_id in agent_ids:
+        db.add(RoomMcpScopeAgent(room_id=room_id, user_installed_item_id=installed_item_id, agent_id=agent_id))
+    await db.commit()
+
+    from app.core.events import emit_event
+
+    await emit_event(
+        room_id=room_id,
+        event_type="ROOM_MCP_SCOPE_CHANGED",
+        content=(
+            f"MCP {item.name}: available to all agents"
+            if body.mode == "all"
+            else f"MCP {item.name}: available to {len(agent_ids)} selected agent(s)"
+        ),
+        db=db,
+        metadata={
+            "installed_item_id": str(installed_item_id),
+            "mode": body.mode,
+            "agent_ids": [str(agent_id) for agent_id in agent_ids],
+        },
+    )
+    return McpAgentScopeOut(mode=body.mode, agent_ids=agent_ids)
 
 
 @router.put("/{room_id}/mcp-servers/{installed_item_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -196,6 +300,14 @@ async def unassign_room_mcp_server(
         delete(RoomMcpServer).where(
             RoomMcpServer.room_id == room_id,
             RoomMcpServer.user_installed_item_id == installed_item_id,
+        )
+    )
+    # A re-assigned server starts from "all agents" (room_mcp_agent_scope_plan §2);
+    # room_mcp_scope_agent rows go with it by FK cascade.
+    await db.execute(
+        delete(RoomMcpScope).where(
+            RoomMcpScope.room_id == room_id,
+            RoomMcpScope.user_installed_item_id == installed_item_id,
         )
     )
     await db.commit()
@@ -306,6 +418,12 @@ async def create_room(
                     room_id=db_obj.id,
                     granted_by=current_user.id,
                 )
+
+    # internal design notes §3.0: default Market MCPs
+    # are ordinary room assignments, so "Disable" in this room really disables.
+    from app.core.skill_defaults import attach_default_mcps_to_room
+
+    await attach_default_mcps_to_room(db_obj.id, current_user.id, db)
 
     # T9: `workspaced` must create the root and attach its XFS project before
     # this room is visible.  A file upload may be the first operation — it

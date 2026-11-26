@@ -67,6 +67,10 @@ class ReadFilesTool(Tool):
         if len(raw_paths) > _MAX_PATHS:
             return f"Error: at most {_MAX_PATHS} paths per call (got {len(raw_paths)}); split into multiple calls"
 
+        from app.core.task_trees import tree_for_path
+        from app.core.tools.registry import ctx_tree
+
+        tree = await ctx_tree(ctx)
         sections: list[str] = []
         budget_exhausted = False
 
@@ -81,7 +85,10 @@ class ReadFilesTool(Tool):
                 sections.append(f"<file path={raw_path!r}>\nError: invalid path: {exc}\n</file>")
                 continue
 
-            content = await wsd.read_workspace_file(str(ctx.room_id), f"/workspace/{path}")
+            path_tree = tree_for_path(tree, path)
+            content = await wsd.read_workspace_file(
+                str(ctx.room_id), f"/workspace/{path}", **({"tree": path_tree} if path_tree else {})
+            )
             if content is None:
                 sections.append(f"<file path={path!r}>\nFile not found: {path!r}\n</file>")
                 continue

@@ -30,6 +30,24 @@ class WorkspaceServiceToolError(ValueError):
     """An error that can be returned to an agent with a concrete recovery."""
 
 
+TASK_TREE_SERVICE_NOTE = (
+    "\n[note: room services run from /workspace, the room's integration tree, not from "
+    "your task tree — they do not see your branch's changes. To check your own code over "
+    "HTTP, start a dev server in your tree with bash(background=true) on a free port, "
+    "curl it, then bash_kill it. Do not restart or declare room services for that.]"
+)
+
+
+async def _task_tree_note(ctx: ToolContext) -> str:
+    """internal design notes R6: services stay on the integration tree."""
+    from app.core.tools.registry import ctx_tree
+
+    try:
+        return TASK_TREE_SERVICE_NOTE if await ctx_tree(ctx) else ""
+    except Exception:  # noqa: BLE001 — a hint must never break the tool
+        return ""
+
+
 class WorkspaceServiceTool(Tool):
     name = "workspace_service"
     description = (
@@ -136,10 +154,12 @@ class WorkspaceServiceTool(Tool):
             return "Error: action must be list, declare, prepare, start, stop, restart, status, logs, wait_ready, or request"
         try:
             if action == "list":
-                return await self._list(ctx)
-            if action == "declare":
-                return await self._declare(ctx, tool_input)
-            return await self._operate(ctx, action, tool_input)
+                out = await self._list(ctx)
+            elif action == "declare":
+                out = await self._declare(ctx, tool_input)
+            else:
+                out = await self._operate(ctx, action, tool_input)
+            return out + await _task_tree_note(ctx)
         except (WorkspaceServiceToolError, ServiceValidationError) as exc:
             return f"Error: workspace_service {action} failed: {exc}"
         except httpx.HTTPError as exc:

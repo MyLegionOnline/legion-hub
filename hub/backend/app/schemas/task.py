@@ -30,6 +30,7 @@ class TaskOut(BaseModel):
     retry_count: int = 0
     auto_retry_count: int = 0
     auto_retry_at: Optional[datetime] = None
+    queued_at: Optional[datetime] = None
     rework_count: int = 0
     continuation_of_task_id: Optional[UUID] = None
     assigned_agent_id: Optional[UUID]
@@ -67,6 +68,9 @@ class TaskOut(BaseModel):
     # result, deterministic risk class, and the merge commit produced when the
     # branch was folded into `dev` (kept so a trivial auto-merge is revertable).
     branch_name: Optional[str] = None
+    # internal design notes E6: set while the task works in its own
+    # git worktree (NULL = shared tree, the old mode); the board shows a chip.
+    worktree: Optional[str] = None
     ci_status: Optional[str] = None
     ci_log_key: Optional[str] = None
     risk: Optional[str] = None

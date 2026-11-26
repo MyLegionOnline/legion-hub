@@ -34,10 +34,12 @@ def get_runs(room_id: str) -> list[dict[str, Any]]:
         return []
 
 
-def get_checks(room_id: str) -> list[dict[str, Any]]:
+def get_checks(room_id: str, tree: Optional[str] = None) -> list[dict[str, Any]]:
     """Read .legion/run.json and return the 'checks' list (internal design notes
-    Stage 2). Empty list if the key is missing or the file is invalid."""
-    content = read_file(room_id, RUNS_CONFIG_PATH)
+    Stage 2). Empty list if the key is missing or the file is invalid.
+
+    ``tree`` reads the file of one task's own worktree (its branch's version)."""
+    content = read_file(room_id, RUNS_CONFIG_PATH, tree=tree)
     if content is None:
         return []
     try:

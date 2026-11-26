@@ -53,6 +53,7 @@ async def run_checks(
     *,
     exec_fn: ExecFn,
     env: dict[str, str] | None = None,
+    tree: str | None = None,
 ) -> dict[str, Any]:
     """Run the room's declared checks for ``scope`` ("quick" | "full").
 
@@ -60,14 +61,19 @@ async def run_checks(
     backend from Room variables plus each check's declared ``secrets`` names
     and merged into every check's exec — never the ``git checkout`` above it.
 
+    ``tree`` (internal design notes) names a task's own
+    worktree: the declared checks are read from it and ``ref`` is ignored — the
+    tree already sits on the task's branch, so nothing is checked out. The
+    caller's ``exec_fn`` is what runs the commands inside that tree.
+
     Returns ``{passed, ran, scope, results, error}``. ``ran`` is False when the
     room declared no matching checks — backward-compatible "no CI configured".
     """
-    checks = _select(get_checks(room_id), scope)
+    checks = _select(get_checks(room_id, tree=tree) if tree else get_checks(room_id), scope)
     if not checks:
         return {"passed": True, "ran": False, "scope": scope, "results": [], "error": None}
 
-    if ref:
+    if ref and not tree:
         checkout = await exec_fn(
             ["bash", "-lc", f"git -c safe.directory='*' checkout {ref!s}"],
             30,

@@ -107,7 +107,7 @@ def test_retry_after_accepts_delay_and_http_date():
         ("repeated_tool_error", None, None),
         ("legacy_pipeline_stalled", None, None),
         ("pause_abandoned", None, None),
-        ("proxy_error", None, None),
+        ("proxy_error", None, "retry"),
     ],
 )
 async def test_schedule_auto_retry_for_interruption(reason, status, action):

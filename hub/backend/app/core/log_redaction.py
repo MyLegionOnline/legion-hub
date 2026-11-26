@@ -10,6 +10,7 @@ token expires. One-time codes of the sign-in flows travel the same way.
 from __future__ import annotations
 
 import logging
+import os
 import re
 
 SECRET_QUERY_PARAMS = ("token", "access_token", "refresh_token", "code", "state", "ticket")
@@ -39,3 +40,37 @@ def install() -> None:
         logger = logging.getLogger(name)
         if not any(isinstance(f, RedactQuerySecrets) for f in logger.filters):
             logger.addFilter(RedactQuerySecrets())
+
+
+# Loggers whose INFO lines are operational events worth seeing by default:
+# slot admissions/queueing, memory-gate waits, process reaping, auto-retries
+# (internal design notes, E4: none of them showed
+# because the root logger had no handler and Python's last resort prints only
+# WARNING and above).
+_INFO_LOGGERS = (
+    "app.core.room_slots",
+    "app.core.memory_gate",
+    "app.core.proc_reaper",
+    "app.core.auto_retry",
+)
+
+
+def configure_app_logging() -> None:
+    """Give application loggers a handler; ``LOG_LEVEL`` sets the root level.
+
+    Default WARNING keeps the volume where it was; the operational loggers
+    above log at INFO regardless, and ``LOG_INFO_LOGGERS`` (comma-separated)
+    adds more without code changes.
+    """
+    root = logging.getLogger()
+    if not root.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+        root.addHandler(handler)
+    level = os.getenv("LOG_LEVEL", "WARNING").strip().upper()
+    root.setLevel(getattr(logging, level, logging.WARNING))
+    extra = [n.strip() for n in os.getenv("LOG_INFO_LOGGERS", "").split(",") if n.strip()]
+    for name in (*_INFO_LOGGERS, *extra):
+        lg = logging.getLogger(name)
+        if lg.getEffectiveLevel() > logging.INFO:
+            lg.setLevel(logging.INFO)

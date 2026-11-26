@@ -404,9 +404,11 @@ async def get_agent_memory(room_id: UUID, agent_id: UUID, db: AsyncSession) -> O
     return result.scalars().first()
 
 
-async def get_repo_snapshot(room_id: UUID, db: AsyncSession) -> List[Dict[str, str]]:
+async def get_repo_snapshot(
+    room_id: UUID, db: AsyncSession, tree: Optional[str] = None
+) -> List[Dict[str, str]]:
     """Return a bounded path manifest — never file contents or an unbounded tree."""
-    files = await wfs.fs_list_files(room_id, db)
+    files = await wfs.fs_list_files(room_id, db, **({"tree": tree} if tree else {}))
     # The complete tree remains available to explicit glob/repo_map calls.  A
     # prompt only needs enough orientation to choose its next on-demand read.
     return files[:200]
@@ -621,7 +623,14 @@ async def build_agent_context(task_id: UUID, db: AsyncSession, agent_id: Optiona
 
     memory = await get_project_memory(task.room_id, db)
     agent_memory = await get_agent_memory(task.room_id, agent_id, db) if agent_id else None
-    repo_snapshot = await get_repo_snapshot(task.room_id, db)
+    from app.core.task_trees import tree_of_task_id
+
+    task_tree = await tree_of_task_id(task_id, db)
+    repo_snapshot = (
+        await get_repo_snapshot(task.room_id, db, tree=task_tree)
+        if task_tree
+        else await get_repo_snapshot(task.room_id, db)
+    )
     previous_summary = await get_last_session_summary(task_id, db)
     referenced_files = await _fetch_referenced_files(task.description or "", task.room_id, db)
 

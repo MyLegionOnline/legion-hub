@@ -197,6 +197,23 @@ async def deliver_pending(
     if task_id is None:
         return []
     try:
+        # Plain read first: almost every turn has nothing queued, and a
+        # ``FOR UPDATE`` (even on zero rows) flags the loop's transaction as
+        # holding a lock, so ``release_db`` would keep its connection across
+        # the model wait — with several tasks running that drained the pool
+        # (internal design notes, E4).
+        waiting = (
+            await db.execute(
+                select(TaskInterjection.id)
+                .where(
+                    TaskInterjection.task_id == task_id,
+                    TaskInterjection.delivered_at.is_(None),
+                )
+                .limit(1)
+            )
+        ).scalars().first()
+        if waiting is None:
+            return []
         # A savepoint, not a rollback on failure: this is the tool loop's own
         # session, and rolling it back would drop whatever the loop has not
         # committed yet.
@@ -295,6 +312,117 @@ def inject_anthropic(working: list[dict[str, Any]], note: str) -> None:
 def inject_openai(working: list[dict[str, Any]], note: str) -> None:
     """Chat Completions takes a user message right after ``tool`` results."""
     working.append({"role": "user", "content": note})
+
+
+# Once answered, a note must stop asking for an answer: left as is, it stays
+# the newest user message of the turn and a weak model re-answers it and redoes
+# work it already did (Loki's friends, 2026-11-24: ~25 steps, three replies).
+_ANSWERED_HEAD = (
+    "[MESSAGE FROM THE USER DURING THE TASK — ALREADY ANSWERED with reply_to_user. "
+    "Do not answer it again. Everything you did after it is newer than it: do not "
+    "redo that work. Keep any instruction it gives and continue the task.]"
+)
+_REPLY_OK = "Delivered to the user."
+
+
+def _is_note(text: Any) -> bool:
+    return isinstance(text, str) and text.startswith(_NOTE_HEAD.split(" — ", 1)[0] + " — the user")
+
+
+def _answered(note: str) -> str:
+    _head, sep, body = note.partition("]\n\n")
+    return f"{_ANSWERED_HEAD}\n\n{body}" if sep else _ANSWERED_HEAD
+
+
+def _tool_result_text(block: dict[str, Any]) -> str:
+    content = block.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(str(b.get("text") or "") for b in content if isinstance(b, dict))
+    return ""
+
+
+def _replies_in(msg: dict[str, Any]) -> int:
+    """Successful reply_to_user results carried by ``msg`` (either API shape)."""
+    content = msg.get("content")
+    if msg.get("role") == "tool":
+        return int(isinstance(content, str) and _REPLY_OK in content)
+    if msg.get("role") == "user" and isinstance(content, list):
+        return sum(
+            1
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "tool_result" and _REPLY_OK in _tool_result_text(b)
+        )
+    return 0
+
+
+def settle_answered(messages: list[dict[str, Any]]) -> dict[str, str]:
+    """Rewrite the notes a later reply_to_user answered; returns {old: new}.
+
+    Mirrors ``record_reply``: each successful reply answers the oldest open
+    note.  A reply in the same message as a note came before that note was
+    delivered.  Message dicts are replaced, not mutated (shared with history).
+    """
+    pending: list[tuple[int, int | None]] = []  # (message index, block index or None)
+    answered: list[tuple[int, int | None]] = []
+    for idx, msg in enumerate(messages):
+        for _ in range(_replies_in(msg)):
+            if pending:
+                answered.append(pending.pop(0))
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if _is_note(content):
+            pending.append((idx, None))
+        elif isinstance(content, list):
+            for bidx, block in enumerate(content):
+                if isinstance(block, dict) and block.get("type") == "text" and _is_note(block.get("text")):
+                    pending.append((idx, bidx))
+    changed: dict[str, str] = {}
+    for idx, bidx in answered:
+        msg = messages[idx]
+        if bidx is None:
+            old = msg["content"]
+            changed[old] = _answered(old)
+            messages[idx] = {**msg, "content": changed[old]}
+        else:
+            blocks = list(msg["content"])
+            old = blocks[bidx]["text"]
+            changed[old] = _answered(old)
+            blocks[bidx] = {**blocks[bidx], "text": changed[old]}
+            messages[idx] = {**msg, "content": blocks}
+    return changed
+
+
+async def settle_for_history(
+    notes: list[str] | None, task_id: UUID | None, db: AsyncSession
+) -> list[str] | None:
+    """Mark this turn's notes answered when nothing delivered is still open.
+
+    The history keeps the notes but not the turn's reply_to_user results, so
+    without this a later turn would read them as still waiting for an answer.
+    """
+    if not notes or task_id is None:
+        return notes
+    try:
+        open_id = (
+            await db.execute(
+                select(TaskInterjection.id)
+                .where(
+                    TaskInterjection.task_id == task_id,
+                    TaskInterjection.delivered_at.is_not(None),
+                    TaskInterjection.answered_at.is_(None),
+                )
+                .limit(1)
+            )
+        ).scalars().first()
+    except Exception as exc:  # noqa: BLE001 — keep the notes as they are
+        logger.debug("task_interject: open check failed (task=%s): %s", task_id, exc)
+        return notes
+    if open_id is not None:
+        return notes
+    return [_answered(n) if _is_note(n) else n for n in notes]
 
 
 # ---------------------------------------------------------------------------

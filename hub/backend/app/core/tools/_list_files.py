@@ -50,7 +50,12 @@ class GlobTool(Tool):
         except WorkspacePathError as exc:
             return f"Error: invalid pattern: {exc}"
 
-        tree = await wsd.get_workspace_tree(str(ctx.room_id))
+        from app.core.tools.registry import ctx_tree
+
+        task_tree = await ctx_tree(ctx)
+        tree = await wsd.get_workspace_tree(
+            str(ctx.room_id), **({"tree": task_tree} if task_tree else {})
+        )
 
         matched: list[tuple[float, str]] = []
         for entry in tree:

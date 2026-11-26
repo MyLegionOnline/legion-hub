@@ -364,6 +364,7 @@ async def create_room(
         coordinator_config=room_in.coordinator_config,
         auto_retry_enabled=room_in.auto_retry_enabled,
         auto_retry_max=room_in.auto_retry_max,
+        parallel_tasks_base=room_in.parallel_tasks_base,
         creator_id=current_user.id,
     )
     db.add(db_obj)
@@ -978,6 +979,13 @@ async def update_room(
             await clear_room_auto_retries(room_id, db)
     if room_in.auto_retry_max is not None:
         db_obj.auto_retry_max = room_in.auto_retry_max
+    if room_in.parallel_tasks_base is not None:
+        db_obj.parallel_tasks_base = room_in.parallel_tasks_base
+        await db.flush()
+        from app.core.room_slots import schedule_queued_dispatch
+
+        # A raised base can free a slot for a task already waiting.
+        schedule_queued_dispatch(room_id)
 
     # Update memberships if provided
     if room_in.user_ids is not None:

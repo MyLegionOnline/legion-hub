@@ -104,11 +104,14 @@ class GrepTool(Tool):
             select(Workspace).where(Workspace.room_id == ctx.room_id)
         )
         ws = ws_res.scalar_one_or_none()
+        from app.core.tools.registry import ctx_tree
+
+        tree = await ctx_tree(ctx)
         # Up to 30 s in the container, or a file-API walk on the fallback path.
         await release_tool_db(ctx, reason="grep")
         if ws is not None and ws.status == "running":
             result = await _grep_in_container(
-                rid, pattern, glob_filter, path_prefix, output_mode, max_results
+                rid, pattern, glob_filter, path_prefix, output_mode, max_results, tree
             )
             if result is not None:
                 return await self._with_observation(
@@ -117,7 +120,7 @@ class GrepTool(Tool):
 
         # Fallback: pure-Python grep via file API
         result = await _grep_fallback(
-            rid, compiled, pattern, glob_filter, path_prefix, output_mode, max_results
+            rid, compiled, pattern, glob_filter, path_prefix, output_mode, max_results, tree
         )
         return await self._with_observation(
             ctx, result, pattern, glob_filter, output_mode, max_results, path_prefix
@@ -184,9 +187,11 @@ async def _grep_in_container(
     path_prefix: str,
     output_mode: str,
     max_results: int,
+    tree: str | None = None,
 ) -> str | None:
     """Run grep inside the container. Returns None if exec fails (caller falls back)."""
     from app.core import workspaced_client as wsd
+    from app.core.task_trees import tree_container_path
 
     flags = ["-r"]
     if output_mode == "files":
@@ -203,7 +208,10 @@ async def _grep_in_container(
     cmd = ["grep"] + flags + ["-e", pattern, target]
     try:
         result = await asyncio.wait_for(
-            wsd.exec_in_workspace(rid, cmd, cwd="/workspace", timeout_sec=30),
+            wsd.exec_in_workspace(
+                rid, cmd, cwd=tree_container_path(tree) if tree else "/workspace",
+                timeout_sec=30,
+            ),
             timeout=35,
         )
     except Exception:
@@ -258,11 +266,13 @@ async def _grep_fallback(
     path_prefix: str,
     output_mode: str,
     max_results: int,
+    task_tree: str | None = None,
 ) -> str:
     """Python-based grep via the workspaced file API (no container needed)."""
     from app.core import workspaced_client as wsd
 
-    tree = await wsd.get_workspace_tree(rid)
+    tkw = {"tree": task_tree} if task_tree else {}
+    tree = await wsd.get_workspace_tree(rid, **tkw)
     matched_files: list[str] = []
     content_lines: list[str] = []
     total = 0
@@ -278,7 +288,7 @@ async def _grep_fallback(
         if glob_filter and not _glob_match(fp, glob_filter):
             continue
 
-        text = await wsd.read_workspace_file(rid, fp)
+        text = await wsd.read_workspace_file(rid, fp, **tkw)
         if text is None:
             continue
         if text.startswith("data:") and ";base64," in text:

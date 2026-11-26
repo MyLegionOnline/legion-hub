@@ -122,11 +122,20 @@ def _db_returning(*results):
     return db
 
 
-def _started(task_start):
-    """db whose single execute() yields the first proxy pair's start."""
+def _started(task_start, *, via_review: bool = False):
+    """db whose execute() yields the first proxy pair's start.
+
+    ``via_review`` — the caller is ``_build_review_verification``, which first
+    looks up the task's own worktree (internal design notes E2); none here, so
+    the shared tree is reviewed.
+    """
     started_result = MagicMock()
     started_result.scalar = MagicMock(return_value=task_start)
-    return _db_returning(started_result)
+    if not via_review:
+        return _db_returning(started_result)
+    no_tree = MagicMock()
+    no_tree.scalar_one_or_none = MagicMock(return_value=None)
+    return _db_returning(no_tree, started_result)
 
 
 def _snapshot(*files):
@@ -377,7 +386,7 @@ async def test_regression_vue_init_review_block_under_token_cap():
 
     with _snapshot(*_vue_init_files(task_start)):
         text = await _build_review_verification(
-            _actions(), [], ROOM_ID, _started(task_start), task_id=TASK_ID
+            _actions(), [], ROOM_ID, _started(task_start, via_review=True), task_id=TASK_ID
         )
 
     assert len(text) <= _REVIEW_TOTAL_MAX_CHARS

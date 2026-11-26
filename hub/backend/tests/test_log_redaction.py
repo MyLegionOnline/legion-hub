@@ -29,3 +29,29 @@ def test_websocket_and_request_lines_lose_their_tokens():
 
 def test_lines_without_secrets_are_unchanged():
     assert log_redaction.redact("/api/v1/rooms?limit=10&tokenizer=x") == "/api/v1/rooms?limit=10&tokenizer=x"
+
+
+def test_operational_loggers_log_info_with_a_warning_root(monkeypatch):
+    """E4: slot and memory-gate INFO lines never reached the container log."""
+    import logging
+
+    from app.core import log_redaction
+
+    root = logging.getLogger()
+    saved = (root.level, list(root.handlers))
+    gate = logging.getLogger("app.core.memory_gate")
+    saved_gate = gate.level
+    try:
+        monkeypatch.delenv("LOG_LEVEL", raising=False)
+        monkeypatch.setenv("LOG_INFO_LOGGERS", "app.core.some_extra")
+        gate.setLevel(logging.NOTSET)
+        log_redaction.configure_app_logging()
+        assert root.level == logging.WARNING and root.handlers
+        assert gate.isEnabledFor(logging.INFO)
+        assert logging.getLogger("app.core.some_extra").isEnabledFor(logging.INFO)
+        assert not logging.getLogger("app.core.unrelated_x").isEnabledFor(logging.INFO)
+    finally:
+        root.setLevel(saved[0])
+        root.handlers[:] = saved[1]
+        gate.setLevel(saved_gate)
+        logging.getLogger("app.core.some_extra").setLevel(logging.NOTSET)

@@ -308,6 +308,13 @@ async def close_open_task_sessions(
 
         cancel_local_proxy_task(task_id)
 
+    # Whatever the closed sessions left running in the workspace (a dev server
+    # in the background, a build past its timeout) goes once the run is over.
+    from app.core.proc_reaper import schedule_room_reap
+
+    for room_id in {s.room_id for s in sessions if getattr(s, "room_id", None)}:
+        schedule_room_reap(room_id)
+
     return len(sessions)
 
 
@@ -646,6 +653,8 @@ async def block_stalled_legacy_tasks(db: AsyncSession, *, now: datetime | None =
                 Task.state == TaskState.IN_PROGRESS,
                 Task.run_id.is_(None),
                 Task.updated_at < kill_cutoff,
+                # Waiting for a parallel-task slot is not a stalled run.
+                Task.queued_at.is_(None),
             )
         )
     ).scalars().all()
@@ -718,6 +727,13 @@ async def run_watchdog_cycle(db: AsyncSession, *, now: datetime | None = None) -
 
     await block_stalled_legacy_tasks(db, now=now)
     await settle_abandoned_pausing(db, now=now)
+    try:
+        from app.core.room_slots import sweep_queues
+
+        await sweep_queues(db)
+    except Exception:
+        await db.rollback()
+        logger.exception("watchdog: sweeping queued tasks failed")
     await close_idle_user_sessions(db, now=now)
     await close_stale_plan_sessions(db, reason="timeout", now=now)
 
@@ -831,6 +847,15 @@ async def run_watchdog_loop(engine) -> None:
                     await db.commit()
             except Exception:
                 logger.exception("watchdog: session scan failed")
+            # Processes of finished tasks / closed chats (core/proc_reaper.py) —
+            # in its own session: it talks to workspaced room by room.
+            try:
+                from app.core.proc_reaper import reap_running_rooms
+
+                async with async_session() as db:
+                    await reap_running_rooms(db)
+            except Exception:
+                logger.exception("watchdog: reaping finished agents' processes failed")
     finally:
         retry_worker.cancel()
         await asyncio.gather(retry_worker, return_exceptions=True)

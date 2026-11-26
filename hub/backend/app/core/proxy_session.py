@@ -119,6 +119,7 @@ from app.db.release import release_db
 from app.core.secrets.crypto import SecretValue
 from app.core.secrets.runtime import legacy_secret_value, resolve_agent_secret
 from app.models.secret import SecretPurpose
+from app.core.repeat_guard import RepeatGuard
 from app.core.tool_offer import LOAD_TOOLS, ToolOffer
 from app.core.session_close import (
     ANTHROPIC_CLOSE_TOOL,
@@ -174,6 +175,11 @@ _MAX_PROXY_TURNS = int(os.getenv("PROXY_MAX_TURNS", "40"))
 # After this many question/answer round trips the agent is told to stop asking and
 # decide. Not a hard stop — the next answer simply carries a "this is final" note.
 _QA_SOFT_LIMIT = int(os.getenv("PROXY_QA_SOFT_LIMIT", "6"))
+# Hard stop: after this many rounds without a delivery the pair is closed and the
+# task blocked (2026-11-20: 22 rounds of "tools are not declared" burnt ~2M tokens).
+_QA_HARD_LIMIT = int(os.getenv("PROXY_QA_HARD_LIMIT", "20"))
+# The same stop when the agent sends near-identical messages this many times in a row.
+_QA_REPEAT_LIMIT = int(os.getenv("PROXY_QA_REPEAT_LIMIT", "8"))
 # Turns left before the cap at which the agent is told to wrap up and close.
 _TURN_WARNING_MARGIN = 2
 # A task may use many short LLM/tool turns, but it may not keep a worker alive
@@ -1818,16 +1824,22 @@ async def _call_llm_with_tools(
         if not await touch_run_activity(session_id, task_id, run_id, db):
             raise _attach_progress(RunStopped(task_id, run_id))
 
-    async def _deliver_interjections(inject) -> None:
+    async def _deliver_interjections(inject, messages: list[dict[str, Any]]) -> None:
         """internal design notes Stage 2: hand the executor the messages the
         user queued into this task, before the next model request.  The note
         is also left in ``loop_signals`` for the proxy loop to keep in the
         agent's history after the turn (this ``working`` list is discarded).
+        Notes already answered with reply_to_user are marked as such first.
         """
         if context_role != "agent" or task_id is None:
             return
         from app.core import task_interject
 
+        settled = task_interject.settle_answered(messages)
+        if settled and loop_signals is not None and loop_signals.get("interjections"):
+            loop_signals["interjections"] = [
+                settled.get(n, n) for n in loop_signals["interjections"]
+            ]
         texts = await task_interject.deliver_pending(task_id, session_id, db)
         if not texts:
             return
@@ -2289,7 +2301,7 @@ async def _call_llm_with_tools(
             step_tick(_step_side)
             await _ensure_run_active()
             await _deliver_interjections(
-                lambda note: _task_interject.inject_anthropic(working, note)
+                lambda note: _task_interject.inject_anthropic(working, note), working
             )
             # The tool list changes only after load_tools (or a direct call of
             # a deferred tool): one uncached step, then stable again.
@@ -2871,7 +2883,7 @@ async def _call_llm_with_tools(
         step_tick(_step_side)
         await _ensure_run_active()
         await _deliver_interjections(
-            lambda note: _task_interject.inject_openai(working_oai, note)
+            lambda note: _task_interject.inject_openai(working_oai, note), working_oai
         )
         if tool_offer is not None:
             tool_offer.absorb(working_oai)
@@ -3735,11 +3747,22 @@ async def _build_review_verification(
     # Fresh `git diff --stat` of the workspace vs main (merge-base scoped):
     # a compact, complete list of every changed file — immune to snapshot
     # staleness and to path-filter mistakes in the CM's own git_diff calls.
+    # A task with its own worktree (internal design notes E2): review ITS tree,
+    # not the shared one, which does not hold the task's files.
+    review_tree = None
+    if task_id is not None:
+        try:
+            from app.core.task_trees import tree_of_task_id
+
+            review_tree = await tree_of_task_id(task_id, db)
+        except Exception:  # noqa: BLE001 — old mode
+            review_tree = None
+    review_tkw = {"tree": review_tree} if review_tree else {}
     try:
         from app.core import workspaced_client as wsd
 
         data = await wsd.git_diff_workspace(
-            str(room_id), from_ref="main", stat=True, merge_base=True
+            str(room_id), from_ref="main", stat=True, merge_base=True, **review_tkw
         )
         stat = (data.get("diff") or "").strip()
         lines.append("Workspace git changes vs main (diff --stat, fresh):")
@@ -3755,7 +3778,9 @@ async def _build_review_verification(
     changes = None
     if task_id is not None:
         try:
-            changes = await _task_scoped_file_changes(task_id, room_id, db)
+            changes = await _task_scoped_file_changes(
+                task_id, room_id, db, tree=review_tree
+            )
         except Exception as exc:
             logger.warning(
                 "proxy_session: task-scoped file changes for CM review failed: %s", exc
@@ -3769,7 +3794,7 @@ async def _build_review_verification(
         try:
             from app.core.memory_layer import _repo_snapshot
 
-            fresh = await _repo_snapshot(room_id, db)
+            fresh = await _repo_snapshot(room_id, db, **review_tkw)
             before = {f["path"]: f.get("version") for f in (start_snapshot or [])}
             diff_lines: list[str] = []
             ignored_snap = 0
@@ -3810,7 +3835,7 @@ async def _build_review_verification(
 
 
 async def _task_scoped_file_changes(
-    task_id: UUID, room_id: UUID, db: AsyncSession
+    task_id: UUID, room_id: UUID, db: AsyncSession, tree: Optional[str] = None
 ) -> Optional[list[str]]:
     """Files touched since the first proxy pair of *task_id* started.
 
@@ -3846,8 +3871,9 @@ async def _task_scoped_file_changes(
 
     from app.core import workspaced_client as wsd
 
+    tkw: dict[str, str] = {"tree": tree} if tree else {}
     try:
-        snapshot = await wsd.get_workspace_snapshot(str(room_id), max_previews=0)
+        snapshot = await wsd.get_workspace_snapshot(str(room_id), max_previews=0, **tkw)
     except Exception:
         return None  # fall back to pair-start snapshot comparison
 
@@ -4581,6 +4607,7 @@ async def _run_proxy_loop(
     _mcp_failure_counts: dict[str, int] = {}
     # Mid-task question/answer round trips between the agent and CM.
     _qa_rounds = 0
+    _qa_repeats = RepeatGuard(limit=_QA_REPEAT_LIMIT)
     # internal design notes Stage 6: the last unanswered mid-task
     # question from the agent, so the CM's answer turn can archive the pair.
     _last_agent_question = ""
@@ -4856,7 +4883,7 @@ async def _run_proxy_loop(
                                 if limit_reason == "token_budget"
                                 else f"filled the context window (limit {getattr(exc, 'context_window_limit', TOKEN_LIMIT):,} tokens)."
                                 if limit_reason == "context_window"
-                                else f"{preflight_detail} Reduce the task context size or simplify the handoff."
+                                else f"{preflight_detail} Shorten the goal description, the task description or the handoff."
                                 if preflight_detail is not None
                                 else "repeated the same tool error; automatic retries were stopped."
                                 if limit_reason == "repeated_tool_error"
@@ -4966,7 +4993,10 @@ async def _run_proxy_loop(
             # this turn lived only in the tool loop's working list; keep them
             # in the agent's history so later turns still know about them.
             _task_interject.persist_in_history(
-                agent_history, _loop_signals.pop("interjections", None)
+                agent_history,
+                await _task_interject.settle_for_history(
+                    _loop_signals.pop("interjections", None), task.id, db
+                ),
             )
 
             if a_text is None and a_tool is None:
@@ -5158,6 +5188,7 @@ async def _run_proxy_loop(
             _qa_rounds += 1
             if not _stall:
                 _last_agent_question = agent_reply
+                _qa_repeats.observe(agent_reply)
             logger.info(
                 "proxy_session: %s from agent for task %s (round %d, turn %d)",
                 "STALL intervention" if _stall else "mid-task message",
@@ -5218,6 +5249,23 @@ async def _run_proxy_loop(
             else:
                 cm_history.append({"role": "user", "content": _MID_TASK_NOTE + agent_reply})
             _save_history(cm_session, cm_history)
+            _loop_stop = _qa_loop_stop(task.title, _qa_rounds, _qa_repeats)
+            if _loop_stop is not None:
+                logger.warning(
+                    "proxy_session: %s for task %s (round %d, repeats %d) — stopping the pair",
+                    _loop_stop[0], task.id, _qa_rounds, _qa_repeats.count,
+                )
+                await _block_proxy_for_runtime_failure(
+                    agent_session, cm_session, task, db,
+                    reason=_loop_stop[0], content=_loop_stop[1],
+                    metadata={
+                        "turns": _turn + 1,
+                        "qa_rounds": _qa_rounds,
+                        "repeat_count": _qa_repeats.count,
+                    },
+                    allow_auto_retry=False,
+                )
+                return True
             await emit_status(
                 room_id,
                 AgentStatus.WAITING_PEER,
@@ -5857,6 +5905,30 @@ async def _run_proxy_loop(
             logger.exception(
                 "proxy_session: failed to block task %s after max turns", task.id
             )
+
+
+def _qa_loop_stop(
+    task_title: str, qa_rounds: int, repeats: RepeatGuard
+) -> tuple[str, str] | None:
+    """(block reason, room message) once the agent↔CM dialogue must end, else None."""
+    if repeats.tripped:
+        return (
+            "proxy_qa_repeat",
+            f"Task '{task_title}' stopped: the agent sent ChatMaster the same message "
+            f"{repeats.count} times in a row without delivering the task. This usually "
+            "means the agent's model or provider cannot do the work (for example it "
+            "reports that its tools are missing). Check the agent's model and provider "
+            "settings, then press Retry.",
+        )
+    if _QA_HARD_LIMIT > 0 and qa_rounds >= _QA_HARD_LIMIT:
+        return (
+            "proxy_qa_limit",
+            f"Task '{task_title}' stopped: the agent and ChatMaster exchanged "
+            f"{qa_rounds} question/answer rounds, but the task was never delivered. "
+            "Clarify the task wording or check the agent's model and provider, then "
+            "press Retry.",
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -7001,6 +7073,22 @@ async def handle_task_created(
             await notice.emit(task, db)
             return
 
+    # Parallel-task slots (core/room_slots.py): every running task shares the
+    # room's one workspace, so a task beyond the room's base starts only while
+    # its memory has room to spare. The admission lock is held until the claim
+    # (or the queue entry) below commits.
+    from app.core.room_slots import admit, needs_slot, queue_task
+
+    admission = await admit(room_id, db) if await needs_slot(task, db) else None
+    if admission is not None and not admission.ok:
+        await queue_task(
+            task, admission, db,
+            resume=resume,
+            rework_feedback=rework_feedback,
+            auto_retry_started_at=auto_retry_started_at,
+        )
+        return
+
     # A run id is the durable ownership fence for this background coroutine.
     # Retry/Cancel/Pause can revoke it from another worker without relying on
     # this process's in-memory Session identity map.
@@ -7029,6 +7117,8 @@ async def handle_task_created(
         "runtime_state": "running",
         "stop_requested_at": None,
         "stop_reason": None,
+        "queued_at": None,
+        "queued_dispatch": None,
     }
     if automatic:
         # A workspace pause can now see the claimed run even before this

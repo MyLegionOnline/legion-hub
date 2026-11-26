@@ -111,6 +111,7 @@ from app.core.session_close import (
     strip_tool_call_markup,
     _matrix_key,
 )
+from app.core.repeat_guard import REPEAT_LIMIT, repeat_streak
 from app.core.token_budget import (
     TOKEN_LIMIT,
     check_token_budget,
@@ -393,6 +394,51 @@ def _parse_xml_open_questions(inner: str) -> list[dict[str, Any]]:
     return items
 
 
+# Markup that never belongs inside a goal description: a closing tag of the
+# text-form plan, a reasoning block end, a second plan block, or DeepSeek's
+# native tool-call markup.  Its presence means the model leaked the rest of
+# its reply (reasoning, repeated plans, chat history) into the argument.
+_LEAKED_PLAN_MARKUP = re.compile(
+    r"</goal_description>|</?think>|<propose_plan>|<[|｜]DSML[|｜]",
+    re.IGNORECASE,
+)
+
+
+def _cut_leaked_markup(text: str) -> str:
+    """Return *text* up to the first leaked markup marker."""
+    m = _LEAKED_PLAN_MARKUP.search(text or "")
+    return (text[: m.start()] if m else (text or "")).strip()
+
+
+def _repair_tool_plan(plan_data: dict[str, Any]) -> dict[str, Any]:
+    """Undo a propose_plan tool call whose goal_description swallowed the reply.
+
+    DeepSeek models sometimes leave the goal_description argument unclosed and
+    keep writing: reasoning, the plan again in XML form, the chat history.
+    Every repeat ends up in the goal, the fallback plan step and each task
+    prompt.  A complete XML plan inside the argument is the model's own
+    finished plan and replaces the argument; otherwise the description is cut
+    at the first leaked marker.
+    """
+    desc = str(plan_data.get("goal_description") or "")
+    if not _LEAKED_PLAN_MARKUP.search(desc):
+        return plan_data
+    repaired = dict(plan_data)
+    recovered = _extract_propose_plan_from_text(desc)
+    if recovered:
+        for key, value in recovered.items():
+            if value and (key == "goal_description" or not repaired.get(key)):
+                repaired[key] = value
+    else:
+        repaired["goal_description"] = _cut_leaked_markup(desc)
+    logger.warning(
+        "propose_plan: goal_description carried leaked markup (%d chars) — "
+        "repaired to %d chars (recovered_xml=%s)",
+        len(desc), len(str(repaired.get("goal_description") or "")), bool(recovered),
+    )
+    return repaired
+
+
 def _extract_propose_plan_from_text(text: str) -> dict[str, Any] | None:
     """Detect a text-based propose_plan call from models that write JSON/XML instead of calling the tool.
 
@@ -406,14 +452,20 @@ def _extract_propose_plan_from_text(text: str) -> dict[str, Any] | None:
     import re as _re
 
     # --- Format 1: XML tags <propose_plan>...</propose_plan> ---
-    xml_m = _re.search(r'<propose_plan>(.*?)</propose_plan>', text, _re.DOTALL | _re.IGNORECASE)
-    if xml_m:
-        inner = xml_m.group(1)
+    # A looping model can open several blocks and close only some of them;
+    # the last block that holds no other opening tag is the one it finished.
+    xml_blocks = list(_re.finditer(
+        r'<propose_plan>((?:(?!<propose_plan>).)*?)</propose_plan>',
+        text,
+        _re.DOTALL | _re.IGNORECASE,
+    ))
+    if xml_blocks:
+        inner = xml_blocks[-1].group(1)
         def _xtag(tag: str) -> str:
             m = _re.search(rf'<{tag}>(.*?)</{tag}>', inner, _re.DOTALL | _re.IGNORECASE)
             return m.group(1).strip() if m else ""
         title = _xtag("goal_title")
-        desc = _xtag("goal_description")
+        desc = _cut_leaked_markup(_xtag("goal_description"))
         if title and desc:
             return {
                 "goal_title": title,
@@ -2476,7 +2528,10 @@ async def _context_window_limit(session: Session, db: AsyncSession) -> int:
         agent_id=agent_id,
         llm_config=None,
     )
-    return policy.context_window_limit
+    # The assembler enforces min(app window, model capacity); rotation must
+    # use the same effective cap, or a small-context model with the default
+    # 200k window would overflow before rotating.
+    return min(policy.context_window_limit, policy.model_context_limit)
 
 
 async def _successor_session(session: Session, db: AsyncSession) -> Session | None:
@@ -5330,7 +5385,7 @@ async def _process_user_turn(
 
     # 6a-propose: CM wants button confirmation — store plan, emit event, stay open
     if result.tool_input is not None and result.tool_name == "propose_plan":
-        plan_data = result.tool_input
+        plan_data = _repair_tool_plan(result.tool_input)
         # Add synthetic assistant message so history ends on assistant turn;
         # the next user message (after Edit) won't create two consecutive user roles.
         history.append({
@@ -5539,5 +5594,49 @@ async def _process_user_turn(
                 "(session %s): %s", session.id, exc,
             )
 
+    if str(session.kind or "").startswith("user_agent"):
+        _streak = repeat_streak(
+            [str(m.get("content") or "") for m in history if m.get("role") == "assistant"]
+        )
+        if REPEAT_LIMIT > 0 and _streak >= REPEAT_LIMIT:
+            await _close_on_reply_loop(session, _streak, db)
+            return True
+
     await _maybe_warn_growth(session, db)
     return True
+
+
+async def _close_on_reply_loop(session: Session, streak: int, db: AsyncSession) -> None:
+    """End a direct session whose agent keeps giving the same answer.
+
+    Its history is what talks every next turn into that answer again
+    (2026-11-19: "my tools are not declared" turn after turn), so the session is
+    closed without a summary call — nothing from it is worth carrying over — and
+    the user's next message starts a clean one.
+    """
+    logger.warning(
+        "user_sessions: session %s repeated the same reply %d times — closing",
+        session.id, streak,
+    )
+    session.closed_at = datetime.now(timezone.utc)
+    session.close_reason = "error"
+    db.add(session)
+    await db.flush()
+    await emit_event(
+        room_id=session.room_id,
+        event_type="SESSION_CLOSED",
+        content=(
+            f"Session {session.id} closed: the agent gave the same answer {streak} "
+            "times in a row. Your next message starts a fresh session. If the agent "
+            "repeats itself again, check its model and provider settings."
+        ),
+        db=db,
+        metadata={
+            "session_id": str(session.id),
+            "kind": session.kind,
+            "close_reason": "error",
+            "reason_detail": "reply_repeat",
+            "repeat_count": streak,
+        },
+    )
+    await db.commit()

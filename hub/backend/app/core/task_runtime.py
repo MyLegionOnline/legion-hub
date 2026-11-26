@@ -268,6 +268,16 @@ async def finalize_run(
     task.updated_at = datetime.utcnow()
     db.add(task)
     await db.flush()
+    # The run held one of the room's parallel-task slots; a queued task may
+    # take it once this transaction commits (core/room_slots.py).
+    room_id = getattr(task, "room_id", None)
+    if room_id is not None:
+        from app.core.proc_reaper import schedule_room_reap
+        from app.core.room_slots import schedule_queued_dispatch
+
+        schedule_queued_dispatch(room_id)
+        # ...and whatever the generation left running in the workspace goes.
+        schedule_room_reap(room_id)
     if task.runtime_state == RUNTIME_PAUSED:
         from app.core.events import emit_event
 

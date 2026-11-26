@@ -11,7 +11,7 @@ import {
   withManualComplete, confirmManualComplete, changeTaskState, userTransitionsFor,
   RequirementsChecklist, buildRequirementDecisions,
 } from './TaskPanel';
-import { RiskBadge, CiBadge, OriginBadge, AutoMergedNotice, openTaskCiLog, RequirementCodesChip } from './GitFlowCards';
+import { RiskBadge, CiBadge, OriginBadge, TaskTreeChip, AutoMergedNotice, openTaskCiLog, RequirementCodesChip } from './GitFlowCards';
 import { DialogueContextChip } from './DialogueContextChip';
 import { RuntimeStatusCard } from './RuntimeStatusCard';
 import { NOT_IN_ROOM_LABEL, onRoomAgentsChanged } from '../lib/roomAgents';
@@ -277,6 +277,8 @@ function TaskCard({ task, roomId, token, agents, onRefresh, onShowDiff, liveStat
           {task.runtime_state === 'running' && (
             <RuntimeStatusCard roomId={roomId} taskId={task.id} token={token} liveStatus={liveStatus} />
           )}
+
+          <TaskTreeChip task={task} />
 
           {(task.state === 'waiting_review' || task.state === 'blocked') && (task.risk || task.ci_status) && (
             <div className="flex flex-wrap items-center gap-1.5 pt-0.5">

@@ -659,7 +659,7 @@ function ToolLimitCard({ msg, taskActions, autoRetryBadge, autoRetryResolved }) 
   const [actioned, setActioned] = useState(null); // 'resumed' | 'handed_off' | 'retried' | 'cancelled'
   const [pending, setPending] = useState(false);
   const [error, setError] = useState(null);
-  const { task_title, agent_nickname, reason } = msg.metadata || {};
+  const { task_title, agent_nickname, reason, estimated_input_tokens, context_cap } = msg.metadata || {};
   const taskId = msg.taskId || msg.metadata?.task_id;
   const canAct = taskActions && taskId && !actioned;
   const isTokenLimit = reason === 'token_budget';
@@ -751,7 +751,11 @@ function ToolLimitCard({ msg, taskActions, autoRetryBadge, autoRetryResolved }) 
                 <>
                   The task <span className="font-medium" style={{ color: 'var(--text-primary)' }}>"{task_title || '…'}"</span>{' '}
                   cannot be sent to the agent{' '}
-                  <span className="font-medium" style={{ color: 'var(--accent-light)' }}>@{agent_nickname || 'agent'}</span>: the system prompt (task description, handoff, tool schemas) by itself exceeds the input window limit. Shorten the task description or the continuation context and restart.
+                  <span className="font-medium" style={{ color: 'var(--accent-light)' }}>@{agent_nickname || 'agent'}</span>: the starting prompt
+                  {estimated_input_tokens && context_cap
+                    ? ` (about ${Number(estimated_input_tokens).toLocaleString('en-US')} tokens, limit ${Number(context_cap).toLocaleString('en-US')})`
+                    : ''}{' '}
+                  exceeds the input window before any work starts. It holds the goal and its plan, the task description, the handoff, agent memory and tool schemas — check the goal description first, then shorten what is too long and restart.
                 </>
               ) : isRepeatedToolError ? (
                 <>
@@ -3362,6 +3366,9 @@ const EVENT_ICONS = {
   TASK_AUTO_RETRY_SKIPPED: <AlertTriangle size={11} style={{ color: '#f97316' }} />,
   TASK_DISPATCH_FAILED: <AlertTriangle size={11} style={{ color: '#ef4444' }} />,
   TASK_DISPATCH_STARTED: <Cpu size={11} style={{ color: '#06b6d4' }} />,
+  TASK_QUEUED:       <Hourglass size={11} style={{ color: '#a78bfa' }} />,
+  // Room memory nearly full (core/memory_gate.py): raise the limit on the Workspace tab.
+  ROOM_MEMORY_LOW:   <AlertTriangle size={11} style={{ color: '#f97316' }} />,
   TASK_RESUMED:      <Play size={11} style={{ color: '#22c55e' }} />,
   // internal design notes Stage 5: blocked empty-overwrite warnings, always
   // user-visible (not just logged) — see workspace_fs.fs_write_file / git_sync.sync_branch.
@@ -4641,7 +4648,7 @@ function RoomChat({ room, token, pullConflictFocus, onDelete, onRoomStateChange,
             eventType === 'TASK_STALLED' || eventType === 'TASK_RETRIED' || eventType === 'TASK_DISPATCH_FAILED' ||
             eventType === 'TOOL_LIMIT_REACHED' || eventType === 'TASK_RESUMED' || eventType === 'TASK_HANDOFF_CREATED' ||
             eventType === 'TASK_CHANGES_REQUESTED' || eventType === 'SESSION_STARTED' ||
-            eventType === 'TASK_DISPATCH_STARTED' ||
+            eventType === 'TASK_DISPATCH_STARTED' || eventType === 'TASK_QUEUED' ||
             // waiting_reply_safeguard: a reply to a parked task moved it
             // (approved/merged, re-opened, or blocked pending the user).
             eventType === 'WAITING_REPLY_RESOLVED' || eventType === 'TASK_BLOCKED') {

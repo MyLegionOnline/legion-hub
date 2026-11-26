@@ -60,6 +60,20 @@ class FindFileTool(Tool):
         except WorkspacePathError as exc:
             return f"Error: invalid dir: {exc}"
         rid = str(ctx.room_id)
+        from app.core.tools.registry import ctx_tree
+
+        tree = await ctx_tree(ctx)
+        if tree:
+            # A task's own tree: search there, not in the shared /workspace.
+            from app.core.task_trees import tree_container_path
+
+            base = tree_container_path(tree)
+            if search_dir.rstrip("/") == "/workspace":
+                search_dir = base
+            elif search_dir.startswith("/workspace/") and not search_dir.startswith(
+                "/workspace/.legion/"
+            ):
+                search_dir = base + search_dir[len("/workspace"):]
 
         # Try container exec first
         ws_res = await ctx.db.execute(
@@ -67,16 +81,19 @@ class FindFileTool(Tool):
         )
         ws = ws_res.scalar_one_or_none()
         if ws is not None and ws.status == "running":
-            result = await _find_in_container(rid, name, search_dir)
+            result = await _find_in_container(rid, name, search_dir, tree)
             if result is not None:
                 return result
 
         # Fallback: walk workspace tree via file API
-        return await _find_fallback(rid, name)
+        return await _find_fallback(rid, name, tree)
 
 
-async def _find_in_container(rid: str, name: str, search_dir: str) -> str | None:
+async def _find_in_container(
+    rid: str, name: str, search_dir: str, tree: str | None = None
+) -> str | None:
     from app.core import workspaced_client as wsd
+    from app.core.task_trees import tree_container_path
 
     # Escape the name for shell safety — only allow safe glob characters
     safe_name = name.replace("'", "")
@@ -104,7 +121,9 @@ async def _find_in_container(rid: str, name: str, search_dir: str) -> str | None
     paths = []
     for raw in stdout.splitlines():
         value = raw.strip().replace("\\", "/")
-        if value.startswith("/workspace/"):
+        if tree and value.startswith(tree_container_path(tree) + "/"):
+            value = value[len(tree_container_path(tree)) + 1 :]
+        elif value.startswith("/workspace/"):
             value = value[len("/workspace/") :]
         elif value == "/workspace":
             value = ""
@@ -117,13 +136,13 @@ async def _find_in_container(rid: str, name: str, search_dir: str) -> str | None
     return _truncate(out)
 
 
-async def _find_fallback(rid: str, name: str) -> str:
+async def _find_fallback(rid: str, name: str, tree: str | None = None) -> str:
     from app.core import workspaced_client as wsd
 
-    tree = await wsd.get_workspace_tree(rid)
+    entries = await wsd.get_workspace_tree(rid, **({"tree": tree} if tree else {}))
     matches: list[str] = []
 
-    for entry in sorted(tree, key=lambda e: e.get("path", "")):
+    for entry in sorted(entries, key=lambda e: e.get("path", "")):
         fp = entry.get("path", "").lstrip("/")
         if not fp:
             continue

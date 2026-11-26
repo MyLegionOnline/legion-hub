@@ -646,6 +646,18 @@ async def _maybe_complete_goal(rid: UUID, task: Task, db: AsyncSession) -> None:
         logger.warning("divergence: goal %s completion check failed: %s", task.goal_id, exc)
 
 
+async def _release_task_tree(rid: UUID, task: Task, db: AsyncSession) -> None:
+    """Drop the task's own worktree (best effort; pending files are parked in a commit)."""
+    if not getattr(task, "worktree", None):
+        return
+    from app.core.task_trees import remove_task_tree
+
+    try:
+        await remove_task_tree(rid, task, db)
+    except Exception as exc:  # noqa: BLE001 — the git call below reports a held branch
+        logger.warning("divergence: task %s tree not released: %s", task.id, exc)
+
+
 async def resolve_divergence(
     room_id: "UUID | str",
     task: Task,
@@ -676,6 +688,11 @@ async def resolve_divergence(
             return {"ok": False, "detail": f"could not re-check the divergence: {exc}"}
         if not fresh.get("ok"):
             return {"ok": False, "detail": fresh.get("error") or "the divergence cannot be read"}
+
+    if decision in ("take_branch", "delete_branch"):
+        # The task's own worktree holds the branch: park it (the branch keeps the
+        # files) so the merge reads them and the delete is not refused by git.
+        await _release_task_tree(rid, task, db)
 
     if decision == "take_branch":
         from app.core.room_git_flow import keep_live_head
@@ -832,6 +849,7 @@ async def _spawn_rework_task(rid: UUID, task: Task, base: str, note: str | None,
     # longer flags it, it just lingers until the next cleanup.
     backup_ref = None
     if stale_branch:
+        await _release_task_tree(rid, task, db)
         try:
             res = await wsd.git_discard_branch_workspace(
                 str(rid), stale_branch, working_branch=await _room_working_branch(rid, db)

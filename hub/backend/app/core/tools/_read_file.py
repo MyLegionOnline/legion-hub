@@ -89,8 +89,12 @@ class ReadFileTool(Tool):
 
         # Keep the legacy container-facing prefix at the HTTP boundary; all
         # state, observations, and subsequent tool comparisons use ``path``.
+        from app.core.task_trees import tree_for_path
+        from app.core.tools.registry import ctx_tree
+
+        tree = tree_for_path(await ctx_tree(ctx), path)
         content = await wsd.read_workspace_file(
-            str(ctx.room_id), f"/workspace/{path}"
+            str(ctx.room_id), f"/workspace/{path}", **({"tree": tree} if tree else {})
         )
         if content is None:
             try:

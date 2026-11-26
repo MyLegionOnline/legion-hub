@@ -87,3 +87,23 @@ def test_restore_requires_matching_checkpoint_config_and_desired_state():
     assert should_restore_declared_service(
         process, {"desired_state": "stopped", "config_hash": digest}
     ) == (False, "checkpoint_desired_state_stopped")
+
+
+@pytest.mark.parametrize("cwd", [".legion/wt", ".legion/wt/32093f97", ".legion/wt/32093f97/app"])
+def test_service_cwd_in_a_task_tree_is_rejected(cwd):
+    # A task's tree is deleted with the task; the service would stay as junk
+    # in the registry and in the git-tracked manifest.
+    with pytest.raises(ServiceValidationError, match=r"\.legion/wt/.*bash\(background=true\)"):
+        normalize_declaration(_web_service(cwd=cwd))
+
+
+def test_service_environment_root_in_a_task_tree_is_rejected():
+    environment = {**_web_service()["environment"], "root": ".legion/wt/c2d0fba4"}
+    with pytest.raises(ServiceValidationError, match="environment.root"):
+        normalize_declaration(_web_service(environment=environment))
+
+
+@pytest.mark.parametrize("cwd", [".", ".legion-app", "apps/.legion/wt"])
+def test_service_cwd_outside_task_trees_still_allowed(cwd):
+    environment = {**_web_service()["environment"], "root": "."}
+    assert normalize_declaration(_web_service(cwd=cwd, environment=environment))["cwd"] == cwd

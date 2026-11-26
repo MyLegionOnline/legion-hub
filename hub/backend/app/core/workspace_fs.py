@@ -48,7 +48,9 @@ class EmptyOverwriteBlockedError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
-async def fs_list_files(room_id: UUID, db: AsyncSession) -> list[dict[str, Any]]:
+async def fs_list_files(
+    room_id: UUID, db: AsyncSession, tree: Optional[str] = None
+) -> list[dict[str, Any]]:
     """Return lightweight file list from the volume snapshot.
 
     Returns list of {path, version, updated_at, line_count, size, mtime,
@@ -56,7 +58,7 @@ async def fs_list_files(room_id: UUID, db: AsyncSession) -> list[dict[str, Any]]
     """
     from app.core import workspaced_client as wsd
 
-    snapshot = await wsd.get_workspace_snapshot(str(room_id), max_previews=0)
+    snapshot = await wsd.get_workspace_snapshot(str(room_id), max_previews=0, **({"tree": tree} if tree else {}))
     generation = snapshot.get("generation") or {}
     revision = int(generation.get("revision", 0))
     return [
@@ -77,12 +79,14 @@ async def fs_list_files(room_id: UUID, db: AsyncSession) -> list[dict[str, Any]]
     ]
 
 
-async def fs_list_files_short(room_id: UUID, db: AsyncSession) -> list[dict[str, Any]]:
+async def fs_list_files_short(
+    room_id: UUID, db: AsyncSession, tree: Optional[str] = None
+) -> list[dict[str, Any]]:
     """Return [{path, version, fingerprint, generation}] — cheaper variant
     for system-prompt snapshots."""
     from app.core import workspaced_client as wsd
 
-    snapshot = await wsd.get_workspace_snapshot(str(room_id), max_previews=0)
+    snapshot = await wsd.get_workspace_snapshot(str(room_id), max_previews=0, **({"tree": tree} if tree else {}))
     return [
         {
             "path": normalize_ws_path(item.get("path", "")),
@@ -94,7 +98,9 @@ async def fs_list_files_short(room_id: UUID, db: AsyncSession) -> list[dict[str,
     ]
 
 
-async def fs_read_file(room_id: UUID, path: str, db: AsyncSession) -> Optional[str]:
+async def fs_read_file(
+    room_id: UUID, path: str, db: AsyncSession, tree: Optional[str] = None
+) -> Optional[str]:
     """Return file content from the workspace volume.
 
     Stage 6.3: the legacy fallback to ``RepoFile.content`` / S3 is gone —
@@ -105,7 +111,7 @@ async def fs_read_file(room_id: UUID, path: str, db: AsyncSession) -> Optional[s
     from app.core import workspaced_client as wsd
 
     normalized = normalize_ws_path(path)
-    return await wsd.read_workspace_file(str(room_id), normalized)
+    return await wsd.read_workspace_file(str(room_id), normalized, **({"tree": tree} if tree else {}))
 
 
 async def fs_write_file(

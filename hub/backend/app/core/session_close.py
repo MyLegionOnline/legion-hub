@@ -1684,6 +1684,17 @@ async def _flush_cheap_summary(
     history = [m for m in (session.context_snapshot or {}).get("messages", []) if isinstance(m, dict)]
     if not any(m.get("role") == "assistant" for m in history):
         return None
+    from app.db.release import holds_xact_lock
+
+    if holds_xact_lock(db):
+        # The close runs under a row lock: a model call here would pin the
+        # connection for its whole duration (E4, room_parallel_tasks_memory_plan).
+        # The deterministic summary is the caller's fallback.
+        logger.info(
+            "session_close: cheap summary skipped for session %s — close holds a row lock",
+            session.id,
+        )
+        return None
     try:
         from app.core.proxy_session import _build_summary_request, _call_compact_summary
         from app.core.secrets.runtime import resolve_agent_secret

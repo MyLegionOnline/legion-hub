@@ -94,6 +94,7 @@ def _make_ctx() -> tuple[ToolContext, MagicMock, MagicMock]:
 
     db.execute = AsyncMock(side_effect=lambda q: _make_result(ws))
     ctx = ToolContext(room_id=uuid4(), session_id=uuid4(), task_id=uuid4(), db=db)
+    ctx.tree, ctx._tree_resolved = None, True  # old mode: no task worktree
     return ctx, db, ws
 
 

@@ -76,6 +76,12 @@ class RoomBase(SQLModel):
         default=3,
         sa_column=Column(Integer, nullable=False, server_default="3"),
     )
+    # Tasks that always run side by side; more only while the room's memory has
+    # room to spare (core/room_slots.py, internal design notes).
+    parallel_tasks_base: int = Field(
+        default=2,
+        sa_column=Column(Integer, nullable=False, server_default="2"),
+    )
 
 class Room(RoomBase, table=True):
     id: UUID = Field(default_factory=uuid4, primary_key=True, index=True)
@@ -86,6 +92,12 @@ class Room(RoomBase, table=True):
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc),
         sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()),
+    )
+    # Last time a task of the room got a slot (core/room_slots.py): a slot
+    # beyond the base waits until the room's memory reflects that start.
+    last_slot_admit_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), nullable=True),
     )
     # Durable marker for the two-system room deletion transaction.  It keeps
     # new workspace starts out while the external destroy is retried.

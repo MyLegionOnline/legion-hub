@@ -59,6 +59,47 @@ def _test_keyring() -> None:
 _test_keyring()
 
 
+@pytest.fixture(autouse=True)
+def _room_slots_open_outside_db_tests(request, monkeypatch):
+    """Parallel-task slots (core/room_slots.py) always admit in mock-DB tests.
+
+    Admission adds queries to the dispatcher and the watchdog; tests that feed
+    ``db.execute`` a fixed list of results would otherwise see them shifted.
+    The slots have their own unit and PostgreSQL tests (test_room_slots*.py).
+    """
+    if request.node.get_closest_marker("db") is not None:
+        return
+    from app.core import room_slots
+
+    async def _admit(room_id, db):
+        return room_slots.Admission(True, 0, room_slots.DEFAULT_BASE, room_slots.slots_cap(), "base")
+
+    async def _sweep(db):
+        return 0
+
+    async def _needs_slot(task, db):
+        return True
+
+    monkeypatch.setattr(room_slots, "admit", _admit)
+    monkeypatch.setattr(room_slots, "needs_slot", _needs_slot)
+    monkeypatch.setattr(room_slots, "sweep_queues", _sweep)
+    monkeypatch.setattr(room_slots, "schedule_queued_dispatch", lambda *a, **k: None)
+    # Same for the reaper of finished agents' processes (core/proc_reaper.py):
+    # it would otherwise call workspaced from a background task.
+    from app.core import proc_reaper
+
+    monkeypatch.setattr(proc_reaper, "schedule_room_reap", lambda *a, **k: None)
+
+    # And the memory gate of heavy bash commands (core/memory_gate.py): an
+    # unknown reading lets every command through without calling workspaced.
+    from app.core import memory_gate
+
+    async def _no_pressure(room_id):
+        return None
+
+    monkeypatch.setattr(memory_gate, "_pressure", _no_pressure)
+
+
 @pytest.fixture
 def mcp_weekly_grant(monkeypatch):
     """A weekly MCP credit grant of 50 credits, as the cloud's tariffs give one.

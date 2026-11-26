@@ -135,6 +135,7 @@ class _NestedDb:
         self.commit = AsyncMock()
         self.rollback = AsyncMock()
         self.added = []
+        self.statements = []
 
     def begin_nested(self):
         from contextlib import asynccontextmanager
@@ -150,8 +151,10 @@ class _NestedDb:
             raise RuntimeError("db down")
         from unittest.mock import MagicMock
 
+        self.statements.append(a[0] if a else None)
         res = MagicMock()
         res.scalars.return_value.all.return_value = self.rows
+        res.scalars.return_value.first.return_value = self.rows[0] if self.rows else None
         return res
 
     def add(self, obj):
@@ -194,6 +197,21 @@ async def test_stamp_messages_keeps_the_mark_in_bubble_metadata():
     db = _NestedDb([], fail=True)  # no message ids → no query at all
     await ti._stamp_messages([TaskInterjection(room_id=uuid.uuid4(), task_id=uuid.uuid4(), text="x")],
                              "delivered_at", when, db)
+
+
+@pytest.mark.asyncio
+async def test_deliver_pending_empty_queue_takes_no_row_lock():
+    """No queued message → one plain read, no FOR UPDATE, no commit.
+
+    A ``FOR UPDATE`` flags the loop's transaction, and ``release_db`` then
+    keeps its connection across the model wait (E4: pool exhausted with four
+    tasks running).
+    """
+    db = _NestedDb([])
+    assert await ti.deliver_pending(uuid.uuid4(), uuid.uuid4(), db) == []
+    assert len(db.statements) == 1
+    assert db.statements[0]._for_update_arg is None
+    db.commit.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -246,3 +264,79 @@ async def test_tool_loop_delivers_before_next_request(context_role, delivered):
     assert all(not (a == b == "user") for a, b in zip(roles, roles[1:]))
     assert history == [{"role": "user", "content": "hi"}]
     assert bool(signals.get("interjections")) is delivered
+
+
+def _note(text: str) -> str:
+    return ti.format_note([text])
+
+
+def test_settle_answered_openai_marks_the_note_after_a_reply():
+    note = _note("service is not your branch")
+    working = [
+        {"role": "user", "content": "task"},
+        {"role": "tool", "tool_call_id": "a", "content": "ok"},
+        {"role": "user", "content": note},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "r"}]},
+        {"role": "tool", "tool_call_id": "r", "content": "Delivered to the user. Continue the task."},
+    ]
+    original = working[2]
+    changed = ti.settle_answered(working)
+    new = working[2]["content"]
+    assert new.startswith("[MESSAGE FROM THE USER DURING THE TASK — ALREADY ANSWERED")
+    assert "> service is not your branch" in new
+    assert "reply_to_user tool (your turn" not in new
+    assert changed == {note: new}
+    assert original["content"] == note  # dict replaced, not mutated
+    assert ti.settle_answered(working) == {}  # idempotent
+
+
+def test_settle_answered_leaves_an_unanswered_note():
+    note = _note("hurry up")
+    working = [
+        {"role": "tool", "tool_call_id": "r", "content": "Delivered to the user. Continue the task."},
+        {"role": "user", "content": note},
+    ]
+    assert ti.settle_answered(working) == {}
+    assert working[1]["content"] == note
+
+
+def test_settle_answered_one_reply_answers_the_oldest_note_only():
+    first, second = _note("first"), _note("second")
+    working = [
+        {"role": "user", "content": first},
+        {"role": "user", "content": second},
+        {"role": "tool", "tool_call_id": "r", "content": "Delivered to the user. Continue the task."},
+    ]
+    ti.settle_answered(working)
+    assert "ALREADY ANSWERED" in working[0]["content"]
+    assert working[1]["content"] == second
+
+
+def test_settle_answered_anthropic_block_answered_by_a_later_tool_result():
+    note = _note("status?")
+    msg = {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x", "content": "ok"}]}
+    working = [{"role": "user", "content": "task"}, msg]
+    ti.inject_anthropic(working, note)
+    working.append({"role": "assistant", "content": [{"type": "tool_use", "id": "r"}]})
+    working.append({
+        "role": "user",
+        "content": [{
+            "type": "tool_result", "tool_use_id": "r",
+            "content": [{"type": "text", "text": "Delivered to the user. Continue the task."}],
+        }],
+    })
+    ti.settle_answered(working)
+    assert "ALREADY ANSWERED" in working[1]["content"][-1]["text"]
+    assert working[1]["content"][0]["type"] == "tool_result"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("open_row, answered", [(None, True), (uuid.uuid4(), False)])
+async def test_settle_for_history_marks_notes_when_nothing_is_open(open_row, answered):
+    note = _note("skip the HTTP checks")
+    result = SimpleNamespace(scalars=lambda: SimpleNamespace(first=lambda: open_row))
+    db = SimpleNamespace(execute=AsyncMock(return_value=result))
+    out = await ti.settle_for_history([note], uuid.uuid4(), db)
+    assert ("ALREADY ANSWERED" in out[0]) is answered
+    assert "> skip the HTTP checks" in out[0]
+    assert await ti.settle_for_history(None, uuid.uuid4(), db) is None

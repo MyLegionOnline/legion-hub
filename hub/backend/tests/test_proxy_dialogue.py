@@ -391,6 +391,49 @@ class TestMidTaskDialogue:
         assert call.args[1] == "proxy_max_turns"
         assert call.kwargs["extra_meta"]["qa_rounds"] == 2
 
+    @pytest.mark.asyncio
+    async def test_qa_hard_limit_blocks_before_the_turn_cap(self):
+        """2026-11-20: 22 undelivered rounds; the hard limit ends the pair itself."""
+        emitted: list[str] = []
+        script: list[tuple] = []
+        for i in range(10):
+            script.append(_text(f"Question number {i} about chapter {i * 7}: which file?"))
+            script.append(_text(f"Answer {i}."))
+
+        with patch.object(proxy_session, "_QA_HARD_LIMIT", 3):
+            result = await _run(script, emitted)
+
+        result["block_stalled_task"].assert_awaited_once()
+        call = result["block_stalled_task"].await_args
+        assert call.args[1] == "proxy_qa_limit"
+        assert call.kwargs["extra_meta"]["qa_rounds"] == 3
+        assert call.kwargs["allow_auto_retry"] is False
+        # The third question never reached the CM: two answers only.
+        answers = [
+            m["content"] for m in _history(result["agent_session"])
+            if m["role"] == "user" and m["content"].startswith(_CM_ANSWER_NOTE)
+        ]
+        assert len(answers) == 2
+
+    @pytest.mark.asyncio
+    async def test_repeated_question_blocks_the_task(self):
+        emitted: list[str] = []
+        script: list[tuple] = []
+        for i in range(10):
+            script.append(_text(
+                "environment failure: workspace file tools (`read_file`, `edit_file`) "
+                f"are not declared for this agent instance{'.' * (i % 2)}"
+            ))
+            script.append(_text(f"Answer {i}: the tools are there."))
+
+        with patch.object(proxy_session, "_QA_REPEAT_LIMIT", 3):
+            result = await _run(script, emitted)
+
+        result["block_stalled_task"].assert_awaited_once()
+        call = result["block_stalled_task"].await_args
+        assert call.args[1] == "proxy_qa_repeat"
+        assert call.kwargs["extra_meta"]["repeat_count"] == 3
+
 
 # ---------------------------------------------------------------------------
 # The instrument itself: ChatMaster must be able to rewrite the task it owns

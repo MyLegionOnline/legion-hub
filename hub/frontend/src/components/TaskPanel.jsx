@@ -5,7 +5,7 @@ import {
   MessageSquarePlus,
 } from 'lucide-react';
 import { describeStatus, useTicker, BUSY_KINDS } from '../hooks/useAgentStatuses';
-import { RiskBadge, CiBadge, OriginBadge, AutoMergedNotice, openTaskCiLog, RequirementCodesChip } from './GitFlowCards';
+import { RiskBadge, CiBadge, OriginBadge, TaskTreeChip, AutoMergedNotice, openTaskCiLog, RequirementCodesChip } from './GitFlowCards';
 import { ModalPortal } from './shared';
 import { DialogueContextChip } from './DialogueContextChip';
 import { RuntimeStatusCard, InterjectForm } from './RuntimeStatusCard';
@@ -28,6 +28,11 @@ export const RETRYABLE_STATES = ['assigned', 'in_progress', 'blocked', 'pausing'
 export const RUNTIME_META = {
   blocked_by_dependencies: { label: 'Waiting for predecessor', color: '#fbbf24' },
   queued:                  { label: 'Queued',          color: 'var(--text-muted)' },
+  waiting_slot:            {
+    label: 'Waiting for a free slot',
+    color: '#a78bfa',
+    title: 'Enough tasks are already running in this room. This one starts by itself when one of them finishes.',
+  },
   dispatching:             { label: 'Starting…',       color: '#06b6d4' },
   running:                 { label: 'Running',        color: '#34d399' },
   needs_retry:             { label: 'Not started — Retry', color: '#f87171' },
@@ -40,7 +45,9 @@ export const RUNTIME_ACTIVE = new Set(['running', 'dispatching']);
 // Any runtime status where a "…→ in_progress" transition (Start/Resume/
 // Unblock/Rework) must not be offered: either it's already executing, or the
 // lifecycle contract says only the explicit Retry action may restart it.
-export const RUNTIME_BLOCKS_START = new Set(['running', 'dispatching', 'needs_retry', 'dispatch_failed']);
+export const RUNTIME_BLOCKS_START = new Set([
+  'running', 'dispatching', 'needs_retry', 'dispatch_failed', 'waiting_slot',
+]);
 
 // ── session-interruption reason formatting (internal design notes, part 4) ──
 // One formatter shared by the chat card (ChatWindow's ToolLimitCard), TaskPanel
@@ -98,7 +105,7 @@ export function describeInterruption(meta) {
     return `used ${(tokens_used || 0).toLocaleString('en-US')} of ${(tokens_limit || 100000).toLocaleString('en-US')} tokens`;
   }
   if (reason === 'context_window') {
-    return `filled the context window (limit ${(tokens_limit || 100000).toLocaleString('en-US')} tokens)`;
+    return `filled the context window (limit ${(tokens_limit || 200000).toLocaleString('en-US')} tokens)`;
   }
   return `made ${tool_calls_used ?? limit ?? 0} of ${tool_calls_limit ?? limit ?? 60} allowed calls`;
 }
@@ -171,7 +178,7 @@ export function RuntimeBadge({ task }) {
     <span
       className="text-[9px] px-1.5 py-0.5 rounded-full flex-shrink-0"
       style={{ background: `${meta.color}18`, color: meta.color, border: `1px solid ${meta.color}44` }}
-      title={task.dispatch_reason || undefined}
+      title={meta.title || task.dispatch_reason || undefined}
     >
       {meta.label}{elapsed ? ` · ${elapsed}` : ''}
     </span>
@@ -588,6 +595,8 @@ function TaskRow({ task, roomId, token, agents, onRefresh, liveStatus }) {
               <span className="text-[11px]" style={{ color: 'var(--text-muted)' }}>Unassigned</span>
             )}
           </div>
+
+          <TaskTreeChip task={task} />
 
           {/* description */}
           {task.description && (

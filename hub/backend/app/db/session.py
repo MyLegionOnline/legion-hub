@@ -337,6 +337,12 @@ END $$""",
     # Room auto-retry settings and task state.
     "ALTER TABLE room ADD COLUMN IF NOT EXISTS auto_retry_enabled BOOLEAN NOT NULL DEFAULT true",
     "ALTER TABLE room ADD COLUMN IF NOT EXISTS auto_retry_max INTEGER NOT NULL DEFAULT 3",
+    "ALTER TABLE room ADD COLUMN IF NOT EXISTS parallel_tasks_base INTEGER NOT NULL DEFAULT 2",
+    "ALTER TABLE room ADD COLUMN IF NOT EXISTS last_slot_admit_at TIMESTAMPTZ",
+    "ALTER TABLE task ADD COLUMN IF NOT EXISTS queued_at TIMESTAMPTZ",
+    "ALTER TABLE task ADD COLUMN IF NOT EXISTS queued_dispatch JSON",
+    "CREATE INDEX IF NOT EXISTS ix_task_queued ON task(room_id, queued_at) "
+    "WHERE queued_at IS NOT NULL",
     "ALTER TABLE task ADD COLUMN IF NOT EXISTS auto_retry_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE task ADD COLUMN IF NOT EXISTS auto_retry_at TIMESTAMPTZ",
     "ALTER TABLE task ADD COLUMN IF NOT EXISTS auto_retry_reason VARCHAR",
@@ -1080,6 +1086,9 @@ END $$""",
     # overlapping-edit conflict refreshing the branch; drives the "Divergence
     # review" button and the DIVERGENCE_REVIEW card. Nullable, additive.
     "ALTER TABLE task ADD COLUMN IF NOT EXISTS divergence_state VARCHAR",
+    # ── internal design notes E1: the task's own git worktree ──
+    # Container path of ``.legion/wt/<task8>``; NULL = shared tree (old mode).
+    "ALTER TABLE task ADD COLUMN IF NOT EXISTS worktree VARCHAR",
     # ── The model a session's turns actually ran on ───────────────────────────
     # Stamped by track_llm_usage. Before this the Sessions tab derived the model
     # from the agent's *current* llm_config, so rebinding an agent rewrote the

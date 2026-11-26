@@ -382,7 +382,16 @@ async def test_resolved_secret_reaches_exec_env_and_is_masked_in_output():
             ctx, {"cmd": "deploy.sh $DEPLOY_TOKEN", "secrets": ["DEPLOY_TOKEN"]}
         )
 
-    assert mock_exec.await_args.kwargs["env"] == {"DEPLOY_TOKEN": "supersecretvalue"}
+    # Besides the secret, every command carries its owner tag (core/proc_reaper.py).
+    assert mock_exec.await_args.kwargs["env"] == {
+        "DEPLOY_TOKEN": "supersecretvalue",
+        "LEGION_PROC_OWNER": f"task:{ctx.task_id}:-",
+        "TMPDIR": f"/tmp/legion/task-{ctx.task_id}",
+    }
+    # The scratch directory is created before the command itself runs.
+    assert mock_exec.await_args.args[1] == [
+        "bash", "-c", 'mkdir -p "$TMPDIR" 2>/dev/null; deploy.sh $DEPLOY_TOKEN',
+    ]
     assert "supersecretvalue" not in result
     assert "***MASKED:DEPLOY_TOKEN***" in result
 

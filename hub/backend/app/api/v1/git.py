@@ -1602,6 +1602,14 @@ async def delete_git_branch(
             detail="A task is running — stop it, then delete the branch.",
         )
 
+    if task is not None and getattr(task, "worktree", None):
+        # git refuses to delete a branch another worktree holds: release the
+        # task's own tree first (its pending files are parked on the branch,
+        # which the backup tag below keeps).
+        from app.core.task_trees import remove_task_tree
+
+        await remove_task_tree(room_id, task, db)
+
     try:
         res = await wsd.git_discard_branch_workspace(
             str(room_id), branch, working_branch=cfg.working_branch

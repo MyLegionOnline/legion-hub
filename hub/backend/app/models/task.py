@@ -135,6 +135,15 @@ class Task(SQLModel, table=True):
         sa_column=Column(DateTime(timezone=True), nullable=True),
     )
     auto_retry_reason: Optional[str] = Field(default=None)
+    # Set while a READY task waits for a free parallel-task slot in its room
+    # (core/room_slots.py); cleared when the task is claimed or leaves READY.
+    queued_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), nullable=True),
+    )
+    # How the queued dispatch was asked for ({resume, rework_feedback,
+    # auto_retry_started_at}) — replayed when a slot frees, also after a restart.
+    queued_dispatch: Optional[dict] = Field(default=None, sa_column=Column(JSON, nullable=True))
     rework_count: int = Field(
         default=0,
         sa_column=Column("rework_count", Integer, nullable=False, server_default="0"),
@@ -200,6 +209,14 @@ class Task(SQLModel, table=True):
     divergence_state: Optional[str] = Field(
         default=None,
         sa_column=Column("divergence_state", String, nullable=True),
+    )
+    # internal design notes E1: the task's own git worktree, as
+    # the room container sees it (``/workspace/.legion/wt/<task8>``). NULL — the
+    # task works in the room's shared tree (every task started before the
+    # ROOM_TASK_WORKTREES flag, and every task while the flag is off).
+    worktree: Optional[str] = Field(
+        default=None,
+        sa_column=Column("worktree", String, nullable=True),
     )
     # internal design notes Stage 0: how this task came into being.
     # NULL — the historic paths (ChatMaster plan, manual creation); a task

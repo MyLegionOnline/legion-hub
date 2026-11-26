@@ -48,6 +48,18 @@ _TASK_LOCKS_INFO_KEY = "legion_task_locks"
 _ENABLED = os.getenv("DB_RELEASE_BEFORE_AWAIT", "on").strip().lower() not in {"off", "0", "false", "no"}
 
 
+def holds_xact_lock(db: Any) -> bool:
+    """Whether ``db``'s open transaction holds a transaction-scoped lock.
+
+    ``release_db`` keeps such a transaction (and its connection) across the
+    wait it guards; callers with an optional wait can skip it instead.
+    """
+    try:
+        return db.in_transaction() is True and db.info.get(XACT_LOCK_INFO_KEY) is True
+    except Exception:
+        return False
+
+
 def mark_xact_lock(db: Any) -> None:
     """Record that ``db``'s current transaction holds a transaction-scoped lock."""
     try:

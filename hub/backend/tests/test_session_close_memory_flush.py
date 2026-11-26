@@ -331,3 +331,23 @@ def test_memory_flush_forced_reads_env_truthy_values():
 
         _os.environ.pop("MEMORY_FLUSH_FORCED", None)
         assert _memory_flush_forced() is True
+
+
+@pytest.mark.asyncio
+async def test_cheap_summary_skipped_while_the_close_holds_a_row_lock():
+    """E4: the summary's model call pinned a pooled connection under a lock."""
+    from app.core.session_close import _flush_cheap_summary
+    from app.db.release import XACT_LOCK_INFO_KEY
+
+    session = _session(
+        "cm_agent_proxy",
+        context_snapshot={"messages": [{"role": "user", "content": "x"},
+                                       {"role": "assistant", "content": "done"}]},
+    )
+    agent = types.SimpleNamespace(id=_AGENT_ID, owner_id=uuid.uuid4())
+    db = MagicMock()
+    db.in_transaction.return_value = True
+    db.info = {XACT_LOCK_INFO_KEY: True}
+    with patch("app.core.proxy_session._call_compact_summary", new_callable=AsyncMock) as call:
+        assert await _flush_cheap_summary(session, agent, {"provider": "openai"}, db) is None
+    call.assert_not_awaited()

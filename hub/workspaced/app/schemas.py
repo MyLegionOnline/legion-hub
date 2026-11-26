@@ -37,6 +37,22 @@ class StorageProjectResponse(BaseModel):
     assigned_room_ids: list[str] = Field(default_factory=list)
 
 
+class ProcReapRequest(BaseModel):
+    """Owner tags whose processes are to be stopped (room_parallel_tasks_memory_plan E2)."""
+
+    owners: list[str] = Field(default_factory=list, max_length=200)
+
+    @field_validator("owners")
+    @classmethod
+    def _valid_owners(cls, value: list[str]) -> list[str]:
+        from app.room_procs import valid_owner
+
+        bad = [o for o in value if not valid_owner(o)]
+        if bad:
+            raise ValueError(f"invalid owner tag(s): {bad[:3]}")
+        return value
+
+
 class MemoryUpdateRequest(BaseModel):
     """A running room's new memory limit (internal design notes §3a, T2a)."""
 
@@ -121,6 +137,9 @@ class FileWriteRequest(BaseModel):
     commit_message: Optional[str] = None
     # Commit only the written file, never other pending changes in the tree.
     commit_only_path: bool = False
+    # internal design notes: write into (and commit on the
+    # branch of) this task's own worktree (``<task8>``) instead of /workspace.
+    tree: Optional[str] = None
 
 
 class FileWriteResponse(BaseModel):
@@ -136,6 +155,7 @@ class FileWriteResponse(BaseModel):
 class ImportRequest(BaseModel):
     files: list[dict]  # [{path: str, content: str}]
     commit_message: Optional[str] = None
+    tree: Optional[str] = None  # a task's own worktree, see FileWriteRequest
 
 
 class ImportResponse(BaseModel):
@@ -181,6 +201,8 @@ class GitCommitRequest(BaseModel):
     # are rejected on `main`; explicit human operations (revert / restore)
     # pass True.
     allow_main_commit: bool = False
+    # Commit in this task's own worktree (``<task8>``), not the shared tree.
+    tree: Optional[str] = None
 
 
 class GitAuthorRequest(BaseModel):
@@ -332,6 +354,9 @@ class GitMergeRequest(BaseModel):
     theirs: bool = True
     strategy: Literal["ours", "theirs"] | None = None
     expected_tips: tuple[str, str] | None = None
+    # A task's own worktree (``<task8>``): merge inside it, on its branch
+    # (``target`` must be that branch); the shared HEAD is not touched.
+    tree: Optional[str] = None
 
 
 class GitRevertCommitRequest(BaseModel):
@@ -620,6 +645,9 @@ class ChecksRunRequest(BaseModel):
     # Optional branch / commit-ish to check out before running; omitted → run
     # against whatever the shared working tree currently has checked out.
     ref: Optional[str] = None
+    # A task's own worktree (``<task8>``): the checks run inside it, on its
+    # branch, and ``ref`` is ignored (nothing is checked out).
+    tree: Optional[str] = None
     timeout_sec: int = Field(default=600, ge=1, le=3600)
     # internal design notes Stage 6 — resolved Room variables/secrets
     # values (never persisted; the Hub backend resolves CheckSpec.secrets
@@ -763,3 +791,49 @@ class ServiceLogsResponse(BaseModel):
     content: str = ""
     cursor: int = 0
     rotated: bool = False
+
+
+# ── Task worktrees (internal design notes) ───────────────
+
+class WorktreeAddRequest(BaseModel):
+    """Give a task its own worktree on ``branch`` (created from ``base`` if new)."""
+
+    branch: str = Field(min_length=1, max_length=100)
+    base: Optional[str] = Field(default=None, max_length=100)
+
+
+class WorktreeInfo(BaseModel):
+    task8: str
+    path: str  # as the room container sees it
+    branch: Optional[str] = None
+    head: Optional[str] = None
+    locked: bool = False
+    prunable: bool = False
+    dirty: Optional[bool] = None
+
+
+class WorktreeAddResponse(BaseModel):
+    ok: bool
+    created: bool
+    task8: str
+    path: str
+    branch: Optional[str] = None
+    head: Optional[str] = None
+
+
+class WorktreeRemoveResponse(BaseModel):
+    ok: bool
+    removed: bool
+    task8: str
+    parked_sha: Optional[str] = None
+    branch: Optional[str] = None
+    error: Optional[str] = None
+    warning: Optional[str] = None
+
+
+class GitStatusResponse(BaseModel):
+    branch: Optional[str] = None
+    head: Optional[str] = None
+    dirty: bool = False
+    changes: list[str] = []
+    changes_count: int = 0

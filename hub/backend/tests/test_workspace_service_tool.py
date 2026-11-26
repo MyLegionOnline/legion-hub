@@ -220,3 +220,24 @@ async def test_start_on_running_service_points_to_restart(monkeypatch):
     tool._start_tree.assert_not_awaited()
     assert "health: ready" in result
     assert "action=restart" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tree", [None, "ab12cd34"])
+async def test_task_tree_is_told_services_run_the_integration_tree(monkeypatch, tree):
+    # internal design notes R6: a task with its own tree must not
+    # expect a room service to serve its branch.
+    from app.core.tools._workspace_service import TASK_TREE_SERVICE_NOTE
+
+    monkeypatch.setenv("WORKSPACE_SERVICES_ENABLED", "true")
+    tool = WorkspaceServiceTool()
+    tool._service = AsyncMock(
+        return_value=(SimpleNamespace(id=uuid4()), MagicMock(), _service(runtime_state="ready"))
+    )
+    ctx = _context()
+    ctx.tree = tree
+    ctx._tree_resolved = True
+
+    result = await tool.execute(ctx, {"action": "status", "slug": "catalog-web"})
+
+    assert result.endswith(TASK_TREE_SERVICE_NOTE) is bool(tree)

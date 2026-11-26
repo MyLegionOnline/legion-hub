@@ -57,12 +57,32 @@ def port_range() -> tuple[int, int]:
     return first, last
 
 
+_TASK_TREES_DIR = ".legion/wt"
+
+
+def _reject_task_tree(path: str, field: str) -> None:
+    """A room service must not live in a task's worktree.
+
+    The tree is deleted when its task ends, leaving a dead service in the
+    room's registry and in the git-tracked services manifest (Loki's friends,
+    2026-11-24: home-verify, moderation-verify).
+    """
+    if path == _TASK_TREES_DIR or path.startswith(_TASK_TREES_DIR + "/"):
+        raise ServiceValidationError(
+            f"{field} must not point into {_TASK_TREES_DIR}/ (a task's own tree, deleted when "
+            "the task ends). Room services run the integration tree. To check your task's "
+            "code over HTTP, start a dev server in your tree with bash(background=true) on a "
+            "free port, curl it, then bash_kill it."
+        )
+
+
 def _workspace_relative_path(value: object, field: str) -> str:
     path = str(value or "")
     if not path or path.startswith("/") or "\\" in path or (
         path != "." and any(part in {"", ".", ".."} for part in path.split("/"))
     ):
         raise ServiceValidationError(f"{field} must be a workspace-relative path")
+    _reject_task_tree(path, field)
     return path
 
 
@@ -126,6 +146,7 @@ def normalize_declaration(raw: dict[str, Any]) -> dict[str, Any]:
         cwd != "." and any(part in {"", ".", ".."} for part in cwd.split("/"))
     ):
         raise ServiceValidationError("cwd must be a workspace-relative path")
+    _reject_task_tree(cwd, "cwd")
     env = raw.get("env") or {}
     if not isinstance(env, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in env.items()):
         raise ServiceValidationError("env must be a string-to-string mapping")

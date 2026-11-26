@@ -76,9 +76,13 @@ class WriteFileTool(Tool):
             refusal = await room_storage_refusal(ctx.room_id, ctx.db)
             if refusal is not None:
                 return f"Error: {refusal}"
-        if ctx.task_id:
+        from app.core.tools.registry import ctx_tree
+
+        tree = await ctx_tree(ctx)
+        if ctx.task_id and not tree:
             # A gate merge may have moved the shared checkout off this task's
             # branch; the commit below must land on task/<id> regardless.
+            # (A task with its own worktree needs no pin: nobody moves its HEAD.)
             from app.core.room_git_flow import pin_task_head
 
             await pin_task_head(ctx.room_id, ctx.task_id, ctx.db)
@@ -86,7 +90,8 @@ class WriteFileTool(Tool):
         commit_msg = f"session:{ctx.session_id}: write {boundary_path}{task_ref}"
         try:
             await wsd.write_workspace_file(
-                str(ctx.room_id), boundary_path, content, commit_message=commit_msg
+                str(ctx.room_id), boundary_path, content, commit_message=commit_msg,
+                **({"tree": tree} if tree else {}),
             )
         except wsd.WorkspaceMainProtectedError:
             from app.core.room_git_flow import room_working_branch
@@ -102,7 +107,9 @@ class WriteFileTool(Tool):
             pass
         try:
             from app.core.tools._repo_map import invalidate_repo_map_path
-            invalidate_repo_map_path(str(ctx.room_id), path)
+            invalidate_repo_map_path(
+                f"{ctx.room_id}:{tree}" if tree else str(ctx.room_id), path
+            )
         except Exception:
             pass
         # Stage 6: no repofile metadata sync — the volume is the single

@@ -74,9 +74,14 @@ def uses_cumulative_limit() -> bool:
     """Whether the temporary legacy cumulative guard is enabled."""
     return context_limit_mode() == "cumulative"
 
-# Default enforced context-window budget (tokens). Matches TOKEN_LIMIT so that
-# agents without an explicit setting behave exactly as before.
-_CONTEXT_WINDOW_LIMIT_DEFAULT: int = _env_int("CONTEXT_WINDOW_LIMIT", 100_000)
+# Default enforced context-window budget (tokens) for agents without an
+# explicit setting.  Raised from 100k: large tasks were cut off at 100k,
+# while in practice none came close to 200k.  Still capped by the model's
+# own context limit when that is smaller.
+DEFAULT_CONTEXT_WINDOW_LIMIT: int = 200_000
+_CONTEXT_WINDOW_LIMIT_DEFAULT: int = _env_int(
+    "CONTEXT_WINDOW_LIMIT", DEFAULT_CONTEXT_WINDOW_LIMIT
+)
 
 
 def _as_bool(value: Any) -> bool | None:
@@ -118,7 +123,7 @@ class ContextPolicy:
     checkpoint_cap: int
     # Enforced per-call context-window budget set by the application.
     # Distinct from model_context_limit (provider capacity, read-only).
-    context_window_limit: int = 100_000
+    context_window_limit: int = DEFAULT_CONTEXT_WINDOW_LIMIT
     # When tool results are demoted to receipts.  ``active_tool_result_cap``
     # and ``keep_raw_results`` are only applied in "eager" mode.
     eviction_mode: EvictionMode = "on_demand"

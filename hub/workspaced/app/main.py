@@ -7,12 +7,14 @@ import os
 import struct
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 import app.config as config
 from fastapi import FastAPI, Depends, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.git_lock import GitWorkspaceBusyError
+from app.task_tree import TaskTreeError
 
 from app.auth import verify_token
 from app.docker_manager import DockerManager
@@ -44,6 +46,7 @@ from app.schemas import (
     FileWriteRequest,
     FileWriteResponse,
     MemoryUpdateRequest,
+    ProcReapRequest,
     GitApplyPatchRequest,
     GitArchiveResponse,
     GitAuthorRequest,
@@ -51,6 +54,11 @@ from app.schemas import (
     GitBranchRenameRequest,
     GitCommitRequest,
     GitCommitResponse,
+    GitStatusResponse,
+    WorktreeAddRequest,
+    WorktreeAddResponse,
+    WorktreeInfo,
+    WorktreeRemoveResponse,
     GitAdoptRequest,
     GitAdoptResponse,
     GitBackfillExcludesResponse,
@@ -195,6 +203,12 @@ async def _git_workspace_busy_handler(request: Request, exc: GitWorkspaceBusyErr
         content={"detail": str(exc), "busy": True, "room_id": exc.room_id},
         headers={"Retry-After": "5"},
     )
+
+
+@app.exception_handler(TaskTreeError)
+async def _task_tree_handler(request: Request, exc: TaskTreeError):
+    """A task tree that is malformed, missing, or unsafe (internal design notes)."""
+    return JSONResponse(status_code=exc.status, content={"detail": str(exc)})
 
 
 @app.get("/health")
@@ -343,6 +357,51 @@ async def workspace_stats(room_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get(
+    "/workspaces/{room_id}/pressure",
+    dependencies=[Depends(verify_token)],
+)
+async def workspace_pressure(room_id: str):
+    """Memory pressure inside the room, cached 5 s (room_parallel_tasks_memory_plan E0)."""
+    try:
+        return await docker_mgr.pressure(room_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("Failed to get memory pressure for %s", room_id)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get(
+    "/workspaces/{room_id}/procs",
+    dependencies=[Depends(verify_token)],
+)
+async def workspace_proc_owners(room_id: str):
+    """Agent processes alive in the room, by owner tag (room_parallel_tasks_memory_plan E2)."""
+    try:
+        return await docker_mgr.list_proc_owners(room_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("Failed to list agent processes for %s", room_id)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post(
+    "/workspaces/{room_id}/procs/reap",
+    dependencies=[Depends(verify_token)],
+)
+async def workspace_reap_procs(room_id: str, req: ProcReapRequest):
+    """Stop every process of finished owners: SIGTERM, then SIGKILL after a grace."""
+    try:
+        return await docker_mgr.reap_proc_owners(room_id, req.owners)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("Failed to reap agent processes for %s", room_id)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post(
     "/workspaces/{room_id}/memory",
     dependencies=[Depends(verify_token)],
@@ -441,9 +500,11 @@ async def workspace_proxy(room_id: str, port: int, path: str = "", qs: str = "")
     response_model=list[FileTreeEntry],
     dependencies=[Depends(verify_token)],
 )
-async def workspace_tree(room_id: str):
+async def workspace_tree(room_id: str, tree: str | None = None):
     try:
-        return await asyncio.to_thread(get_tree, room_id)
+        return await asyncio.to_thread(get_tree, room_id, tree)
+    except TaskTreeError:
+        raise
     except Exception as e:
         logger.exception("Failed to get tree for %s", room_id)
         raise HTTPException(status_code=500, detail=str(e))
@@ -471,6 +532,7 @@ async def workspace_snapshot(
     paths: list[str] | None = None,
     max_previews: int = 20,
     preview_chars: int = 600,
+    tree: str | None = None,
 ):
     """Return a consistent volume snapshot; RepoFile is never consulted."""
     try:
@@ -480,7 +542,10 @@ async def workspace_snapshot(
             preview_paths=paths,
             max_previews=max(0, min(max_previews, 100)),
             preview_chars=max(0, min(preview_chars, 4000)),
+            tree=tree,
         )
+    except TaskTreeError:
+        raise
     except Exception as e:
         logger.exception("Failed to snapshot workspace %s", room_id)
         raise HTTPException(status_code=500, detail=str(e))
@@ -503,7 +568,9 @@ async def workspace_generation(room_id: str):
     response_model=FileReadResponse,
     dependencies=[Depends(verify_token)],
 )
-async def workspace_read_file(room_id: str, path: str, rev: str | None = None):
+async def workspace_read_file(
+    room_id: str, path: str, rev: str | None = None, tree: str | None = None
+):
     try:
         path = normalize_workspace_path(path)
     except WorkspacePathError as exc:
@@ -514,7 +581,7 @@ async def workspace_read_file(room_id: str, path: str, rev: str | None = None):
         if content is None:
             raise HTTPException(status_code=404, detail=f"File {path!r} not found at revision {rev!r}")
         return FileReadResponse(path=path, content=content)
-    content = _read_file(room_id, path)
+    content = _read_file(room_id, path, tree=tree)
     if content is None:
         raise HTTPException(status_code=404, detail=f"File not found: {path}")
     return FileReadResponse(path=path, content=content)
@@ -524,12 +591,14 @@ async def workspace_read_file(room_id: str, path: str, rev: str | None = None):
     "/workspaces/{room_id}/outline",
     dependencies=[Depends(verify_token)],
 )
-async def workspace_outline(room_id: str, path: str, max_symbols: int = 40):
+async def workspace_outline(
+    room_id: str, path: str, max_symbols: int = 40, tree: str | None = None
+):
     try:
         path = normalize_workspace_path(path)
     except WorkspacePathError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    outline = get_outline(room_id, path, max_symbols=max_symbols)
+    outline = get_outline(room_id, path, max_symbols=max_symbols, tree=tree)
     if outline is None:
         raise HTTPException(status_code=404, detail=f"Text file not found: {path}")
     return outline
@@ -546,9 +615,11 @@ async def workspace_write_file(room_id: str, path: str, req: FileWriteRequest):
         path = normalize_workspace_path(path)
         result = await asyncio.to_thread(
             _write_file, room_id, path, req.content, commit_message=req.commit_message,
-            commit_only_path=req.commit_only_path,
+            commit_only_path=req.commit_only_path, tree=req.tree,
         )
         return FileWriteResponse(**result)
+    except TaskTreeError:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except MainBranchProtectedError as e:
@@ -568,12 +639,13 @@ async def workspace_delete_file(
     room_id: str,
     path: str,
     commit_message: str | None = None,
+    tree: str | None = None,
 ):
     from app.git_ops import MainBranchProtectedError
     try:
         path = normalize_workspace_path(path)
         deleted = await asyncio.to_thread(
-            _delete_file, room_id, path, commit_message=commit_message
+            _delete_file, room_id, path, commit_message=commit_message, tree=tree
         )
     except WorkspacePathError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -595,9 +667,11 @@ async def workspace_import(room_id: str, req: ImportRequest):
             for item in req.files
         ]
         result = await asyncio.to_thread(
-            import_files, room_id, req.files, commit_message=req.commit_message
+            import_files, room_id, req.files, commit_message=req.commit_message, tree=req.tree
         )
         return ImportResponse(**result)
+    except TaskTreeError:
+        raise
     except WorkspacePathError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except MainBranchProtectedError as exc:
@@ -794,14 +868,15 @@ async def git_commit_workspace(room_id: str, req: GitCommitRequest):
         git_init,
         is_git_repo,
     )
-    if not is_git_repo(room_id):
+    if not req.tree and not is_git_repo(room_id):
         git_init(room_id)
     from app.git_ops import _HOLD_BACK_REPORT_MAX
 
     report: dict = {}
     try:
         sha = git_commit(
-            room_id, req.message, allow_main_commit=req.allow_main_commit, report=report
+            room_id, req.message, allow_main_commit=req.allow_main_commit, report=report,
+            tree=req.tree,
         )
     except MainBranchProtectedError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
@@ -937,15 +1012,18 @@ async def git_log_workspace(
     path: str | None = None,
     limit: int = 20,
     rev_range: str | None = None,
+    tree: str | None = None,
 ):
     from app.git_ops import git_log, git_current_branch
     try:
         path = normalize_workspace_path(path, allow_empty=True) if path else None
         path = path or None
-        entries = git_log(room_id, path=path, limit=limit, rev_range=rev_range or None)
+        entries = git_log(
+            room_id, path=path, limit=limit, rev_range=rev_range or None, tree=tree
+        )
     except WorkspacePathError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    branch = git_current_branch(room_id)
+    branch = git_current_branch(room_id, tree=tree)
     return GitLogResponse(
         entries=entries,
         branch=branch,
@@ -964,6 +1042,7 @@ async def git_diff_workspace(
     path: str | None = None,
     stat: bool = False,
     merge_base: bool = False,
+    tree: str | None = None,
 ):
     from app.git_ops import git_diff
     try:
@@ -971,11 +1050,72 @@ async def git_diff_workspace(
         path = path or None
         diff = git_diff(
             room_id, from_ref=from_ref, to_ref=to_ref, path=path,
-            stat=stat, merge_base=merge_base,
+            stat=stat, merge_base=merge_base, tree=tree,
         )
     except WorkspacePathError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return GitDiffResponse(diff=diff, from_ref=from_ref, to_ref=to_ref)
+
+
+@app.get(
+    "/workspaces/{room_id}/git/status",
+    response_model=GitStatusResponse,
+    dependencies=[Depends(verify_token)],
+)
+async def git_status_workspace(room_id: str, tree: str | None = None):
+    """Branch, HEAD and pending changes of the shared tree or of one task tree."""
+    from app.git_ops import git_status
+    return GitStatusResponse(**await asyncio.to_thread(git_status, room_id, tree))
+
+
+# ── Task worktrees (internal design notes) ────────────────
+
+@app.get(
+    "/workspaces/{room_id}/worktrees",
+    response_model=list[WorktreeInfo],
+    dependencies=[Depends(verify_token)],
+)
+async def worktrees_list_workspace(room_id: str):
+    from app.git_ops import worktree_list
+    return await asyncio.to_thread(worktree_list, room_id)
+
+
+@app.post(
+    "/workspaces/{room_id}/worktrees/prune",
+    dependencies=[Depends(verify_token)],
+)
+async def worktrees_prune_workspace(room_id: str):
+    """Forget worktrees whose directory is gone (a task tree removed by hand)."""
+    from app.git_ops import worktree_prune
+    return await asyncio.to_thread(worktree_prune, room_id)
+
+
+@app.post(
+    "/workspaces/{room_id}/worktrees/{task8}",
+    response_model=WorktreeAddResponse,
+    dependencies=[Depends(verify_token)],
+)
+async def worktree_add_workspace(room_id: str, task8: str, req: WorktreeAddRequest):
+    """Create (or reuse) the task's own worktree on ``req.branch``.
+
+    Never moves the shared tree's HEAD. 409 when the tree exists on another
+    branch or the branch is checked out elsewhere.
+    """
+    from app.git_ops import worktree_add
+    result = await asyncio.to_thread(worktree_add, room_id, task8, req.branch, req.base)
+    return WorktreeAddResponse(**result)
+
+
+@app.delete(
+    "/workspaces/{room_id}/worktrees/{task8}",
+    response_model=WorktreeRemoveResponse,
+    dependencies=[Depends(verify_token)],
+)
+async def worktree_remove_workspace(room_id: str, task8: str, force: bool = False):
+    """Remove the task's worktree (pending work is committed first); the branch stays."""
+    from app.git_ops import worktree_remove
+    result = await asyncio.to_thread(worktree_remove, room_id, task8, force=force)
+    return WorktreeRemoveResponse(**result)
 
 
 @app.get(
@@ -1057,14 +1197,18 @@ async def git_rename_branch_workspace(room_id: str, req: GitBranchRenameRequest)
 )
 async def git_merge_branch_workspace(room_id: str, req: GitMergeRequest):
     from app.git_ops import git_merge_branch, git_current_branch
+    from app.task_tree import normalize_tree
+
+    tree = normalize_tree(req.tree)
     result = git_merge_branch(
         room_id, req.name,
         target=req.target or "main",
         theirs=req.theirs,
         message=req.message,
         **req.model_dump(include={"strategy", "expected_tips"}, exclude_unset=True),
+        **({"tree": tree} if tree else {}),
     )
-    branch = git_current_branch(room_id)
+    branch = git_current_branch(room_id, tree=tree) if tree else git_current_branch(room_id)
     return GitOpResponse(**result, branch=branch)
 
 
@@ -1384,10 +1528,19 @@ async def run_workspace_checks(room_id: str, req: ChecksRunRequest):
     from app.checks import run_checks
     from app.schemas import ExecRequest as _ExecRequest
 
+    from app.task_tree import container_path, normalize_tree, tree_path
+
+    # A task's own worktree: validate it exists, then run the checks inside it.
+    tree = normalize_tree(req.tree)
+    cwd = "/workspace"
+    if tree:
+        tree_path(Path(config.WORKSPACE_DATA_DIR) / room_id, tree)
+        cwd = container_path(tree)
+
     async def _exec_fn(cmd: list[str], timeout_sec: int, env: dict[str, str] | None) -> dict:
         result = await docker_mgr.exec(
             room_id,
-            _ExecRequest(cmd=cmd, cwd="/workspace", timeout_sec=timeout_sec, env=env),
+            _ExecRequest(cmd=cmd, cwd=cwd, timeout_sec=timeout_sec, env=env),
         )
         return {
             "exit_code": result.exit_code,
@@ -1404,6 +1557,7 @@ async def run_workspace_checks(room_id: str, req: ChecksRunRequest):
             timeout_sec=req.timeout_sec,
             exec_fn=_exec_fn,
             env=req.env,
+            tree=tree,
         )
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))

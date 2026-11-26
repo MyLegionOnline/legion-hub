@@ -92,18 +92,24 @@ class RepoMapTool(Tool):
         query = str(tool_input.get("query") or "").strip()
         max_tokens = max(50, min(int(tool_input.get("max_tokens") or 800), 800))
         outlines = []
-        scope = str(ctx.room_id)
+        from app.core.tools.registry import ctx_tree
+
+        rid = str(ctx.room_id)
+        task_tree = await ctx_tree(ctx)
+        tkw = {"tree": task_tree} if task_tree else {}
+        # Index and caches are per tree: a task's tree is not the shared one.
+        scope = f"{rid}:{task_tree}" if task_tree else rid
         try:
-            snapshot = await wsd.get_workspace_snapshot(scope, max_previews=0)
+            snapshot = await wsd.get_workspace_snapshot(rid, max_previews=0, **tkw)
             tree = snapshot.get("files") or []
             if not tree:
                 # Keep compatibility with older workspaced deployments and
                 # callers that only expose the tree endpoint.
-                tree = await wsd.get_workspace_tree(scope)
+                tree = await wsd.get_workspace_tree(rid, **tkw)
         except Exception:
             snapshot = {}
             try:
-                tree = await wsd.get_workspace_tree(scope)
+                tree = await wsd.get_workspace_tree(rid, **tkw)
             except Exception:
                 tree = []
         generation = snapshot.get("generation") or snapshot.get("workspace_generation")
@@ -149,7 +155,7 @@ class RepoMapTool(Tool):
                     outlines.append(cached)
                     continue
                 try:
-                    content = await wsd.read_workspace_file(scope, path)
+                    content = await wsd.read_workspace_file(rid, path, **tkw)
                 except Exception:
                     content = None
                 if not content or (content.startswith("data:") and ";base64," in content):
@@ -159,7 +165,7 @@ class RepoMapTool(Tool):
         else:
             # Tree unavailable: fall back to the per-file listing from the volume.
             try:
-                files = await wfs.fs_list_files(ctx.room_id, ctx.db)
+                files = await wfs.fs_list_files(ctx.room_id, ctx.db, **tkw)
             except Exception:
                 files = []
             for item in files[:_MAX_FILES]:
@@ -171,7 +177,7 @@ class RepoMapTool(Tool):
                 ):
                     continue
                 try:
-                    content = await wfs.fs_read_file(ctx.room_id, path, ctx.db)
+                    content = await wfs.fs_read_file(ctx.room_id, path, ctx.db, **tkw)
                 except Exception:
                     content = None
                 if content and not (content.startswith("data:") and ";base64," in content):

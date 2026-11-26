@@ -33,10 +33,14 @@ class GitDiffTool(Tool):
     async def execute(self, ctx: ToolContext, tool_input: dict[str, Any]) -> str:
         from app.core import workspaced_client as wsd
 
+        from app.core.tools.registry import ctx_tree
+
+        tree = await ctx_tree(ctx)
+        tk = {"tree": tree} if tree else {}
         path = (tool_input.get("path") or "").strip()
         if not path:
             data = await wsd.git_diff_workspace(
-                str(ctx.room_id), from_ref="main", stat=True, merge_base=True
+                str(ctx.room_id), from_ref="main", stat=True, merge_base=True, **tk
             )
             stat = (data.get("diff") or "").strip()
             if not stat:
@@ -49,7 +53,7 @@ class GitDiffTool(Tool):
             )
 
         data = await wsd.git_diff_workspace(
-            str(ctx.room_id), from_ref="main", path=path, merge_base=True
+            str(ctx.room_id), from_ref="main", path=path, merge_base=True, **tk
         )
         diff = data.get("diff", "")
         if diff:
@@ -60,7 +64,7 @@ class GitDiffTool(Tool):
         # pathspec that matches the path anywhere in the tree.
         glob = f"*{path.strip('/')}*"
         data = await wsd.git_diff_workspace(
-            str(ctx.room_id), from_ref="main", path=glob, merge_base=True
+            str(ctx.room_id), from_ref="main", path=glob, merge_base=True, **tk
         )
         diff = data.get("diff", "")
         if diff:

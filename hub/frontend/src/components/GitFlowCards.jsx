@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import {
   GitMerge, AlertTriangle, CheckCircle2, XCircle, Rocket, ExternalLink,
-  FileText, ShieldAlert, Loader2, RotateCcw, MessageCircle,
+  FileText, ShieldAlert, GitBranch, Loader2, RotateCcw, MessageCircle,
 } from 'lucide-react';
 import { useGitState, useGateActions } from '../context/GitStateContext';
 
@@ -81,6 +81,32 @@ export function OriginBadge({ origin }) {
     >
       <MessageCircle size={9} /> from dialogue
     </span>
+  );
+}
+
+/* ── Task tree chip ──────────────────────────────────────────────────────────
+ * internal design notes E6 — the task works in its own git
+ * worktree (TaskOut.worktree set), so other tasks cannot move its branch. */
+
+export function TaskTreeChip({ task }) {
+  if (!task?.worktree) return null;
+  const path = `/workspace/.legion/wt/${String(task.id).replace(/-/g, '').slice(0, 8)}`;
+  return (
+    <div
+      data-testid="task-tree-chip"
+      className="flex flex-wrap items-center gap-1.5 text-[10px]"
+      style={{ color: 'var(--text-muted)' }}
+      title="This task works in its own git worktree; other tasks cannot switch its branch"
+    >
+      <span
+        className="flex items-center gap-1 px-1.5 py-0.5 rounded-full flex-shrink-0"
+        style={{ background: 'rgba(52,211,153,0.12)', color: '#34d399', border: '1px solid rgba(52,211,153,0.3)' }}
+      >
+        <GitBranch size={9} /> own tree
+      </span>
+      {task.branch_name && <span className="font-mono">{task.branch_name}</span>}
+      <span className="font-mono truncate">{path}</span>
+    </div>
   );
 }
 

@@ -21,6 +21,7 @@ from app.path_contract import USERFILES_DIR, WorkspacePathError, normalize_works
 from app.generation import ensure_generation, sync_generation, workspace_root
 from app.room_id import is_safe_room_id
 from app.sync_ignore import IgnoreDecision, IgnoreMatcher
+from app.task_tree import tree_path
 
 
 logger = logging.getLogger("workspaced.file_ops")
@@ -29,6 +30,16 @@ _ignore_summary_logged: set[str] = set()
 
 def _workspace_root(room_id: str) -> Path:
     return workspace_root(room_id)
+
+
+def _root(room_id: str, tree: Optional[str] = None) -> Path:
+    """The room volume, or — with ``tree`` — one task's own worktree in it.
+
+    A named tree that does not exist raises ``TaskTreeError``; it never falls
+    back to the shared tree.
+    """
+    room_root = _workspace_root(room_id)
+    return tree_path(room_root, tree) if tree else room_root
 
 
 # ---------------------------------------------------------------------------
@@ -120,13 +131,33 @@ def _chown_up_to_root(path: Path, root: Path) -> None:
         p = p.parent
 
 
-def _safe_full_path(root: Path, rel_path: str) -> Path:
-    """Resolve rel_path inside root, rejecting any traversal attempt."""
+def _safe_full_path(
+    root: Path, rel_path: str, *, tree: Optional[str] = None, write: bool = False
+) -> Path:
+    """Resolve rel_path inside root, rejecting any traversal attempt.
+
+    For a task tree (``tree``) the path additionally may not name ``.git`` (the
+    file that links the tree to the room's repo) and may not leave the tree
+    through a link: a write must land inside the tree, a read inside the room
+    volume (a tree's ``node_modules`` is a link to the shared one) but never
+    in the room's ``.git``.
+    """
     try:
         rel = normalize_workspace_path(rel_path)
     except WorkspacePathError as exc:
         raise ValueError(str(exc)) from exc
-    return root / Path(rel)
+    full = root / Path(rel)
+    if tree:
+        if rel.split("/", 1)[0] == ".git":
+            raise ValueError(f"path is inside .git: {rel_path!r}")
+        room_root = root.parents[2]
+        real = Path(os.path.realpath(full))
+        bound = Path(os.path.realpath(root if write else room_root))
+        if real != bound and bound not in real.parents:
+            raise ValueError(f"path leaves the task tree: {rel_path!r}")
+        if Path(os.path.realpath(room_root / ".git")) in real.parents:
+            raise ValueError(f"path is inside .git: {rel_path!r}")
+    return full
 
 
 def _is_userfiles_path(relative: str) -> bool:
@@ -140,9 +171,12 @@ def _is_userfiles_path(relative: str) -> bool:
 # or directly, since all I/O is local disk and very fast)
 # ---------------------------------------------------------------------------
 
-def get_tree(room_id: str) -> list[dict[str, Any]]:
-    """Return syncable file metadata, pruning ignored directories early."""
-    root = _workspace_root(room_id)
+def get_tree(room_id: str, tree: Optional[str] = None) -> list[dict[str, Any]]:
+    """Return syncable file metadata, pruning ignored directories early.
+
+    ``tree`` lists one task's own worktree instead of the room's shared tree.
+    """
+    root = _root(room_id, tree)
     if not root.exists():
         return []
     matcher = IgnoreMatcher(
@@ -258,9 +292,9 @@ def list_dialogue_archive_files(room_id: str) -> list[dict[str, Any]]:
     return out
 
 
-def _snapshot_files(room_id: str) -> list[dict[str, Any]]:
+def _snapshot_files(room_id: str, tree: Optional[str] = None) -> list[dict[str, Any]]:
     """Read volume metadata, retaining user dotfiles but excluding internals."""
-    root = _workspace_root(room_id)
+    root = _root(room_id, tree)
     if not root.exists():
         return []
     result: list[dict[str, Any]] = []
@@ -295,8 +329,13 @@ def get_snapshot(
     preview_paths: Optional[list[str]] = None,
     max_previews: int = 20,
     preview_chars: int = 600,
+    tree: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Return a volume-first, bounded snapshot with a consistent generation."""
+    """Return a volume-first, bounded snapshot with a consistent generation.
+
+    ``tree`` snapshots one task's worktree; files, previews, outlines and git
+    state are then those of that tree (the generation stays the room's).
+    """
     wanted = {
         normalize_workspace_path(path)
         for path in (preview_paths or [])
@@ -308,7 +347,7 @@ def get_snapshot(
     consistent = False
     for _ in range(3):
         generation_before = sync_generation(room_id)
-        files = _snapshot_files(room_id)
+        files = _snapshot_files(room_id, tree) if tree else _snapshot_files(room_id)
         generation_after = sync_generation(room_id)
         if generation_before == generation_after:
             consistent = True
@@ -320,20 +359,20 @@ def get_snapshot(
             normalized = normalize_workspace_path(entry["path"])
             if normalized not in wanted or len(previews) >= max_previews:
                 continue
-            content = read_file(room_id, normalized)
+            content = read_file(room_id, normalized, tree=tree)
             if content is not None and not content.startswith("data:"):
                 previews[entry["path"]] = content[: max(0, preview_chars)]
-                outline = get_outline(room_id, normalized)
+                outline = get_outline(room_id, normalized, tree=tree)
                 if outline is not None:
                     outlines[entry["path"]] = outline
     from app.git_ops import git_current_branch, is_git_repo
 
     git: dict[str, Any] | None = None
     if is_git_repo(room_id):
-        git = {"branch": git_current_branch(room_id)}
+        git = {"branch": git_current_branch(room_id, tree=tree)}
         try:
             from app.git_ops import _run
-            result = _run(["rev-parse", "HEAD"], cwd=_workspace_root(room_id))
+            result = _run(["rev-parse", "HEAD"], cwd=_root(room_id, tree))
             git["commit"] = result.stdout.strip() if result.returncode == 0 else None
         except Exception:
             git["commit"] = None
@@ -379,11 +418,11 @@ def _sniff_binary_mime(raw: bytes, ext: str) -> str:
     return _EXT_MIME.get(ext, "application/octet-stream")
 
 
-def read_file(room_id: str, path: str) -> str | None:
+def read_file(room_id: str, path: str, tree: Optional[str] = None) -> str | None:
     """Return file content as string (binary → data-URI). None if not found."""
-    root = _workspace_root(room_id)
+    root = _root(room_id, tree)
     try:
-        full = _safe_full_path(root, path)
+        full = _safe_full_path(root, path, tree=tree)
     except ValueError:
         return None
     if not full.exists() or not full.is_file():
@@ -397,9 +436,11 @@ def read_file(room_id: str, path: str) -> str | None:
         return f"data:{mime};base64,{b64}"
 
 
-def get_outline(room_id: str, path: str, max_symbols: int = 40) -> dict[str, Any] | None:
+def get_outline(
+    room_id: str, path: str, max_symbols: int = 40, tree: Optional[str] = None
+) -> dict[str, Any] | None:
     """Return a lightweight AST/regex outline without returning source text."""
-    content = read_file(room_id, path)
+    content = read_file(room_id, path, tree=tree)
     if content is None or (content.startswith("data:") and ";base64," in content):
         return None
     normalized = "/" + normalize_workspace_path(path)
@@ -449,24 +490,28 @@ def write_file(
     content: str,
     commit_message: Optional[str] = None,
     commit_only_path: bool = False,
+    tree: Optional[str] = None,
 ) -> dict[str, Any]:
     """Write content to the workspace volume. Returns {path, size, commit_sha}.
 
     ``commit_only_path`` commits just this file instead of the whole tree.
+    ``tree`` writes into (and commits on the branch of) one task's own
+    worktree; the room's shared tree and its HEAD are not touched.
     """
     from app.git_ops import git_commit, git_init, is_git_repo
 
     ensure_generation(room_id)
-    result = _write_volume_file(room_id, path, content)
+    result = _write_volume_file(room_id, path, content, tree=tree)
 
     # Room-private files live on the volume only; they are never committed, so
     # an upload cannot also sweep unrelated pending changes into a "user:" commit.
     if commit_message and not _is_userfiles_path(result["path"]):
-        if not is_git_repo(room_id):
+        if not tree and not is_git_repo(room_id):
             git_init(room_id)
         sha = git_commit(
             room_id, commit_message,
             only_path=result["path"].lstrip("/") if commit_only_path else None,
+            tree=tree,
         )
         result["commit_sha"] = sha
 
@@ -475,10 +520,12 @@ def write_file(
     return result
 
 
-def _write_volume_file(room_id: str, path: str, content: str) -> dict[str, Any]:
+def _write_volume_file(
+    room_id: str, path: str, content: str, tree: Optional[str] = None
+) -> dict[str, Any]:
     """Write one file without touching git or the generation; callers own both."""
-    root = _workspace_root(room_id)
-    full = _safe_full_path(root, path)
+    root = _root(room_id, tree)
+    full = _safe_full_path(root, path, tree=tree, write=True)
     full.parent.mkdir(parents=True, exist_ok=True)
 
     if content.startswith("data:") and ";base64," in content:
@@ -515,14 +562,15 @@ def delete_file(
     room_id: str,
     path: str,
     commit_message: Optional[str] = None,
+    tree: Optional[str] = None,
 ) -> bool:
     """Delete a file. Returns True if deleted, False if not found."""
     from app.git_ops import git_commit, git_init, is_git_repo
 
-    root = _workspace_root(room_id)
+    root = _root(room_id, tree)
     ensure_generation(room_id)
     try:
-        full = _safe_full_path(root, path)
+        full = _safe_full_path(root, path, tree=tree, write=True)
     except ValueError:
         return False
     if not full.exists() or not full.is_file():
@@ -530,9 +578,9 @@ def delete_file(
     full.unlink()
 
     if commit_message and not _is_userfiles_path(full.relative_to(root).as_posix()):
-        if not is_git_repo(room_id):
+        if not tree and not is_git_repo(room_id):
             git_init(room_id)
-        git_commit(room_id, commit_message)
+        git_commit(room_id, commit_message, tree=tree)
 
     sync_generation(room_id)
 
@@ -543,6 +591,7 @@ def import_files(
     room_id: str,
     files: list[dict[str, str]],
     commit_message: Optional[str] = None,
+    tree: Optional[str] = None,
 ) -> dict[str, Any]:
     """Bulk import [{path, content}]. Returns {imported, errors, commit_sha}."""
     from app.git_ops import git_commit, git_init, is_git_repo
@@ -553,7 +602,7 @@ def import_files(
     ensure_generation(room_id)
     for f in files:
         try:
-            _write_volume_file(room_id, f["path"], f["content"])
+            _write_volume_file(room_id, f["path"], f["content"], tree=tree)
             imported += 1
         except Exception as exc:
             errors.append({"path": f["path"], "error": str(exc)})
@@ -561,9 +610,9 @@ def import_files(
     result: dict[str, Any] = {"imported": imported, "errors": errors}
 
     if commit_message and imported > 0:
-        if not is_git_repo(room_id):
+        if not tree and not is_git_repo(room_id):
             git_init(room_id)
-        sha = git_commit(room_id, commit_message)
+        sha = git_commit(room_id, commit_message, tree=tree)
         result["commit_sha"] = sha
 
     result["generation"] = sync_generation(room_id)

@@ -89,12 +89,12 @@ class TestEnvHelpers:
 # ---------------------------------------------------------------------------
 
 class TestPolicyForRole:
-    def test_default_context_window_limit_is_100k(self, monkeypatch):
+    def test_default_context_window_limit_is_200k(self, monkeypatch):
         monkeypatch.delenv("CONTEXT_WINDOW_LIMIT", raising=False)
         # Reload module so _CONTEXT_WINDOW_LIMIT_DEFAULT picks up env change.
         importlib.reload(policy_mod)
         p = policy_mod.policy_for_role("agent")
-        assert p.context_window_limit == 100_000
+        assert p.context_window_limit == 200_000
 
     def test_env_overrides_context_window_limit(self, monkeypatch):
         monkeypatch.setenv("CONTEXT_WINDOW_LIMIT", "50000")
@@ -126,23 +126,23 @@ class TestPolicyForRole:
         monkeypatch.delenv("CONTEXT_WINDOW_LIMIT", raising=False)
         importlib.reload(policy_mod)
         p = policy_mod.policy_for_role("agent")
-        assert p.input_cap == p.context_window_limit == 100_000
+        assert p.input_cap == p.context_window_limit == 200_000
 
     def test_cm_default_input_cap_equals_context_window_limit(self, monkeypatch):
         monkeypatch.delenv("CONTEXT_CHAT_MASTER_INPUT_CAP", raising=False)
         monkeypatch.delenv("CONTEXT_WINDOW_LIMIT", raising=False)
         importlib.reload(policy_mod)
         p = policy_mod.policy_for_role("chat_master")
-        assert p.input_cap == p.context_window_limit == 100_000
+        assert p.input_cap == p.context_window_limit == 200_000
 
     def test_explicit_input_cap_env_overrides_default(self, monkeypatch):
-        """Admin setting CONTEXT_AGENT_INPUT_CAP=20000 is respected even though CWL=100000."""
+        """Admin setting CONTEXT_AGENT_INPUT_CAP=20000 is respected even though CWL=200000."""
         monkeypatch.setenv("CONTEXT_AGENT_INPUT_CAP", "20000")
         monkeypatch.delenv("CONTEXT_WINDOW_LIMIT", raising=False)
         importlib.reload(policy_mod)
         p = policy_mod.policy_for_role("agent")
         assert p.input_cap == 20_000
-        assert p.context_window_limit == 100_000
+        assert p.context_window_limit == 200_000
 
 
 # ---------------------------------------------------------------------------

@@ -428,6 +428,14 @@ async def _compute_task_runtime(
         # stale-DISPATCHED (change_task_state's Block/Cancel path doesn't
         # reset it; only watchdog/_emit_dispatch_failed do).
         runtime_status = "needs_retry"
+    elif (
+        getattr(task, "queued_at", None) is not None
+        and task.dispatch_status == DispatchStatus.READY
+        and active_session_id is None
+    ):
+        # Waiting for a parallel-task slot of its room (core/room_slots.py);
+        # it starts by itself when a running task finishes.
+        runtime_status = "waiting_slot"
     elif active_session_id is not None:
         runtime_status = "running"
     elif task.state == TaskState.IN_PROGRESS and task.run_id is None:

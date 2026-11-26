@@ -23,6 +23,16 @@ from app.file_ops import chown_workspace_tree, ensure_userfiles_dir
 from app.git_exec import auth_env, git_exec, hand_to_git_user, read_repo_file, write_repo_file
 from app.git_lock import GitWorkspaceBusyError, room_git_lock
 from app.path_contract import USERFILES_DIR, normalize_workspace_path
+from app.task_tree import (
+    TaskTreeError,
+    container_path,
+    normalize_tree,
+    planned_tree_path,
+    require_task8,
+    room_of_tree,
+    tree_path,
+    trees_dir,
+)
 
 logger = logging.getLogger("workspaced.git")
 
@@ -255,6 +265,67 @@ def _workspace_root(room_id: str) -> Path:
     return Path(WORKSPACE_DATA_DIR) / room_id
 
 
+def _tree_root(room_id: str, tree: str) -> Path:
+    """The directory of a task's own worktree; raises ``TaskTreeError``."""
+    return tree_path(_workspace_root(room_id), tree)
+
+
+def _repo_root(room_id: str, tree: Optional[str] = None) -> Optional[Path]:
+    """Where git runs for ``tree`` (a task's worktree) or the room's shared tree.
+
+    ``None`` when the room has no repo yet. A named tree that does not exist
+    or is unsafe raises ``TaskTreeError`` instead of quietly falling back to
+    the shared tree — a task must never read or write the wrong one.
+    """
+    if tree:
+        return _tree_root(room_id, tree)
+    root = _workspace_root(room_id)
+    return root if (root / ".git").is_dir() else None
+
+
+def _chown_walk(top: Path, *, shallow: bool = False) -> None:
+    """Hand ``top`` (and, unless ``shallow``, all under it) to the container user.
+
+    Links are never followed; entries with the right owner are skipped.
+    """
+    if not hasattr(os, "chown"):
+        return
+    from app.config import WORKSPACE_GID, WORKSPACE_UID
+
+    def _fix(p: str) -> None:
+        try:
+            st = os.lstat(p)
+            if st.st_uid != WORKSPACE_UID or st.st_gid != WORKSPACE_GID:
+                os.lchown(p, WORKSPACE_UID, WORKSPACE_GID)
+        except OSError:
+            pass
+
+    _fix(str(top))
+    if shallow:
+        return
+    for dirpath, dirnames, filenames in os.walk(top, followlinks=False):
+        for name in dirnames + filenames:
+            _fix(os.path.join(dirpath, name))
+
+
+def _hand_over_tree(room_id: str, tree: str) -> None:
+    """Give a task tree and the repo's ``.git`` to the container user.
+
+    Cheaper than ``chown_workspace_tree``: the room's other files are not
+    walked, and links (a tree's ``node_modules``) are never followed.
+    """
+    root = _workspace_root(room_id)
+    try:
+        directory = tree_path(root, tree)
+        wt = trees_dir(root)
+    except TaskTreeError:
+        return
+    _chown_walk(root / ".git")
+    _chown_walk(directory)
+    _chown_walk(wt, shallow=True)
+    _chown_walk(wt.parent, shallow=True)
+
+
 def _write_local_excludes(root: Path, extra: str = "") -> bool:
     """Idempotently add Legion's local ignore rules to ``.git/info/exclude``.
 
@@ -271,6 +342,9 @@ def _write_local_excludes(root: Path, extra: str = "") -> bool:
     Returns ``True`` when the file was actually modified, ``False`` otherwise
     (already complete, no ``.git`` dir, or a swallowed filesystem error).
     """
+    # A task tree has a ``.git`` *file*; the ignore rules live in the room's
+    # own ``.git`` and apply to every worktree of it.
+    root = room_of_tree(root) or root
     exclude = root / ".git" / "info" / "exclude"
     try:
         if not exclude.parent.is_dir():
@@ -898,8 +972,12 @@ def git_commit(
     allow_main_commit: bool = False,
     only_path: Optional[str] = None,
     report: Optional[dict] = None,
+    tree: Optional[str] = None,
 ) -> Optional[str]:
     """Stage everything and commit. Returns new HEAD sha, or None if nothing changed.
+
+    ``tree`` (``<task8>``) commits in that task's own worktree — its branch,
+    its index — and never touches the room's shared HEAD.
 
     ``report``, when given, receives ``held_back``: the machine binaries the
     staging step kept out of this commit (see ``_hold_back_binaries``).
@@ -913,11 +991,14 @@ def git_commit(
     must never move ``main`` (internal design notes §0.1). Manual user
     operations (revert / restore) pass ``True``.
     """
-    root = _workspace_root(room_id)
-    if not (root / ".git").is_dir():
-        git_init(room_id)
+    if tree:
+        root = _tree_root(room_id, tree)
+    else:
+        root = _workspace_root(room_id)
+        if not (root / ".git").is_dir():
+            git_init(room_id)
 
-    if not allow_main_commit and git_current_branch(room_id) == RELEASE_BRANCH:
+    if not allow_main_commit and git_current_branch(room_id, tree=tree) == RELEASE_BRANCH:
         raise MainBranchProtectedError(
             "refusing to commit on `main`: agent and auto commits must target "
             f"a task branch or `{working_branch_of(root)}` "
@@ -941,7 +1022,10 @@ def git_commit(
         return None
 
     # New .git objects were written as root — hand them to the container user
-    chown_workspace_tree(room_id)
+    if tree:
+        _hand_over_tree(room_id, tree)
+    else:
+        chown_workspace_tree(room_id)
 
     sha_r = _run(["rev-parse", "HEAD"], cwd=root)
     return sha_r.stdout.strip() if sha_r.returncode == 0 else None
@@ -956,6 +1040,7 @@ def git_log(
     path: Optional[str] = None,
     limit: int = 20,
     rev_range: Optional[str] = None,
+    tree: Optional[str] = None,
 ) -> list[dict]:
     """Return list of {sha, short_sha, message, author, timestamp}.
 
@@ -964,8 +1049,8 @@ def git_log(
     to list the commits a promotion carries. A value starting with ``-`` is
     ignored to keep it from being read as a git option.
     """
-    root = _workspace_root(room_id)
-    if not (root / ".git").is_dir():
+    root = _repo_root(room_id, tree)
+    if root is None:
         return []
 
     fmt = "%H%x1f%s%x1f%an%x1f%aI"
@@ -1004,8 +1089,9 @@ def git_diff(
     path: Optional[str] = None,
     stat: bool = False,
     merge_base: bool = False,
+    tree: Optional[str] = None,
 ) -> str:
-    """Return unified diff text.
+    """Return unified diff text. ``tree`` diffs that task's own worktree.
 
     - No refs: working tree vs HEAD
     - from_ref only: from_ref vs working tree
@@ -1016,8 +1102,8 @@ def git_diff(
       commits that landed on from_ref after the branch diverged don't show
       up as reverse changes
     """
-    root = _workspace_root(room_id)
-    if not (root / ".git").is_dir():
+    root = _repo_root(room_id, tree)
+    if root is None:
         return ""
 
     args = ["diff"]
@@ -1127,12 +1213,30 @@ def _head_sha(root: Path) -> Optional[str]:
     return r.stdout.strip() if r.returncode == 0 else None
 
 
-def git_current_branch(room_id: str) -> Optional[str]:
-    root = _workspace_root(room_id)
-    if not (root / ".git").is_dir():
+def git_current_branch(room_id: str, tree: Optional[str] = None) -> Optional[str]:
+    root = _repo_root(room_id, tree)
+    if root is None:
         return None
     r = _run(["rev-parse", "--abbrev-ref", "HEAD"], cwd=root)
     return r.stdout.strip() if r.returncode == 0 else None
+
+
+def git_status(room_id: str, tree: Optional[str] = None) -> dict:
+    """Branch, HEAD and pending changes of the room's tree or of one task tree."""
+    root = _repo_root(room_id, tree)
+    if root is None:
+        return {"branch": None, "head": None, "dirty": False, "changes": [], "changes_count": 0}
+    changes = [
+        line for line in _run(["status", "--porcelain", "-z"], cwd=root).stdout.split("\0")
+        if line
+    ]
+    return {
+        "branch": git_current_branch(room_id, tree=tree),
+        "head": _head_sha(root),
+        "dirty": bool(changes),
+        "changes": [c[3:] if len(c) > 3 else c for c in changes[:200]],
+        "changes_count": len(changes),
+    }
 
 
 def git_branch_exists(room_id: str, branch_name: str) -> bool:
@@ -1223,12 +1327,17 @@ def git_merge_branch(
     *,
     strategy: Literal["ours", "theirs", "legacy"] | None = "legacy",
     expected_tips: tuple[str, str] | None = None,
+    tree: Optional[str] = None,
 ) -> dict:
     """Merge a source ref into ``target`` with ``--no-ff``.
 
     With no explicit strategy, legacy task merges prefer the incoming side
     and gates passing ``theirs=False`` leave conflicts unresolved. Explicit
     ``None`` also leaves conflicts unresolved.
+
+    ``tree`` (``<task8>``) merges inside that task's own worktree, which must
+    already be on ``target``: nothing is checked out and the room's shared HEAD
+    stays where it is (internal design notes E5).
     """
     root = _workspace_root(room_id)
     if not (root / ".git").is_dir():
@@ -1236,6 +1345,9 @@ def git_merge_branch(
 
     if strategy == "legacy":
         strategy = "theirs" if theirs else None
+
+    if tree:
+        return _merge_in_task_tree(room_id, tree, branch_name, target, strategy, message)
 
     remote_source = branch_name.startswith(_REMOTE_REF_PREFIX)
     if expected_tips is not None and not _review_tips_match(root, target, branch_name, expected_tips):
@@ -1314,6 +1426,52 @@ def git_merge_branch(
         head = _run(["rev-parse", "HEAD"], cwd=root)
         sha = head.stdout.strip() if head.returncode == 0 else None
 
+    return {
+        "ok": r.returncode == 0,
+        "conflict": conflict,
+        "stdout": r.stdout[:4096],
+        "stderr": r.stderr[:4096],
+        "sha": sha,
+        "head_changed": sha is not None and sha != head_before,
+    }
+
+
+def _merge_in_task_tree(
+    room_id: str, tree: str, source: str, target: str,
+    strategy: Optional[str], message: Optional[str],
+) -> dict:
+    """``git merge --no-ff source`` inside a task's worktree (its branch is ``target``).
+
+    Pending files of the tree are committed first so the merge never trips on a
+    dirty tree. A conflict is aborted — the tree is left clean on its branch.
+    """
+    directory = _tree_root(room_id, tree)
+    refused = {"ok": False, "conflict": False, "stdout": ""}
+    if source.startswith(_REMOTE_REF_PREFIX):
+        return {**refused, "stderr": "a remote ref cannot be merged inside a task tree"}
+    current = git_current_branch(room_id, tree=tree)
+    if current != target:
+        return {**refused, "stderr": f"the task tree is on {current!r}, not {target!r}"}
+
+    head_before = _head_sha(directory)
+    if _run(["status", "--porcelain"], cwd=directory).stdout.strip():
+        _stage_all(directory)
+        _run(["commit", "-m", f"chore: save task tree before merging {source}"], cwd=directory)
+        if _run(["status", "--porcelain"], cwd=directory).stdout.strip():
+            return {**refused, "stderr": "the task tree has changes that could not be committed"}
+    args = ["merge", "--no-ff"]
+    if strategy:
+        args += ["-X", strategy]
+    args += ["-m", message or f"merge: {source} → {target}", "--", source]
+    r = _run(args, cwd=directory)
+    conflict = r.returncode != 0 and "CONFLICT" in (r.stdout + r.stderr)
+    if conflict:
+        _run(["merge", "--abort"], cwd=directory)
+    elif r.returncode != 0:
+        logger.warning("git_merge_branch in tree %s failed for room %s: %s", tree, room_id, r.stderr[:500])
+    _hand_over_tree(room_id, tree)  # the merge wrote files as root
+
+    sha = _head_sha(directory) if r.returncode == 0 else None
     return {
         "ok": r.returncode == 0,
         "conflict": conflict,
@@ -2887,3 +3045,404 @@ def git_discard_branch(room_id: str, branch: str, working_branch: Optional[str] 
     if r.returncode != 0:
         return {"ok": False, "deleted": False, "backup_ref": backup_ref, "stderr": r.stderr[:500]}
     return {"ok": True, "deleted": True, "backup_ref": backup_ref, "stderr": ""}
+
+
+# ---------------------------------------------------------------------------
+# Task worktrees (internal design notes, E0)
+# ---------------------------------------------------------------------------
+#
+# A task works in ``<room>/.legion/wt/<task8>`` — a ``git worktree`` of the
+# room's repo on the task's own branch. ``.legion/*`` is already in the room's
+# local excludes, so the shared tree never sees these directories.
+#
+# The agent's git runs *inside the room container*, where the volume is
+# ``/workspace``; workspaced sees it as ``WORKSPACE_DATA_DIR/<room>``. The
+# ``.git`` file of a worktree is therefore written with a path relative to the
+# tree (``../../../.git/worktrees/<name>``) so it resolves in both places, and
+# every tree is locked so a ``git worktree prune`` run in the container — where
+# the admin dir's absolute ``gitdir`` points at a path that does not exist —
+# cannot drop it.
+
+_WORKTREE_LOCK_REASON = "legion task tree"
+_PARK_MESSAGE = "chore: park task tree before removal"
+_TASK_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$")
+
+
+def _task_branch_ok(branch: Optional[str]) -> bool:
+    if not branch or not _TASK_BRANCH_RE.match(branch) or branch in (RELEASE_BRANCH, "HEAD"):
+        return False
+    return ".." not in branch and "//" not in branch and not branch.endswith(("/", ".", ".lock"))
+
+
+def _task8_ok(value: str) -> bool:
+    try:
+        return normalize_tree(value) == value
+    except TaskTreeError:
+        return False
+
+
+def _tree_admin_name(directory: Path) -> Optional[str]:
+    """``<name>`` of ``.git/worktrees/<name>`` as the tree's ``.git`` file says."""
+    try:
+        line = (directory / ".git").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not line.startswith("gitdir:"):
+        return None
+    name = Path(os.path.normpath(line[len("gitdir:"):].strip())).name
+    return name if name and name not in (".", "..") else None
+
+
+def _relink_tree(directory: Path) -> Optional[str]:
+    """Rewrite the tree's ``.git`` file with a relative ``gitdir``; returns the admin name."""
+    name = _tree_admin_name(directory)
+    if name is None:
+        return None
+    line = f"gitdir: ../../../.git/worktrees/{name}\n"
+    if os.name == "nt":  # developer machines: git hides the file, and a hidden file cannot be reopened for writing
+        import ctypes
+
+        ctypes.windll.kernel32.SetFileAttributesW(str(directory / ".git"), 0x80)  # NORMAL
+        (directory / ".git").write_text(line, encoding="utf-8", newline="\n")
+    else:
+        write_repo_file(directory, (".git",), line)
+    return name
+
+
+# Dependencies shared with the room's main tree (plan E4, R3). A task tree gets a
+# symbolic link to the main tree's ``node_modules`` / ``.venv`` when the files
+# that decide their content are identical in both trees.
+_NODE_LOCKS = ("package.json", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml",
+               "yarn.lock", "bun.lockb")
+_PY_LOCKS = ("pyproject.toml", "uv.lock", "poetry.lock", "Pipfile.lock", "Pipfile")
+# ``node_modules`` / ``.venv`` as a *link* are not matched by the project's
+# ``node_modules/`` rules (a trailing slash means "directory"), so they get
+# link-proof rules of their own — otherwise ``git add -A`` would commit them.
+_DEP_LINK_EXCLUDES = "node_modules\n.venv\n"
+_DEP_SKIP_DIRS = frozenset({"node_modules", "venv", "__pycache__", "dist", "build"})
+
+
+def _lock_files(directory: Path, kind: str) -> list[str]:
+    if kind == "node_modules":
+        names = list(_NODE_LOCKS)
+    else:
+        names = list(_PY_LOCKS)
+        try:
+            names += sorted(
+                p.name for p in directory.iterdir()
+                if p.name.startswith("requirements") and p.name.endswith(".txt")
+            )
+        except OSError:
+            pass
+    out: list[str] = []
+    for name in names:
+        p = directory / name
+        try:
+            if p.is_file() and not p.is_symlink():
+                out.append(name)
+        except OSError:
+            continue
+    return out
+
+
+def _same_dependency_inputs(shared: Path, tree: Path, kind: str) -> bool:
+    """True when both directories pin the same dependencies (and pin any at all)."""
+    import filecmp
+
+    mine, theirs = _lock_files(tree, kind), _lock_files(shared, kind)
+    if not mine or mine != theirs:
+        return False
+    if kind == "node_modules" and "package.json" not in mine:
+        return False
+    if kind == ".venv" and not any(n != "pyproject.toml" and n != "Pipfile" for n in mine):
+        return False  # a project file alone does not say what is installed
+    try:
+        return all(filecmp.cmp(shared / n, tree / n, shallow=False) for n in mine)
+    except OSError:
+        return False
+
+
+def _link_dependencies(root: Path, target: Path) -> list[str]:
+    """Link the main tree's installed dependencies into a task tree.
+
+    ``<tree>[/<sub>]/node_modules`` and ``.venv`` become *relative* links to the
+    main tree's real directory — relative so they resolve for workspaced and for
+    the container alike. Only a real directory of the main tree is linked, only
+    when the tree has no such entry yet and the lock files match; one level of
+    subdirectories is looked at (``frontend/``). Best-effort: returns the
+    relative paths linked, never raises.
+    """
+    linked: list[str] = []
+    try:
+        subs = [""] + sorted(
+            p.name for p in target.iterdir()
+            if p.is_dir() and not p.is_symlink()
+            and not p.name.startswith(".") and p.name not in _DEP_SKIP_DIRS
+        )
+    except OSError:
+        return linked
+    for sub in subs:
+        shared_dir, tree_dir = (root / sub, target / sub) if sub else (root, target)
+        if shared_dir.is_symlink() or not shared_dir.is_dir():
+            continue
+        for kind in ("node_modules", ".venv"):
+            source, link = shared_dir / kind, tree_dir / kind
+            try:
+                if source.is_symlink() or not source.is_dir() or os.path.lexists(link):
+                    continue
+                if not _same_dependency_inputs(shared_dir, tree_dir, kind):
+                    continue
+                os.symlink(os.path.relpath(source, tree_dir), link, target_is_directory=True)
+                linked.append(f"{sub}/{kind}" if sub else kind)
+            except OSError as exc:
+                logger.info("dependency link %s in %s skipped: %s", kind, target.name, exc)
+    if linked:
+        _write_local_excludes(root, extra=_DEP_LINK_EXCLUDES)
+    return linked
+
+
+def _tree_info(
+    room_id: str, root: Path, task8: str, *, created: bool, linked: Optional[list[str]] = None
+) -> dict:
+    directory = planned_tree_path(root, task8)
+    return {
+        "ok": True,
+        "created": created,
+        "linked": linked or [],
+        "task8": task8,
+        "path": container_path(task8),
+        "branch": git_current_branch(room_id, tree=task8),
+        "head": _head_sha(directory),
+    }
+
+
+@_serialized(busy_dict=False)
+def worktree_add(room_id: str, task8: str, branch: str, base: Optional[str] = None) -> dict:
+    """Give a task its own worktree on ``branch`` (created from ``base`` if new).
+
+    Idempotent: a tree that already exists on ``branch`` is reused (Resume /
+    Retry / rework). A tree on another branch, or a branch that is checked out
+    somewhere else, raises ``TaskTreeError`` (status 409) — the caller decides;
+    nothing is moved or reset. The room's shared HEAD is never touched.
+    """
+    task8 = require_task8(task8)
+    if not _task_branch_ok(branch):
+        raise TaskTreeError(f"invalid task branch name: {branch!r}")
+    root = _workspace_root(room_id)
+    if not (root / ".git").is_dir():
+        raise TaskTreeError("the room has no git repository yet", 404)
+
+    target = planned_tree_path(root, task8)
+    if os.path.lexists(target):
+        current = git_current_branch(room_id, tree=task8)  # raises on a link / file
+        if current == branch:
+            _relink_tree(target)
+            linked = _link_dependencies(root, target)  # a Resume may find a dependency now
+            _hand_over_tree(room_id, task8)
+            return _tree_info(room_id, root, task8, created=False, linked=linked)
+        raise TaskTreeError(
+            f"task tree {task8} already exists on branch {current!r}, not {branch!r}", 409
+        )
+
+    # ``.legion`` and ``.legion/wt`` may be missing or planted as links.
+    wt = root / ".legion" / "wt"
+    for part in (root / ".legion", wt):
+        if part.is_symlink():
+            raise TaskTreeError(f"{part.name} is a symbolic link; refusing to use it")
+    wt.mkdir(parents=True, exist_ok=True)
+    trees_dir(root)
+
+    args = ["worktree", "add", "--lock", "--reason", _WORKTREE_LOCK_REASON]
+    if _local_branch_exists(root, branch):
+        args += [str(target), branch]
+    else:
+        start = base or working_branch_of(root)
+        if _run(["rev-parse", "--verify", "--quiet", f"{start}^{{commit}}"], cwd=root).returncode != 0:
+            raise TaskTreeError(f"cannot start branch {branch!r}: {start!r} is not a commit", 409)
+        args += ["-b", branch, str(target), start]
+    r = _run(args, cwd=root)
+    if r.returncode != 0 and "-b" in args and _local_branch_exists(root, branch):
+        # The git runner repairs ownership and retries a failed command; when the
+        # first attempt had already created the branch, the retry's ``-b`` fails
+        # with "already exists" — attach the tree to the branch that is now there.
+        r = _run(["worktree", "add", "--lock", "--reason", _WORKTREE_LOCK_REASON, str(target), branch], cwd=root)
+    if r.returncode != 0:
+        logger.warning("worktree add failed for room %s task %s: %s", room_id, task8, r.stderr[:500])
+        raise TaskTreeError((r.stderr or r.stdout).strip()[:500] or "git worktree add failed", 409)
+
+    if _relink_tree(target) is None:
+        raise TaskTreeError("git did not leave a usable .git file in the new task tree", 409)
+    linked = _link_dependencies(root, target)
+    _hand_over_tree(room_id, task8)
+    return _tree_info(room_id, root, task8, created=True, linked=linked)
+
+
+@_serialized(busy_dict=False)
+def worktree_remove(room_id: str, task8: str, *, force: bool = False) -> dict:
+    """Remove a task's worktree; its branch stays.
+
+    Pending work is committed first (``chore: park task tree before removal``)
+    so nothing is lost. When it cannot be parked — a damaged tree, a failing
+    commit — the tree is kept and ``ok`` is False, unless ``force`` says to
+    drop it anyway. A missing tree is a no-op success.
+    """
+    task8 = require_task8(task8)
+    root = _workspace_root(room_id)
+    target = planned_tree_path(root, task8)
+    if not os.path.lexists(target):
+        _prune_task_trees(root)
+        return {"ok": True, "removed": False, "parked_sha": None, "task8": task8}
+
+    parked_sha: Optional[str] = None
+    branch: Optional[str] = None
+    problem = ""
+    try:
+        directory: Optional[Path] = tree_path(root, task8)
+    except TaskTreeError as exc:
+        directory, problem = None, str(exc)
+    if directory is not None:
+        status = _run(["status", "--porcelain"], cwd=directory)
+        if status.returncode != 0:
+            problem = (status.stderr or status.stdout).strip()[:300] or "git status failed"
+        else:
+            branch = git_current_branch(room_id, tree=task8)
+            if status.stdout.strip():
+                if branch in (None, RELEASE_BRANCH, "HEAD"):
+                    problem = f"the tree has uncommitted changes on {branch!r}"
+                else:
+                    _stage_all(directory)
+                    commit = _run(["commit", "-m", _PARK_MESSAGE], cwd=directory)
+                    if commit.returncode != 0:
+                        problem = (commit.stderr or commit.stdout).strip()[:300] or "park commit failed"
+                    else:
+                        parked_sha = _head_sha(directory)
+                        _hand_over_tree(room_id, task8)
+                if not problem and _run(["status", "--porcelain"], cwd=directory).stdout.strip():
+                    problem = "the tree still has uncommitted changes after parking"
+    if problem and not force:
+        return {
+            "ok": False, "removed": False, "parked_sha": parked_sha, "task8": task8,
+            "branch": branch, "error": problem,
+        }
+
+    admin = _tree_admin_name(target) if directory is not None else None
+    removed = False
+    if directory is not None and not problem:
+        r = _run(["worktree", "remove", "--force", "--force", str(target)], cwd=root)
+        removed = r.returncode == 0 and not os.path.lexists(target)
+    if not removed:
+        # Damaged tree or forced removal: delete the directory and its admin
+        # entry ourselves; links are unlinked, never followed.
+        _rmtree_no_follow(target)
+        if admin:
+            entry = root / ".git" / "worktrees" / admin
+            if entry.is_dir() and not entry.is_symlink():
+                _rmtree_no_follow(entry)
+        removed = not os.path.lexists(target)
+    _prune_task_trees(root)
+    result = {
+        "ok": removed, "removed": removed, "parked_sha": parked_sha, "task8": task8,
+        "branch": branch,
+    }
+    if problem:
+        result["warning"] = problem
+    return result
+
+
+def _rmtree_no_follow(path: Path) -> None:
+    try:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+    except OSError:
+        pass
+
+
+def _prune_task_trees(root: Path) -> list[str]:
+    """Drop admin entries of trees whose directory is gone, then ``worktree prune``.
+
+    Our trees are locked (see above), which makes git skip them, so a locked
+    entry whose tree has vanished is unlocked first. Only locks carrying
+    Legion's own reason are touched.
+    """
+    admin_root = root / ".git" / "worktrees"
+    freed: list[str] = []
+    try:
+        entries = (
+            list(admin_root.iterdir())
+            if admin_root.is_dir() and not admin_root.is_symlink() else []
+        )
+    except OSError:
+        entries = []
+    for entry in entries:
+        try:
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            lock = entry / "locked"
+            if not lock.is_file() or lock.is_symlink():
+                continue
+            if lock.read_text(encoding="utf-8").strip() != _WORKTREE_LOCK_REASON:
+                continue
+            pointer = (entry / "gitdir").read_text(encoding="utf-8").strip()
+            tree_dir = Path(os.path.normpath(pointer)).parent
+            if room_of_tree(tree_dir) is not None and not os.path.lexists(
+                root / ".legion" / "wt" / tree_dir.name
+            ):
+                lock.unlink()
+                freed.append(entry.name)
+        except (OSError, UnicodeDecodeError):
+            continue
+    if (root / ".git").is_dir():
+        _run(["worktree", "prune"], cwd=root)
+    return freed
+
+
+@_serialized(busy_dict=False)
+def worktree_prune(room_id: str) -> dict:
+    """Forget worktrees whose directory no longer exists."""
+    root = _workspace_root(room_id)
+    if not (root / ".git").is_dir():
+        return {"ok": True, "pruned": []}
+    return {"ok": True, "pruned": _prune_task_trees(root)}
+
+
+def worktree_list(room_id: str) -> list[dict]:
+    """The room's task worktrees (only those under ``.legion/wt``)."""
+    root = _workspace_root(room_id)
+    if not (root / ".git").is_dir():
+        return []
+    r = _run(["worktree", "list", "--porcelain"], cwd=root)
+    if r.returncode != 0:
+        return []
+    wt_real = os.path.realpath(root / ".legion" / "wt")
+    out: list[dict] = []
+    for block in r.stdout.replace("\r\n", "\n").split("\n\n"):
+        fields: dict[str, str] = {}
+        for line in block.strip().splitlines():
+            key, _, value = line.partition(" ")
+            fields[key] = value
+        path = fields.get("worktree")
+        if not path or os.path.dirname(os.path.realpath(path)) != wt_real:
+            continue
+        task8 = os.path.basename(path.rstrip("/\\"))
+        branch = fields.get("branch", "")
+        entry = {
+            "task8": task8,
+            "path": container_path(task8) if _task8_ok(task8) else path,
+            "branch": branch[len("refs/heads/"):] if branch.startswith("refs/heads/") else None,
+            "head": fields.get("HEAD"),
+            "locked": "locked" in fields,
+            "prunable": "prunable" in fields,
+            "dirty": None,
+        }
+        if not entry["prunable"] and _task8_ok(task8):
+            try:
+                entry["dirty"] = bool(
+                    _run(["status", "--porcelain"], cwd=_tree_root(room_id, task8)).stdout.strip()
+                )
+            except TaskTreeError:
+                pass
+        out.append(entry)
+    out.sort(key=lambda e: e["task8"])
+    return out

@@ -156,6 +156,20 @@ class TestDockerManager:
             assert env["OMP_NUM_THREADS"] == jobs
             assert env["CARGO_BUILD_JOBS"] == jobs
             assert env["GOMAXPROCS"] == jobs
+            # Next.js build workers = CIRCLE_NODE_TOTAL - 1 (E4).
+            assert env["CIRCLE_NODE_TOTAL"] == str(int(jobs) + 1)
+
+    @pytest.mark.asyncio
+    async def test_start_sizes_tmp_to_a_quarter_of_room_memory(self, mgr, monkeypatch):
+        container = _make_container_mock()
+        mgr._docker.containers.get = AsyncMock(side_effect=_not_found_error())
+        mgr._docker.containers.create_or_replace = AsyncMock(return_value=container)
+        monkeypatch.setattr("app.docker_manager.WORKSPACE_TMP_MB", 512)
+
+        for mem, size in ((1024, 256), (4096, 512), (128, 64)):
+            await mgr.start(ROOM_ID, StartRequest(mem_limit_mb=mem))
+            _, config = mgr._docker.containers.create_or_replace.await_args.args
+            assert config["HostConfig"]["Tmpfs"]["/tmp"] == f"size={size}m,exec"
 
     @pytest.mark.asyncio
     async def test_workspace_network_isolated_and_off_switch_wins(self, mgr, monkeypatch):

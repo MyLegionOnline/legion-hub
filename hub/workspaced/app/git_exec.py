@@ -35,6 +35,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import re
 import signal
 import stat
 import subprocess
@@ -391,6 +392,70 @@ def _symlink_in(directory: Path) -> Optional[str]:
     return None
 
 
+_WORKTREE_ADMIN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+
+
+def _task_tree_git_dir(cwd: Path, data_dir: Path, here: Path) -> tuple[Optional[Path], str]:
+    """The room's own git dir for a task tree, or why ``cwd`` is refused.
+
+    ``cwd`` must be exactly ``<data>/<room>/.legion/wt/<task8>`` with no link
+    on the way, and its ``.git`` file must point at ``<data>/<room>/.git/
+    worktrees/<name>`` — an absolute path or one relative to the tree — whose
+    ``commondir`` leads back to that room's ``.git``. Anything else keeps the
+    old refusal, so an agent cannot aim workspaced at another room.
+    """
+    refusal = ".git is a file (linked worktree) inside the room volume"
+    from app.task_tree import room_of_tree
+
+    try:
+        parts = here.relative_to(data_dir).parts
+    except ValueError:
+        return None, refusal
+    room_root = room_of_tree(here)
+    if len(parts) != 4 or room_root is None or room_root.parent != data_dir:
+        return None, refusal
+    # ``resolve()`` followed links; the literal path must not have crossed one.
+    chain = data_dir
+    for part in parts:
+        chain = chain / part
+        try:
+            if stat.S_ISLNK(os.lstat(chain).st_mode):
+                return None, refusal
+        except OSError:
+            return None, refusal
+    common = room_root / ".git"
+    try:
+        if not stat.S_ISDIR(os.lstat(common).st_mode):
+            return None, refusal
+        line = (cwd / ".git").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None, refusal
+    if not line.startswith("gitdir:"):
+        return None, "malformed .git file"
+    pointed = Path(line[len("gitdir:"):].strip())
+    if not pointed.is_absolute():
+        pointed = cwd / pointed
+    pointed = Path(os.path.normpath(pointed))
+    admin = common / "worktrees" / pointed.name
+    if not _WORKTREE_ADMIN_NAME.fullmatch(pointed.name) or pointed.name in (".", ".."):
+        return None, refusal
+    try:
+        st = os.lstat(admin)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            return None, refusal
+        if os.path.realpath(pointed) != os.path.realpath(admin):
+            return None, refusal
+        back = (admin / "commondir").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None, refusal
+    if os.path.normpath(back) != os.path.normpath("../.."):
+        return None, refusal
+    name = _symlink_in(admin)
+    if name:
+        return None, f".git/worktrees/{admin.name}/{name} is a symbolic link"
+    return common, ""
+
+
 def _common_git_dir(cwd: Path) -> tuple[Optional[Path], str]:
     """The git dir whose config applies to ``cwd``; ``(None, "")`` if no repo yet."""
     dotgit = cwd / ".git"
@@ -404,15 +469,17 @@ def _common_git_dir(cwd: Path) -> tuple[Optional[Path], str]:
         return dotgit, ""
     if not stat.S_ISREG(st.st_mode):
         return None, ".git is not a directory"
-    # A ``.git`` file is a linked worktree. Only workspaced's own temporary
-    # worktrees (outside the data volume) have one; inside the volume it would
-    # let an agent point workspaced at another room's repository.
+    # A ``.git`` file is a linked worktree. Outside the data volume only
+    # workspaced's own temporary worktrees have one. Inside the volume it would
+    # let an agent point workspaced at another room's repository — except for
+    # a task tree (``<room>/.legion/wt/<task8>``) whose file names exactly that
+    # room's own ``.git/worktrees/<name>``.
     from app.config import WORKSPACE_DATA_DIR
 
     data_dir = Path(WORKSPACE_DATA_DIR).resolve()
     here = cwd.resolve()
     if here == data_dir or data_dir in here.parents:
-        return None, ".git is a file (linked worktree) inside the room volume"
+        return _task_tree_git_dir(cwd, data_dir, here)
     try:
         line = dotgit.read_text(encoding="utf-8").strip()
     except OSError as exc:

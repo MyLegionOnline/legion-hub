@@ -522,3 +522,21 @@ class TestUserCmP2ReferencedImages:
         """The 5-file-read limit must still be present."""
         prompt = self._cm_p2_prompt()
         assert "at most 5 file reads" in prompt
+
+
+@pytest.mark.asyncio
+async def test_repo_snapshot_failure_does_not_break_the_layer():
+    """E4: a snapshot ReadTimeout while builds ran crashed the agent's session."""
+    import httpx
+
+    from app.core.memory_layer import _render_repo_snapshot
+
+    helpers = _mock_helpers()
+    helpers["_repo_snapshot"] = AsyncMock(side_effect=httpx.ReadTimeout("busy"))
+    with patch.multiple(MODULE, **helpers):
+        layer = await build_memory_layer(
+            _session(kind="user_agent_p1", goal_id=_GOAL_ID, task_id=_TASK_ID, agent_id=_AGENT_ID),
+            AsyncMock(),
+        )
+    assert layer["repo_snapshot"] == {"unavailable": True}
+    assert "unavailable" in _render_repo_snapshot(layer["repo_snapshot"])

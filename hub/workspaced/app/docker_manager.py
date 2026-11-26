@@ -27,6 +27,14 @@ from app.config import (
 )
 from app.schemas import StartRequest, StatusResponse, ExecRequest, ExecResponse, SecretFile
 from app.room_id import is_safe_room_id, require_safe_room_id
+from app.room_pressure import PRESSURE_SCRIPT, parse_pressure, pressure_from_stats
+from app.room_procs import (
+    PROCS_SCRIPT,
+    REAP_EXEC_TIMEOUT_SEC,
+    REAP_GRACE_SEC,
+    parse_list,
+    parse_reap,
+)
 
 logger = logging.getLogger("workspaced.docker")
 
@@ -81,6 +89,10 @@ while True:
 # asks for every running room at once — a stats call costs Docker ~1 s, so a
 # room's figure is reused for this long.
 STATS_CACHE_SEC = 15.0
+# Memory pressure (room_pressure.py) gates task admission and heavy commands,
+# so it is kept fresher than the "In use now" figure.
+PRESSURE_CACHE_SEC = 5.0
+PRESSURE_EXEC_TIMEOUT_SEC = 5.0
 _MIB = 1024 * 1024
 
 
@@ -129,8 +141,22 @@ def cpu_quota_env(cpu_limit_milli: int) -> list[str]:
         f"CMAKE_BUILD_PARALLEL_LEVEL={jobs}",
         f"GOMAXPROCS={jobs}",
         f"PYTEST_XDIST_AUTO_NUM_WORKERS={jobs}",
+        # Next.js sizes its build workers as CIRCLE_NODE_TOTAL - 1, else host
+        # cores - 1 (next/dist/server/config-shared.js, ``experimental.cpus``):
+        # eleven ~90 MB workers on half a core filled a 1 GB room (E4).
+        f"CIRCLE_NODE_TOTAL={int(jobs) + 1}",
         f"UV_THREADPOOL_SIZE={max(2, int(jobs))}",
     ]
+
+
+def tmp_size_mb(mem_limit_mb: int) -> int:
+    """Size of the room's /tmp: at most a quarter of its memory.
+
+    /tmp is tmpfs, and tmpfs pages are charged to the room's memory cgroup.
+    At the flat 512 MB a 1 GB room could spend half its memory on scratch
+    files (E4: agents kept test databases and a worktree copy there).
+    """
+    return max(64, min(WORKSPACE_TMP_MB, int(mem_limit_mb) // 4))
 
 
 def _validate_secret_path(path: str) -> str:
@@ -191,6 +217,8 @@ class DockerManager:
         self._pending_execs: dict[str, list[Any]] = {}
         # room_id -> (monotonic time, stats payload); see STATS_CACHE_SEC.
         self._stats_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        # room_id -> (monotonic time, pressure payload); see PRESSURE_CACHE_SEC.
+        self._pressure_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
     def _room_lock(self, room_id: str) -> asyncio.Lock:
         return self._room_locks.setdefault(room_id, asyncio.Lock())
@@ -287,7 +315,7 @@ class DockerManager:
             # reasonably try. "exec" here is the mount option, not a Python
             # package.
             "Tmpfs": {
-                "/tmp": f"size={WORKSPACE_TMP_MB}m,exec",
+                "/tmp": f"size={tmp_size_mb(req.mem_limit_mb)}m,exec",
                 # Deploy keys and other file-shaped secrets (Stage 5). Small,
                 # noexec (the tmpfs default — no "exec" suffix here, unlike
                 # /tmp above), owned by the workspace user so bash can read a
@@ -371,6 +399,7 @@ class DockerManager:
 
         self._last_activity.pop(room_id, None)
         self._stats_cache.pop(room_id, None)
+        self._pressure_cache.pop(room_id, None)
         return "stopped"
 
     async def destroy(self, room_id: str) -> dict[str, Any]:
@@ -501,6 +530,107 @@ class DockerManager:
             self._stats_cache.pop(room_id, None)
         return {**payload, "cached": False}
 
+    async def pressure(self, room_id: str) -> dict[str, Any]:
+        """Memory pressure inside the room, cached for PRESSURE_CACHE_SEC.
+
+        internal design notes (E0): one short
+        exec reads the room's own cgroup and its largest processes. A stopped
+        room answers ``status: stopped`` with no figures.
+        """
+        room_id = require_safe_room_id(room_id)
+        cached = self._pressure_cache.get(room_id)
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < PRESSURE_CACHE_SEC:
+            return {**cached[1], "cached": True}
+        payload: dict[str, Any] = {"room_id": room_id, "status": "stopped"}
+        container = await self._find_container(_container_name(room_id))
+        if container is not None:
+            info = await container.show()
+            if (info.get("State") or {}).get("Running"):
+                try:
+                    text = await self._exec_capture(container, ["sh", "-c", PRESSURE_SCRIPT])
+                except Exception as exc:  # timeout under the room's CPU quota, exec error
+                    logger.warning(
+                        "pressure: exec in %s failed (%s); using Docker stats",
+                        room_id, type(exc).__name__,
+                    )
+                    payload.update(pressure_from_stats(
+                        memory_from_stats(await container.stats(stream=False))
+                    ))
+                else:
+                    docker_limit = (info.get("HostConfig") or {}).get("Memory") or None
+                    payload.update(parse_pressure(
+                        text, docker_limit_mb=int(docker_limit) // _MIB if docker_limit else None,
+                    ))
+                payload["status"] = "running"
+        if payload["status"] == "running":
+            self._pressure_cache[room_id] = (now, payload)
+        else:
+            self._pressure_cache.pop(room_id, None)
+        return {**payload, "cached": False}
+
+    async def _exec_capture(
+        self, container: Any, cmd: list[str], *, timeout_sec: float = PRESSURE_EXEC_TIMEOUT_SEC
+    ) -> str:
+        """Run one short helper in the container and return its stdout."""
+        ex = await container.exec(cmd, stdout=True, stderr=False)
+        parts: list[bytes] = []
+        async with ex.start(detach=False) as stream:
+            async with asyncio.timeout(timeout_sec):
+                while True:
+                    msg = await stream.read_out()
+                    if msg is None:
+                        break
+                    if msg.stream != 2:
+                        parts.append(msg.data)
+        return b"".join(parts).decode("utf-8", errors="replace")
+
+    async def _running_container(self, room_id: str) -> Any:
+        container = await self._find_container(_container_name(room_id))
+        if container is None:
+            return None
+        info = await container.show()
+        return container if (info.get("State") or {}).get("Running") else None
+
+    async def list_proc_owners(self, room_id: str) -> dict[str, Any]:
+        """Agent processes still alive in the room, grouped by owner tag (E2)."""
+        room_id = require_safe_room_id(room_id)
+        container = await self._running_container(room_id)
+        if container is None:
+            return {"status": "stopped", "owners": {}}
+        text = await self._exec_capture(
+            container, ["sh", "-c", PROCS_SCRIPT, "procs", "list"],
+            timeout_sec=REAP_EXEC_TIMEOUT_SEC,
+        )
+        return {"status": "running", "owners": parse_list(text)}
+
+    async def reap_proc_owners(self, room_id: str, owners: list[str]) -> dict[str, Any]:
+        """SIGTERM every process of these owners, SIGKILL what is left after a grace.
+
+        The caller has decided the owners are finished (a task generation that
+        ended, a closed direct-chat session); owner tags are validated by the
+        request schema and passed as script arguments.
+        """
+        room_id = require_safe_room_id(room_id)
+        if not owners:
+            return {"status": "noop", "terminated": [], "force_killed": [], "pids": [], "removed_tmp": []}
+        container = await self._running_container(room_id)
+        if container is None:
+            return {"status": "stopped", "terminated": [], "force_killed": [], "pids": [], "removed_tmp": []}
+        text = await self._exec_capture(
+            container,
+            ["sh", "-c", PROCS_SCRIPT, "procs", "reap", str(REAP_GRACE_SEC), *owners],
+            timeout_sec=REAP_EXEC_TIMEOUT_SEC,
+        )
+        result = parse_reap(text)
+        if result["pids"] or result["removed_tmp"]:
+            self._pressure_cache.pop(room_id, None)
+            logger.info(
+                "reaped %d agent process(es) and %d scratch dir(s) in room %s for %s",
+                len(result["pids"]), len(result["removed_tmp"]), room_id, ", ".join(owners),
+            )
+        return {"status": "running", **result}
+
     async def update_memory(self, room_id: str, mem_limit_mb: int) -> dict[str, Any]:
         """Change a running room's memory limit in place (``docker update``).
 
@@ -523,6 +653,7 @@ class DockerManager:
                 data={"Memory": memory, "MemorySwap": memory * 2},
             )
             self._stats_cache.pop(room_id, None)
+            self._pressure_cache.pop(room_id, None)
             return {"room_id": room_id, "memory_limit_mb": int(mem_limit_mb)}
 
     async def exec(self, room_id: str, req: ExecRequest) -> ExecResponse:

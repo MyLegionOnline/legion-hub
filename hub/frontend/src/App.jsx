@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Hash, MoreVertical, Trash2, PauseCircle, ChevronLeft, PanelRight, Square, X, RotateCcw } from 'lucide-react';
+import { Hash, MoreVertical, Trash2, PauseCircle, ChevronLeft, PanelRight, Square, X, RotateCcw, Layers } from 'lucide-react';
 import { NavSidebar } from './components/NavSidebar';
 import { ChatList } from './components/ChatList';
 import { ChatWindow } from './components/ChatWindow';
@@ -16,6 +16,8 @@ import { SkillsPanel } from './components/SkillsPanel';
 import { ConnectionsPanel } from './components/ConnectionsPanel';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import { AutoRetrySettingsDialog } from './components/AutoRetrySettings';
+import { ParallelTasksDialog } from './components/ParallelTasksSettings';
+import { DEFAULT_PARALLEL_TASKS } from './lib/parallelTasks';
 import { DEFAULT_AUTO_RETRY_MAX } from './lib/autoRetry';
 import { TaskBoardTab } from './components/TaskBoardTab';
 import { WorkspaceTab } from './components/WorkspaceTab';
@@ -87,6 +89,7 @@ function App() {
   const [switchStatus, setSwitchStatus] = useState(null);
   const [roomMenuOpen, setRoomMenuOpen] = useState(false);
   const [autoRetryRoomId, setAutoRetryRoomId] = useState(null);
+  const [parallelRoomId, setParallelRoomId] = useState(null);
   const [pausingAgents, setPausingAgents] = useState(false);
   const roomMenuRef = useRef(null);
   // Phone layout: one pane at a time. The list (rooms or agents) shows when
@@ -822,9 +825,34 @@ function App() {
       setRooms(prev => prev.map(room => (room.id === roomId ? { ...room, ...patch } : room)));
       setTaskRefreshKey(key => key + 1);
     };
+    const parallelTasks = selectedRoom.parallel_tasks_base ?? DEFAULT_PARALLEL_TASKS;
+    const saveParallelTasks = async (settings) => {
+      const roomId = selectedRoom.id;
+      const res = await API(`/api/v1/rooms/${roomId}`, token, {
+        method: 'PUT',
+        body: JSON.stringify(settings),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(switchErrorText(data, 'Could not save the parallel tasks setting.'));
+      }
+      const { parallel_tasks_base } = await res.json();
+      const patch = { parallel_tasks_base };
+      setSelectedRoom(prev => (prev?.id === roomId ? { ...prev, ...patch } : prev));
+      setRooms(prev => prev.map(room => (room.id === roomId ? { ...room, ...patch } : room)));
+      setTaskRefreshKey(key => key + 1);
+    };
 
     return (
       <div className="flex flex-col h-full overflow-hidden">
+        {parallelRoomId === selectedRoom.id && (
+          <ParallelTasksDialog
+            key={selectedRoom.id}
+            room={selectedRoom}
+            onSave={saveParallelTasks}
+            onClose={() => setParallelRoomId(null)}
+          />
+        )}
         {autoRetryRoomId === selectedRoom.id && (
           <AutoRetrySettingsDialog
             key={selectedRoom.id}
@@ -916,6 +944,16 @@ function App() {
                   >
                     <RotateCcw size={13} />
                     Auto-retry: {autoRetryLabel}
+                  </button>
+                )}
+                {selectedRoom.type !== 'dm' && (
+                  <button
+                    onClick={() => { setParallelRoomId(selectedRoom.id); setRoomMenuOpen(false); }}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-xs text-left transition-colors hover:bg-[var(--bg-hover)]"
+                    style={{ color: 'var(--text-primary)' }}
+                  >
+                    <Layers size={13} />
+                    Parallel tasks: {parallelTasks}
                   </button>
                 )}
                 {selectedRoom.billing_active && (

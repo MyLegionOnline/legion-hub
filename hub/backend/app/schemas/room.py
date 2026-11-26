@@ -35,6 +35,7 @@ class RoomBase(BaseModel):
     vps_access_mode: VpsAccessMode = VpsAccessMode.readonly
     auto_retry_enabled: bool = True
     auto_retry_max: int = Field(default=3, ge=1, le=10)
+    parallel_tasks_base: int = Field(default=2, ge=1, le=4)
 
     @field_validator("coordinator_config", "git_config")
     @classmethod
@@ -84,6 +85,7 @@ class RoomUpdate(BaseModel):
     vps_access_mode: Optional[VpsAccessMode] = None
     auto_retry_enabled: Optional[bool] = None
     auto_retry_max: Optional[int] = Field(default=None, ge=1, le=10)
+    parallel_tasks_base: Optional[int] = Field(default=None, ge=1, le=4)
     user_ids: Optional[List[UUID]] = None
     agent_ids: Optional[List[UUID]] = None
 

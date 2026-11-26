@@ -1000,9 +1000,9 @@ function ModelMetaFields({ form, setForm }) {
         <div className="col-span-2">
           <label className="block text-[10px] mb-1" style={{ color: 'var(--text-secondary)' }}>
             Application context window limit (tokens)
-            <span className="ml-1 font-normal" style={{ color: 'var(--text-muted)' }}>· max size of one model request, default 100 000; not a session-spend limit</span>
+            <span className="ml-1 font-normal" style={{ color: 'var(--text-muted)' }}>· max size of one model request, default 200 000; not a session-spend limit</span>
           </label>
-          {numField('context_window_limit', '100000')}
+          {numField('context_window_limit', '200000')}
         </div>
       </div>
       <details className="mt-3 rounded-lg px-3 py-2" style={{ border: '1px solid var(--border)' }}>

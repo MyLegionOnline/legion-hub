@@ -224,6 +224,22 @@ class BashTool(Tool):
         rid = str(ctx.room_id)
         sid = str(ctx.session_id)
 
+        # Task worktrees (internal design notes E3): a task
+        # with its own tree runs commands there, not in the shared /workspace.
+        from app.core.tools.registry import ctx_tree
+        from app.core.task_trees import rewrite_cmd_for_tree, tree_cwd, tree_container_path
+
+        tree = await ctx_tree(ctx)
+        tree_note = ""
+        if tree:
+            cwd = tree_cwd(cwd, tree)
+            cmd, rewritten = rewrite_cmd_for_tree(cmd, tree)
+            if rewritten:
+                tree_note = (
+                    f"\n[note: /workspace → your task tree {tree_container_path(tree)}; "
+                    "use relative paths or $LEGION_TASK_TREE]"
+                )
+
         if not cmd:
             return "Error: cmd is required — pass the shell command as the `cmd` argument"
 
@@ -254,6 +270,15 @@ class BashTool(Tool):
         )
         if err:
             return err
+        # Tag everything this command spawns with its owner, so the processes
+        # can be stopped once the owner is finished (core/proc_reaper.py).
+        # TMPDIR: the owner's own scratch directory, removed when the task is
+        # over (mktemp, tempfile and os.tmpdir() all honour it).
+        from app.core.proc_reaper import OWNER_ENV, TMPDIR_ENV, owner_tag_for, tmp_dir_for
+
+        exec_env = {**exec_env, OWNER_ENV: owner_tag_for(ctx), TMPDIR_ENV: tmp_dir_for(ctx)}
+        if tree:
+            exec_env["LEGION_TASK_TREE"] = tree_container_path(tree)
         if background and secret_files:
             # A deploy-key file's lifetime is tied to the one exec that wrote
             # it — the launcher exec below returns as soon as the background
@@ -264,19 +289,55 @@ class BashTool(Tool):
                 "exists only for one synchronous call; run the git command without background"
             )
 
+        # A heavy command waits while the room's memory is nearly full, before
+        # the room lock and before its own timeout starts (core/memory_gate.py).
+        from app.core import memory_gate
+
+        memory_note = ""
+        if memory_gate.needs_gate(cmd, background=background, install=_is_install_command(cmd)):
+            gate = await memory_gate.wait_for_memory(ctx, rid)
+            if not gate.ok:
+                if gate.stopped:
+                    return (
+                        "Error: the run was stopped while waiting for workspace memory; "
+                        "the command was not started"
+                    )
+                await memory_gate.notify_room_memory_low(ctx.db, ctx.room_id, gate.pressure or {})
+                own_bg = await self._own_background(ctx, ws, sid)
+                return memory_gate.busy_message(gate.pressure or {}, gate.waited, own_bg)
+            if gate.held_by_room:
+                await memory_gate.notify_room_memory_low(ctx.db, ctx.room_id, gate.pressure or {})
+                memory_note = "\n" + memory_gate.held_by_room_note(gate.pressure or {})
+
+        # E4: an install must not write through a link to the shared dependencies.
+        run_cmd, has_prelude = cmd, False
+        if tree:
+            from app.core.task_trees import dep_unlink_prelude
+
+            prelude = dep_unlink_prelude(cmd, cwd, tree)
+            run_cmd, has_prelude = prelude + cmd, bool(prelude)
+
         if background:
-            return await self._run_background(
-                ctx, ws, cmd, cwd, wsd, exec_env, resolved_secrets, secret_files,
+            out = await self._run_background(
+                ctx, ws, run_cmd, cwd, wsd, exec_env, resolved_secrets, secret_files,
                 wake_on_exit=bool(tool_input.get("wake_on_exit", False)),
                 wake_note=str(tool_input.get("wake_note") or "").strip()[:2000] or None,
             )
+            return out + memory_note + tree_note
 
-        dedup = await self._maybe_dedup_cat(ctx, cmd, cwd)
+        # The read ledger is keyed by shared-tree paths: not for a task tree.
+        dedup = None if tree else await self._maybe_dedup_cat(ctx, cmd, cwd)
         if dedup is not None:
             return dedup
-        return await self._run_sync(
-            ctx, ws, cmd, cwd, timeout_sec, sid, wsd, exec_env, resolved_secrets, secret_files
+        out = await self._run_sync(
+            ctx, ws, run_cmd, cwd, timeout_sec, sid, wsd, exec_env, resolved_secrets, secret_files
         )
+        if has_prelude:
+            from app.core.task_trees import take_dep_unlink_note
+
+            out, dep_note = take_dep_unlink_note(out)
+            tree_note += dep_note
+        return out + memory_note + tree_note
 
     async def _build_exec_env(
         self,
@@ -542,6 +603,25 @@ class BashTool(Tool):
             "via read_file or an earlier cat, content unchanged.] " + receipt
         )
 
+    async def _own_background(self, ctx, ws, sid: str) -> list[tuple[str, str]]:
+        """Running background processes this session started: ``[(bg_id, cmd)]``."""
+        from sqlalchemy.future import select
+
+        from app.models.workspace import WorkspaceBgProc
+
+        try:
+            res = await ctx.db.execute(
+                select(WorkspaceBgProc.bg_id, WorkspaceBgProc.cmd).where(
+                    WorkspaceBgProc.workspace_id == ws.id,
+                    WorkspaceBgProc.session_id == sid,
+                    WorkspaceBgProc.status == "running",
+                )
+            )
+            return [(bg_id, cmd or "") for bg_id, cmd in res.all()]
+        except Exception:
+            logger.debug("bash: listing own background processes failed", exc_info=True)
+            return []
+
     async def _run_background(
         self, ctx, ws, cmd, cwd, wsd, exec_env, resolved_secrets, secret_files,
         *, wake_on_exit: bool = False, wake_note: str | None = None,
@@ -575,6 +655,7 @@ class BashTool(Tool):
         # Launch: env vars carry cmd/log to avoid quoting issues.
         # setsid gives the child its own session so killing by PGID works.
         launch_script = (
+            'mkdir -p "$TMPDIR" 2>/dev/null; '
             'mkdir -p "$(dirname "$BGLOG")" && '
             # The wrapper records the exit code next to the log: bash_wait reads it.
             'setsid bash -c \'bash -c "$BGCMD"; echo $? >"$BGLOG.exit"\' >"$BGLOG" 2>&1 </dev/null & '
@@ -657,6 +738,7 @@ class BashTool(Tool):
     async def _run_sync(self, ctx, ws, cmd, cwd, timeout_sec, sid, wsd, exec_env, resolved_secrets, secret_files) -> str:
         from datetime import datetime, timezone
 
+        from app.core.proc_reaper import TMPDIR_PREFIX
         from app.models.workspace import WorkspaceExec
 
         rid = str(ctx.room_id)
@@ -681,7 +763,8 @@ class BashTool(Tool):
                 with track_room_secrets(resolved_secrets):
                     result = await asyncio.wait_for(
                         wsd.exec_in_workspace(
-                            rid, ["bash", "-c", cmd], cwd=cwd, timeout_sec=timeout_sec,
+                            rid, ["bash", "-c", TMPDIR_PREFIX + cmd], cwd=cwd,
+                            timeout_sec=timeout_sec,
                             env=exec_env or None, secret_files=secret_files,
                         ),
                         timeout=timeout_sec + 10,

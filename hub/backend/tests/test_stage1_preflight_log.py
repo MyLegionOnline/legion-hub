@@ -133,7 +133,7 @@ class TestUserMessageFormat:
             f"{getattr(exc, 'estimated_input_tokens', 0):,} tokens, "
             f"the limit of {getattr(exc, 'cap', 0):,} tokens is exceeded "
             f"(adjustable: {getattr(exc, 'cap_env_var', 'CONTEXT_AGENT_INPUT_CAP')}). "
-            f"Reduce the task context size or simplify the handoff."
+            f"Shorten the goal description, the task description or the handoff."
         )
 
     @pytest.mark.parametrize(
@@ -159,7 +159,7 @@ class TestUserMessageFormat:
         assert f"{estimated:,}" in msg, "estimated_input_tokens missing from message"
         assert f"{cap:,}" in msg, "cap missing from message"
         assert env_var in msg, "cap_env_var name missing from message"
-        assert "Reduce" in msg, "actionable hint missing"
+        assert "Shorten the goal description" in msg, "actionable hint missing"
 
     def test_acceptance_cap_1000_visible_not_100000(self):
         """Acceptance: when CONTEXT_AGENT_INPUT_CAP=1000, message shows 1,000, not 100,000."""

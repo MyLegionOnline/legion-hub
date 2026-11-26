@@ -87,13 +87,17 @@ class EditFileTool(Tool):
                 "Call read_file first — this ensures you are editing the current content."
             )
 
-        if ctx.task_id:
+        from app.core.tools.registry import ctx_tree
+
+        tree = await ctx_tree(ctx)
+        tree_kw = {"tree": tree} if tree else {}
+        if ctx.task_id and not tree:
             # Read and commit on this task's own branch even if a gate merge
             # moved the shared checkout elsewhere meanwhile.
             from app.core.room_git_flow import pin_task_head
 
             await pin_task_head(ctx.room_id, ctx.task_id, ctx.db)
-        content = await wsd.read_workspace_file(str(ctx.room_id), path)
+        content = await wsd.read_workspace_file(str(ctx.room_id), path, **tree_kw)
         if content is None:
             try:
                 from app.core.metrics import (
@@ -137,7 +141,8 @@ class EditFileTool(Tool):
         commit_msg = f"session:{ctx.session_id}: edit {path}{task_ref}"
         try:
             write_result = await wsd.write_workspace_file(
-                str(ctx.room_id), boundary_path, new_content, commit_message=commit_msg
+                str(ctx.room_id), boundary_path, new_content, commit_message=commit_msg,
+                **tree_kw,
             )
         except wsd.WorkspaceMainProtectedError:
             from app.core.room_git_flow import room_working_branch
@@ -157,7 +162,9 @@ class EditFileTool(Tool):
             pass
         try:
             from app.core.tools._repo_map import invalidate_repo_map_path
-            invalidate_repo_map_path(str(ctx.room_id), path)
+            invalidate_repo_map_path(
+                f"{ctx.room_id}:{tree}" if tree else str(ctx.room_id), path
+            )
         except Exception:
             pass
         # Stage 6: no repofile metadata sync — the volume is the single

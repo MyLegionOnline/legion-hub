@@ -531,14 +531,26 @@ async def ensure_task_branch(room_id: "UUID | str", task, db) -> str:
         if goal is not None:
             base = await ensure_goal_branch(room_id, goal, db)
 
-    await wsd.create_workspace_branch(str(room_id), branch, base=base)
+    from app.core import task_trees
+
+    # Own worktree (ROOM_TASK_WORKTREES): the branch is created inside it and
+    # the room's shared HEAD is never switched. A refusal falls back to the
+    # checkout below — the task then runs in the old mode.
+    in_tree = task_trees.wants_task_tree(task) and await task_trees.ensure_task_tree(
+        room_id, task, branch, base, db
+    )
+    if not in_tree:
+        await wsd.create_workspace_branch(str(room_id), branch, base=base)
 
     if getattr(task, "branch_name", None) != branch:
         task.branch_name = branch
         db.add(task)
         await db.flush()
 
-    logger.info("ensure_task_branch: room %s task %s → %s (base %s)", room_id, task.id, branch, base)
+    logger.info(
+        "ensure_task_branch: room %s task %s → %s (base %s%s)",
+        room_id, task.id, branch, base, ", own tree" if in_tree else "",
+    )
     return branch
 
 
@@ -642,8 +654,13 @@ async def _active_task_for_branch(branch: str | None, db):
 
 
 async def _head_held_by_live_work(room_id: "UUID | str", branch: str | None, db) -> bool:
-    """True when ``branch`` is where a running task or an open dialogue writes."""
-    if await _active_task_for_branch(branch, db) is not None:
+    """True when ``branch`` is where a running task or an open dialogue writes.
+
+    A task with its own worktree holds its branch there, not in the shared tree
+    (internal design notes E2): it has no claim on the shared HEAD.
+    """
+    active = await _active_task_for_branch(branch, db)
+    if active is not None and not getattr(active, "worktree", None):
         return True
     return await _live_session_owns_head(room_id, branch, db)
 
@@ -732,6 +749,9 @@ async def pin_task_head(room_id: "UUID | str", task_id, db) -> str | None:
         state = str(getattr(task.state, "value", task.state))
         if state not in _AGENT_ACTIVE_TASK_STATES:
             return None
+        if getattr(task, "worktree", None):
+            # The task's own tree keeps its HEAD; there is nothing to pin.
+            return getattr(task, "branch_name", None) or task_branch_name(task.id)
         branch = getattr(task, "branch_name", None) or task_branch_name(task.id)
         current = await _current_branch(room_id)
         if current is None or current == branch:
@@ -847,7 +867,8 @@ async def ensure_session_branch(room_id: "UUID | str", session, db) -> str | Non
 
 
 async def commit_branch_worktree(
-    room_id: "UUID | str", branch: str, db, *, reason: str, task_id=None
+    room_id: "UUID | str", branch: str, db, *, reason: str, task_id=None,
+    tree: str | None = None,
 ) -> str | None:
     """Commit any uncommitted working-tree changes onto *branch*.
 
@@ -857,7 +878,9 @@ async def commit_branch_worktree(
     classification, and the promotion flow.
 
     Only commits when the workspace HEAD is already on *branch*, so it can
-    never strand changes on the wrong one. Best-effort: no repo, a detached /
+    never strand changes on the wrong one. With ``tree`` (the task's own
+    worktree, which is on its branch by construction) the commit is made there
+    and the shared HEAD is not consulted. Best-effort: no repo, a detached /
     mismatched HEAD, or a transport error just returns ``None``. Emits
     ``FILE_CHANGED`` when a commit was actually created.
     """
@@ -865,12 +888,15 @@ async def commit_branch_worktree(
 
     if not branch:
         return None
-    current = await _current_branch(room_id)
-    if current != branch:
-        return None
+    if not tree:
+        current = await _current_branch(room_id)
+        if current != branch:
+            return None
 
     try:
-        res = await wsd.git_commit_workspace(str(room_id), f"agent (bash): {reason}")
+        res = await wsd.git_commit_workspace(
+            str(room_id), f"agent (bash): {reason}", **({"tree": tree} if tree else {})
+        )
     except Exception as exc:
         logger.warning("commit_branch_worktree: commit failed on %s: %s", branch, exc)
         return None
@@ -935,8 +961,13 @@ async def _emit_held_back_binaries(room_id, branch: str, res: Mapping, db, task_
 async def commit_working_tree(room_id: "UUID | str", task, db, *, reason: str) -> str | None:
     """``commit_branch_worktree`` for the branch of *task* (its usual caller)."""
     branch = getattr(task, "branch_name", None) or task_branch_name(task.id)
+    tree = None
+    if getattr(task, "worktree", None):
+        from app.core.task_trees import task8_of
+
+        tree = task8_of(task.id)
     return await commit_branch_worktree(
-        room_id, branch, db, reason=reason, task_id=task.id
+        room_id, branch, db, reason=reason, task_id=task.id, tree=tree
     )
 
 
@@ -945,7 +976,14 @@ async def merge_task_branch(room_id: "UUID | str", task, db) -> dict[str, Any]:
     that is still running (see ``return_head_to_live_work``)."""
     branch = getattr(task, "branch_name", None) or task_branch_name(task.id)
     async with keep_live_head(room_id, db, merged_branch=branch):
-        return await _merge_task_branch(room_id, task, db)
+        result = await _merge_task_branch(room_id, task, db)
+    if result.get("ok") and getattr(task, "worktree", None):
+        # The branch is folded into its base: the task's own tree has done its
+        # job. A conflict keeps it — the work continues there.
+        from app.core import task_trees
+
+        await task_trees.remove_task_tree(room_id, task, db)
+    return result
 
 
 async def _merge_task_branch(room_id: "UUID | str", task, db) -> dict[str, Any]:
@@ -990,13 +1028,19 @@ async def _merge_task_branch(room_id: "UUID | str", task, db) -> dict[str, Any]:
     # copy of every file it happens to touch, discarding whatever landed on the
     # base in between. Merge the base *into* the branch first with a plain 3-way
     # merge: a genuine overlap now surfaces as a conflict for a human instead of
-    # being dropped without a trace.
+    # being dropped without a trace. A task with its own worktree does this
+    # inside it (the tree is on its branch already — no checkout, the shared
+    # HEAD stays put); otherwise the shared tree checks the branch out.
+    from app.core.task_trees import tree_of_task
+
+    task_tree = tree_of_task(task)
     refresh = await wsd.merge_workspace_branch(
         str(room_id),
         target,
         message=f"merge {target} into {branch} before Gate 1 merge",
         target=branch,
         theirs=False,
+        **({"tree": task_tree} if task_tree else {}),
     )
     if refresh.get("conflict"):
         # internal design notes Stage 0 — mark the task so the "Divergence
@@ -1199,7 +1243,14 @@ async def run_task_checks(
 
     check_env, check_secrets = await _resolve_checks_env(room_id, db, scope)
     try:
-        run = await wsd.run_workspace_checks(str(room_id), scope=scope, ref=branch, env=check_env or None)
+        from app.core.task_trees import tree_of_task
+
+        # A task with its own worktree is checked right there, on its branch.
+        task_tree = tree_of_task(task)
+        run = await wsd.run_workspace_checks(
+            str(room_id), scope=scope, ref=branch, env=check_env or None,
+            **({"tree": task_tree} if task_tree else {}),
+        )
         run = _mask_check_run(run, check_secrets)
     except Exception as exc:
         logger.warning("run_task_checks: checks did not run for task %s: %s", task.id, exc)

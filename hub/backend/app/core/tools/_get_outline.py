@@ -46,8 +46,14 @@ class GetOutlineTool(Tool):
         query = str(tool_input.get("query") or "").strip().lower()
         # A generation/tree lookup lets a repeated outline call return a
         # receipt without fetching the file body again.
+        from app.core.tools.registry import ctx_tree
+
+        tree = await ctx_tree(ctx)
+        tree_kw = {"tree": tree} if tree else {}
         try:
-            snapshot = await wsd.get_workspace_snapshot(str(ctx.room_id), max_previews=0)
+            snapshot = await wsd.get_workspace_snapshot(
+                str(ctx.room_id), max_previews=0, **tree_kw
+            )
             entry = next(
                 (
                     item for item in (snapshot.get("files") or [])
@@ -57,7 +63,7 @@ class GetOutlineTool(Tool):
             )
             fingerprint = str((entry or {}).get("fingerprint") or "")
             cached = _OUTLINE_CACHE.get(
-                (str(ctx.room_id), path, fingerprint, query, max_symbols)
+                (str(ctx.room_id), tree or "", path, fingerprint, query, max_symbols)
             )
             if fingerprint and cached is not None:
                 ref = str(cached.get("observation_ref") or "")
@@ -71,7 +77,7 @@ class GetOutlineTool(Tool):
                 return _truncate(json.dumps(cached, ensure_ascii=False, separators=(",", ":")))
         except Exception:
             pass
-        content = await wfs.fs_read_file(ctx.room_id, path, ctx.db)
+        content = await wfs.fs_read_file(ctx.room_id, path, ctx.db, **tree_kw)
         if content is None:
             return f"File not found: {path!r}"
         if content.startswith("data:") and ";base64," in content:

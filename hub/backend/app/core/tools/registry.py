@@ -147,6 +147,10 @@ class ToolContext:
     # Deferred tools of the parent session (app/core/tool_offer.ToolOffer); a
     # run_subtask child starts from a copy of it.
     tool_offer: Any = None
+    # The task's own worktree (``<task8>``), resolved lazily by ``ctx_tree``;
+    # None = the shared tree (no task, or a task begun before the flag).
+    tree: Optional[str] = None
+    _tree_resolved: bool = False
 
     async def release_db(self, *, reason: str = "tool") -> bool:
         """Commit before a long external wait (stage 1.2.3, internal design notes §8.2).
@@ -157,6 +161,36 @@ class ToolContext:
         step towards the per-operation ``ctx.db_session()`` of stage 1.3.
         """
         return await release_tool_db(self, reason=reason)
+
+
+async def ctx_tree(ctx: Any) -> Optional[str]:
+    """The task's own worktree (``<task8>``) for this tool call, or ``None``.
+
+    internal design notes E2: a task with ``task.worktree``
+    reads and writes its own tree, never the shared ``/workspace``. Resolved
+    once per context from the task row; any lookup failure means the old mode.
+    """
+    tree = getattr(ctx, "tree", None)
+    if tree:
+        return str(tree)
+    if getattr(ctx, "_tree_resolved", False):
+        return None
+    task_id = getattr(ctx, "task_id", None)
+    db = getattr(ctx, "db", None)
+    if task_id is None or db is None:
+        return None
+    try:
+        from app.core.task_trees import tree_of_task_id
+
+        tree = await tree_of_task_id(task_id, db)
+    except Exception:  # noqa: BLE001 — old mode is always safe
+        tree = None
+    try:
+        ctx._tree_resolved = True
+        ctx.tree = tree
+    except Exception:  # noqa: BLE001 — frozen / slotted test contexts
+        pass
+    return tree
 
 
 async def release_tool_db(ctx: Any, *, reason: str = "tool") -> bool:

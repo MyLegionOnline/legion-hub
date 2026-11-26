@@ -286,7 +286,7 @@ async def test_legacy_proxy_preflight_blocks_normal_and_forced_close_http_reques
                 session_id=uuid4(),
                 task_id=None,
                 db=db,
-                budget_used=96_000,
+                budget_used=196_000,
                 context_role="agent",
                 on_exhaust="force_close",
             )

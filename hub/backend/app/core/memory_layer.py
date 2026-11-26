@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import inspect
 import hashlib
+import logging
 from typing import Any, Optional
 from uuid import UUID
 
@@ -43,6 +44,8 @@ from app.models.room import RoomAgentLink
 from app.models.session.base import Session
 from app.models.task import Task, TaskHandoff
 from app.models.workspace import Workspace
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +172,30 @@ _KIND_HEADERS: dict[str, str] = {
         "   is a human approval / decision point, not agent work. If you truly\n"
         "   cannot tell who should own a step, still list the step and leave\n"
         "   <assignee> empty rather than dropping <plan_steps> entirely.\n\n"
+        "   WHERE ONE STEP ENDS AND THE NEXT BEGINS — each step becomes a separate\n"
+        "   task, run by an agent that starts with NO memory of earlier tasks: only\n"
+        "   what was committed to the repository (files, the branch) carries over.\n"
+        "   - Put a step boundary only where the earlier step leaves a file in the\n"
+        "     repo that the later step reads. Name that file in both steps.\n"
+        "   - Studying, analysing or reading up is NOT its own step when its only\n"
+        "     output would be knowledge for the next step — that knowledge is lost.\n"
+        "     Fold it into the step that uses it. Make it a separate step only when\n"
+        "     the study is large on its own, and then its acceptance is a written\n"
+        "     findings file (e.g. `docs/<topic>/findings.md`).\n"
+        "   - 'Save to a file', 'commit', 'write it up', 'format the result' are\n"
+        "     never steps of their own — they are acceptance criteria of the step\n"
+        "     that produces the content.\n"
+        "   - If the work is too big for one agent session, split it by SCOPE\n"
+        "     (module, component, document section), not by stage of thinking: each\n"
+        "     part goes through study → do → save inside its own step.\n"
+        "     WRONG (one agent): 'Study the config' → 'Draw the diagrams' →\n"
+        "            'Save the diagrams to a .md file'.\n"
+        "     RIGHT: one step 'Study the config and write the diagrams to\n"
+        "            docs/<name>/diagrams.md'; or, if large, 'Data-flow diagrams →\n"
+        "            docs/<name>/flow.md' and 'Config diagrams → docs/<name>/config.md'.\n"
+        "   - Stages such as development → testing → deploy stay separate: each\n"
+        "     boundary leaves an artefact (code on the branch, a test report) and\n"
+        "     usually changes the owner.\n\n"
         "   REQUIREMENTS, NON-GOALS, OPEN QUESTIONS — fill these from the dialogue,\n"
         "   not from your own summary:\n"
         "   - <requirements>: every distinct thing the user asked for, one\n"
@@ -282,8 +309,41 @@ _KIND_HEADERS: dict[str, str] = {
         "expected behaviour in words. A self-contradicting acceptance criterion costs a whole\n"
         "agent session: the agent either implements the wrong branch or has to stop and ask\n"
         "ChatMaster mid-task about a mistake you could have caught here.\n\n"
+        "TASK BOUNDARIES — AGENTS DO NOT SHARE MEMORY BETWEEN TASKS:\n"
+        "Each task is run by an agent that starts with NO memory of earlier tasks —\n"
+        "not even its own. Only what was committed to the repository (files, the\n"
+        "branch) carries over. Two opposite mistakes waste a task:\n"
+        "  - too big: the agent runs out of context or budget mid-task;\n"
+        "  - too fragmented: a boundary falls where the result exists only in the\n"
+        "    agent's head, so the next task has to redo it.\n"
+        "Rules:\n"
+        "  - Cut between tasks only where the earlier task leaves a file in the repo\n"
+        "    that the later task reads. Name that file path in both descriptions.\n"
+        "  - Studying, analysing or reading up is NOT its own task when its only\n"
+        "    output would be knowledge for the next task. Fold it into the task that\n"
+        "    uses it. Make it a separate task only when the study is large on its own,\n"
+        "    and then its acceptance criterion is a written findings file.\n"
+        "  - 'Save to a file', 'commit', 'write it up', 'format the result' are never\n"
+        "    tasks of their own — they are acceptance criteria of the task that\n"
+        "    produces the content.\n"
+        "  - If the work is too big for one agent session, split it by SCOPE (module,\n"
+        "    component, document section), not by stage of thinking: each part goes\n"
+        "    through study → do → save inside its own task.\n"
+        "  - Plan steps that break these rules (e.g. a study step, then a do step,\n"
+        "    then a save step for the same agent) MUST be merged into one task, even\n"
+        "    if the plan lists them separately. Carry all their requirements and\n"
+        "    `covers` codes into the merged task.\n"
+        "  WRONG (one agent): 'Study the config' → 'Draw the diagrams' → 'Save the\n"
+        "         diagrams to a .md file' — tasks 2 and 3 start knowing nothing.\n"
+        "  RIGHT: one task 'Study the config and write the diagrams to\n"
+        "         docs/<name>/diagrams.md'; or, if large, split by scope: 'Data-flow\n"
+        "         diagrams → docs/<name>/flow.md' and 'Config diagrams →\n"
+        "         docs/<name>/config.md', each studying its own part.\n\n"
         "IMPORTANT — task dependencies:\n"
         "1. Identify logical execution phases (e.g. development → testing → deploy).\n"
+        "   A phase boundary is legitimate because it leaves an artefact (code on the\n"
+        "   branch, a test report) and usually changes the owner — not a\n"
+        "   'think → do → write' sequence of one agent.\n"
         "2. Give every task a unique ref: a short slug without spaces (e.g. 'build-api').\n"
         "3. If a task cannot start until another finishes, set depends_on to that task's ref.\n"
         "4. Tasks within the same phase that can run in parallel must NOT be linked.\n\n"
@@ -437,6 +497,15 @@ _KIND_HEADERS: dict[str, str] = {
         "  bash_wait(bg_id, max_wait_sec?) — block until a background process exits (or the timeout). Free: no tool-call budget, no time limit. Run installs/builds with bash(background=true) then bash_wait; never poll bash_output in a loop.\n"
         "  bash(background=true, wake_on_exit=true, wake_note?) — direct chat only: for a job that may take more than a few minutes, start it this way, tell the user what you wait for and END THE TURN; you are resumed once when it exits.\n"
         "  bash_kill(bg_id) — stop a background process.\n"
+        "  If $LEGION_TASK_TREE is set, your task works in its own git tree there, on branch task/<id>; other tasks cannot move it. bash starts in it and maps /workspace to it. Do not create worktrees or copies of the project. /workspace itself is the room's integration tree. Room services (workspace_service) run from the integration tree and do not see your branch: to check your own code over HTTP, start a dev server in your tree with bash(background=true) on a free port, curl it, and bash_kill it when done; do not restart or declare room services for that.\n"
+        "  The workspace and its memory are shared with other agents' tasks: reuse a running "
+        "room service instead of starting another dev server (except the one check of your own "
+        "task tree above); never copy the project or "
+        "node_modules to work in isolation; bash_kill your background processes once you no "
+        "longer need them (whatever is left is stopped when your task's run ends). Put scratch "
+        "files (dumps, logs, test databases, a git worktree) under $TMPDIR, not straight in "
+        "/tmp: /tmp counts against the room's memory and $TMPDIR is removed when your task "
+        "is done.\n"
         "  preview_fetch(port, path?) — legacy diagnostic for an existing port; do not use it for new user-visible apps.\n"
         "  web_search(query) / web_fetch(url) — web search and page reading, ONLY if they are in your tool list. "
         "Otherwise use a search tool listed under load_tools, if any; never call a tool name that is in neither.\n"
@@ -663,7 +732,23 @@ async def build_memory_layer(session: Session, db: AsyncSession) -> dict[str, An
     room_id = session.room_id
 
     room_mem = await _room_memory(room_id, db)
-    repo_snap = await _repo_snapshot(room_id, db)
+    try:
+        from app.core.task_trees import tree_of_task_id
+
+        _task_id = getattr(session, "task_id", None)
+        _tree = await tree_of_task_id(_task_id, db) if _task_id else None
+        repo_snap = (
+            await _repo_snapshot(room_id, db, tree=_tree)
+            if _tree
+            else await _repo_snapshot(room_id, db)
+        )
+    except Exception as exc:
+        # Orientation only: a busy workspaced (snapshot timeout while builds
+        # run, E4) must not crash the agent's session at start.
+        logger.warning(
+            "memory_layer: repo snapshot of room %s unavailable: %s", room_id, exc
+        )
+        repo_snap = {"unavailable": True}
     agents = await _agents_list_short(room_id, db)
     mcp_unassigned = await _attach_agents_mcp(room_id, agents, db)
     await _refresh_vision_hints(agents)
@@ -825,6 +910,36 @@ async def build_memory_layer(session: Session, db: AsyncSession) -> dict[str, An
     raise ValueError(f"Unknown session kind: {kind!r}")
 
 
+_SAME_AS_GOAL = "(same as the goal description above)"
+
+
+def _without_goal_copies(
+    plan: Optional[dict[str, Any]], goal: Optional[dict[str, Any]]
+) -> Optional[dict[str, Any]]:
+    """Drop step descriptions that repeat the goal description verbatim.
+
+    A plan accepted without steps gets one fallback step whose description is
+    the goal's own; rendering it again doubles the largest block of the prompt.
+    """
+    if not plan or not goal:
+        return plan
+    goal_text = str(goal.get("description") or "").strip()
+    steps = plan.get("steps") or []
+    if not goal_text or not any(
+        str(step.get("description") or "").strip() == goal_text for step in steps
+    ):
+        return plan
+    return {
+        **plan,
+        "steps": [
+            {**step, "description": _SAME_AS_GOAL}
+            if str(step.get("description") or "").strip() == goal_text
+            else step
+            for step in steps
+        ],
+    }
+
+
 def build_system_prompt(memory_layer: dict[str, Any], kind: str) -> str:
     """Render *memory_layer* as a structured system-prompt string.
 
@@ -855,7 +970,9 @@ def build_system_prompt(memory_layer: dict[str, Any], kind: str) -> str:
         parts.append(_render_list_of_goals(memory_layer["list_of_goals"]))
 
     if "plan_of_goal" in memory_layer:
-        parts.append(_render_plan(memory_layer["plan_of_goal"]))
+        parts.append(_render_plan(
+            _without_goal_copies(memory_layer["plan_of_goal"], memory_layer.get("goal"))
+        ))
 
     if "task_data" in memory_layer:
         parts.append(_render_task_data(memory_layer["task_data"]))
@@ -896,9 +1013,17 @@ async def _room_memory(room_id: UUID, db: AsyncSession) -> str:
     return result.scalar_one_or_none() or ""
 
 
-async def _repo_snapshot(room_id: UUID, db: AsyncSession) -> dict[str, Any]:
-    """Return a bounded navigation snapshot; symbol details belong to repo_map."""
-    files = await wfs.fs_list_files_short(room_id, db)
+async def _repo_snapshot(
+    room_id: UUID, db: AsyncSession, tree: str | None = None
+) -> dict[str, Any]:
+    """Return a bounded navigation snapshot; symbol details belong to repo_map.
+
+    ``tree`` — the task's own worktree (internal design notes E2); without it
+    the shared tree.
+    """
+    files = await wfs.fs_list_files_short(
+        room_id, db, **({"tree": tree} if tree else {})
+    )
     paths = [str(item.get("path", "")) for item in files]
     roots = sorted({path.strip("/").split("/", 1)[0] for path in paths if path.strip("/")})
     revision = hashlib.sha256(
@@ -1276,6 +1401,11 @@ async def _agent_skills(agent_id: UUID, db: AsyncSession) -> str:
 
 def _render_repo_snapshot(snapshot: Any) -> str:
     if isinstance(snapshot, dict):
+        if snapshot.get("unavailable"):
+            return (
+                "## Repository Snapshot\n\n*(unavailable right now — the workspace "
+                "service did not answer; list files with your tools)*"
+            )
         if not snapshot.get("file_count"):
             return "## Repository Snapshot\n\n*(no files)*"
         lines = [

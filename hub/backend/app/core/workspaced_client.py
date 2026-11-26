@@ -256,6 +256,35 @@ async def get_workspace_stats(room_id: str) -> dict[str, Any]:
         return r.json()
 
 
+async def get_room_pressure(room_id: str) -> dict[str, Any]:
+    """Memory pressure inside the room, cached 5 s by workspaced.
+
+    internal design notes (E0). Use
+    :func:`app.core.room_slots.room_pressure` instead of calling this
+    directly: it turns every failure into "unknown".
+    """
+    async with _client(read_timeout=8.0) as c:
+        r = await c.get(f"/workspaces/{room_id}/pressure")
+        r.raise_for_status()
+        return r.json()
+
+
+async def list_proc_owners(room_id: str) -> dict[str, Any]:
+    """Agent processes alive in the room, ``{"owners": {tag: [{pid, cmd}]}}`` (E2)."""
+    async with _client(read_timeout=40.0) as c:
+        r = await c.get(f"/workspaces/{room_id}/procs")
+        r.raise_for_status()
+        return r.json()
+
+
+async def reap_proc_owners(room_id: str, owners: list[str]) -> dict[str, Any]:
+    """Stop every process of finished owners (SIGTERM, then SIGKILL)."""
+    async with _client(read_timeout=40.0) as c:
+        r = await c.post(f"/workspaces/{room_id}/procs/reap", json={"owners": owners})
+        r.raise_for_status()
+        return r.json()
+
+
 async def update_workspace_memory(room_id: str, mem_limit_mb: int) -> dict[str, Any]:
     """Change a running room's memory limit without a restart (T2a)."""
     async with _client(read_timeout=30.0) as c:
@@ -371,9 +400,9 @@ def exec_stream_client(
 
 # ── File operations (work without a running container) ───────────────────────
 
-async def get_workspace_tree(room_id: str) -> list[dict[str, Any]]:
+async def get_workspace_tree(room_id: str, tree: Optional[str] = None) -> list[dict[str, Any]]:
     async with _client() as c:
-        r = await c.get(f"/workspaces/{room_id}/tree")
+        r = await c.get(f"/workspaces/{room_id}/tree", params={"tree": tree} if tree else None)
         r.raise_for_status()
         return r.json()
 
@@ -390,11 +419,19 @@ async def list_dialogue_archive_files(room_id: str) -> list[dict[str, Any]]:
         return r.json()
 
 
-async def read_workspace_file(room_id: str, path: str) -> Optional[str]:
-    """Return file content, or None if not found (404)."""
+async def read_workspace_file(
+    room_id: str, path: str, tree: Optional[str] = None
+) -> Optional[str]:
+    """Return file content, or None if not found (404).
+
+    ``tree`` — a task's own worktree (``<task8>``), see internal design notes.
+    """
     path = normalize_workspace_path(path)
+    params: dict[str, Any] = {"path": path}
+    if tree:
+        params["tree"] = tree
     async with _client() as c:
-        r = await c.get(f"/workspaces/{room_id}/file", params={"path": path})
+        r = await c.get(f"/workspaces/{room_id}/file", params=params)
         if r.status_code == 404:
             return None
         r.raise_for_status()
@@ -402,15 +439,15 @@ async def read_workspace_file(room_id: str, path: str) -> Optional[str]:
 
 
 async def get_workspace_outline(
-    room_id: str, path: str, max_symbols: int = 40
+    room_id: str, path: str, max_symbols: int = 40, tree: Optional[str] = None
 ) -> Optional[dict[str, Any]]:
     """Return symbols/imports for a file without transferring its contents."""
     path = normalize_workspace_path(path)
+    params: dict[str, Any] = {"path": path, "max_symbols": max_symbols}
+    if tree:
+        params["tree"] = tree
     async with _client() as c:
-        r = await c.get(
-            f"/workspaces/{room_id}/outline",
-            params={"path": path, "max_symbols": max_symbols},
-        )
+        r = await c.get(f"/workspaces/{room_id}/outline", params=params)
         if r.status_code == 404:
             return None
         r.raise_for_status()
@@ -422,12 +459,15 @@ async def get_workspace_snapshot(
     paths: Optional[list[str]] = None,
     max_previews: int = 20,
     preview_chars: int = 600,
+    tree: Optional[str] = None,
 ) -> dict[str, Any]:
     """Return the authoritative volume snapshot and its generation."""
     params: dict[str, Any] = {
         "max_previews": max_previews,
         "preview_chars": preview_chars,
     }
+    if tree:
+        params["tree"] = tree
     if paths:
         params["paths"] = [normalize_workspace_path(path) for path in paths]
     async with _client() as c:
@@ -451,9 +491,12 @@ async def write_workspace_file(
     commit_message: Optional[str] = None,
     *,
     commit_only_path: bool = False,
+    tree: Optional[str] = None,
 ) -> dict[str, Any]:
     path = normalize_workspace_path(path)
     body: dict[str, Any] = {"content": content}
+    if tree:
+        body["tree"] = tree
     if commit_message:
         body["commit_message"] = commit_message
     if commit_only_path:
@@ -474,9 +517,12 @@ async def delete_workspace_file(
     room_id: str,
     path: str,
     commit_message: Optional[str] = None,
+    tree: Optional[str] = None,
 ) -> bool:
     path = normalize_workspace_path(path)
     params: dict[str, str] = {"path": path}
+    if tree:
+        params["tree"] = tree
     if commit_message:
         params["commit_message"] = commit_message
     async with _client() as c:
@@ -514,8 +560,9 @@ async def git_commit_workspace(
     room_id: str,
     message: str,
     allow_main_commit: bool = False,
+    tree: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Commit the workspace tree.
+    """Commit the workspace tree (or a task's own ``tree``).
 
     ``allow_main_commit`` defaults to False so an agent / auto commit on
     ``main`` is rejected by ``workspaced`` with 409 (internal design notes
@@ -524,7 +571,11 @@ async def git_commit_workspace(
     async with _client() as c:
         r = await c.post(
             f"/workspaces/{room_id}/git/commit",
-            json={"message": message, "allow_main_commit": allow_main_commit},
+            json={
+                "message": message,
+                "allow_main_commit": allow_main_commit,
+                **({"tree": tree} if tree else {}),
+            },
         )
         _raise_if_busy(r)
         r.raise_for_status()
@@ -654,8 +705,11 @@ async def git_log_workspace(
     path: Optional[str] = None,
     limit: int = 20,
     rev_range: Optional[str] = None,
+    tree: Optional[str] = None,
 ) -> dict[str, Any]:
     params: dict[str, Any] = {"limit": limit}
+    if tree:
+        params["tree"] = tree
     if path:
         params["path"] = normalize_workspace_path(path, allow_empty=True)
     if rev_range:
@@ -673,8 +727,11 @@ async def git_diff_workspace(
     path: Optional[str] = None,
     stat: bool = False,
     merge_base: bool = False,
+    tree: Optional[str] = None,
 ) -> dict[str, Any]:
     params: dict[str, Any] = {}
+    if tree:
+        params["tree"] = tree
     if from_ref:
         params["from_ref"] = from_ref
     if to_ref:
@@ -750,6 +807,56 @@ async def create_workspace_branch(
         return r.json()
 
 
+async def add_task_worktree(
+    room_id: str,
+    task8: str,
+    branch: str,
+    base: Optional[str] = None,
+) -> dict[str, Any]:
+    """Give a task its own worktree on ``branch`` (idempotent; the shared HEAD stays put).
+
+    internal design notes E1. Raises on 409 (tree on another
+    branch / branch checked out elsewhere) — the caller decides what to do.
+    """
+    body: dict[str, Any] = {"branch": branch}
+    if base:
+        body["base"] = base
+    async with _client() as c:
+        r = await c.post(f"/workspaces/{room_id}/worktrees/{task8}", json=body)
+        _raise_if_busy(r)
+        r.raise_for_status()
+        return r.json()
+
+
+async def remove_task_worktree(room_id: str, task8: str, *, force: bool = False) -> dict[str, Any]:
+    """Remove a task's worktree (pending work is parked in a commit); the branch stays."""
+    async with _client() as c:
+        r = await c.delete(
+            f"/workspaces/{room_id}/worktrees/{task8}",
+            params={"force": "true"} if force else None,
+        )
+        _raise_if_busy(r)
+        r.raise_for_status()
+        return r.json()
+
+
+async def list_task_worktrees(room_id: str) -> list[dict[str, Any]]:
+    async with _client() as c:
+        r = await c.get(f"/workspaces/{room_id}/worktrees")
+        _raise_if_busy(r)
+        r.raise_for_status()
+        return r.json()
+
+
+async def prune_task_worktrees(room_id: str) -> dict[str, Any]:
+    """Forget worktrees whose directory is gone."""
+    async with _client() as c:
+        r = await c.post(f"/workspaces/{room_id}/worktrees/prune")
+        _raise_if_busy(r)
+        r.raise_for_status()
+        return r.json()
+
+
 async def rename_workspace_branch(
     room_id: str,
     name: str,
@@ -779,8 +886,12 @@ async def merge_workspace_branch(
     *,
     strategy: Literal["ours", "theirs", "legacy"] | None = "legacy",
     expected_tips: tuple[str, str] | None = None,
+    tree: Optional[str] = None,
 ) -> dict[str, Any]:
+    """Merge ``name`` into ``target``; with ``tree`` inside that task worktree (on ``target``)."""
     body: dict[str, Any] = {"name": name}
+    if tree:
+        body["tree"] = tree
     if message:
         body["message"] = message
     if target:
@@ -1131,8 +1242,13 @@ async def run_workspace_checks(
     ref: Optional[str] = None,
     timeout_sec: int = 600,
     env: Optional[dict[str, str]] = None,
+    tree: Optional[str] = None,
 ) -> dict[str, Any]:
     """internal design notes Stage 2 — run the room's declared CI checks.
+
+    ``tree`` (``<task8>``) runs them inside that task's own worktree, on its
+    branch, with no checkout (``ref`` is then ignored).
+
 
     ``env`` (internal design notes Stage 6) carries resolved Room
     variables/secrets values for this one call only — never logged, never
@@ -1142,7 +1258,9 @@ async def run_workspace_checks(
     room declared no matching checks.
     """
     body: dict[str, Any] = {"scope": scope, "timeout_sec": timeout_sec}
-    if ref:
+    if tree:
+        body["tree"] = tree
+    elif ref:
         body["ref"] = ref
     if env:
         body["env"] = env

@@ -20,6 +20,7 @@ from app.core import log_redaction
 
 # WebSocket tokens ride in the query string; uvicorn would log them.
 log_redaction.install()
+log_redaction.configure_app_logging()
 
 app = FastAPI(title="Legion Hub", version="2.0.0")
 

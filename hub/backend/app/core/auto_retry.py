@@ -31,6 +31,9 @@ _AUTO_RETRY_ACTIONS: dict[str, RestartMode] = {
     "timeout": "retry",
     "cm_answer_failed": "retry",
     "orphaned_restart": "retry",
+    # An unhandled error in the proxy loop: usually transient (DB pool, a
+    # workspaced timeout); bounded by the room's attempt limit (E4, 2026-11-23).
+    "proxy_error": "retry",
     "tool_calls": "resume",
     "context_window": "resume",
 }

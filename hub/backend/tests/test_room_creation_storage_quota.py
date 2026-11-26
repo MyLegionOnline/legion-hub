@@ -19,6 +19,7 @@ def _room_input():
         coordinator_config={},
         auto_retry_enabled=True,
         auto_retry_max=3,
+        parallel_tasks_base=2,
         user_ids=[],
         agent_ids=[],
     )

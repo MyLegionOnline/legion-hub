@@ -192,7 +192,8 @@ async def tree_of_task_id(task_id: "UUID | str", db) -> str | None:
     path = (
         await db.execute(select(Task.worktree).where(Task.id == tid))
     ).scalar_one_or_none()
-    return task8_of(tid) if path else None
+    # Only a recorded path counts: anything else (a mocked session) is old mode.
+    return task8_of(tid) if isinstance(path, str) and path else None
 
 
 async def ensure_task_tree(room_id: "UUID | str", task, branch: str, base: str | None, db) -> bool:

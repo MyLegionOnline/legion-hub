@@ -40,9 +40,13 @@ def _db_returning(*objs):
 
 
 def _make_ctx(*db_objs):
-    return ToolContext(
+    ctx = ToolContext(
         room_id=uuid4(), session_id=uuid4(), task_id=uuid4(), db=_db_returning(*db_objs)
     )
+    # Shared tree: the queued db results are for the bash tool, not the
+    # task-worktree lookup.
+    ctx._tree_resolved = True
+    return ctx
 
 
 # ── _build_exec_env ─────────────────────────────────────────────────────────

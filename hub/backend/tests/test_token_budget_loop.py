@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.core.context_policy import DEFAULT_CONTEXT_WINDOW_LIMIT
 from app.core.token_budget import TOKEN_LIMIT
 from app.core.user_sessions import (
     _LLMTurnResult,
@@ -117,10 +118,10 @@ class TestWsLoopBudgetGuard:
                     db=db,
                     workspace_ant_tools=[{"name": "read_file"}],
                     on_exhaust="raise",
-                    budget_used=TOKEN_LIMIT,
+                    budget_used=DEFAULT_CONTEXT_WINDOW_LIMIT,
                 )
         assert caught.value.reason == "token_budget"
-        assert caught.value.tokens_used == TOKEN_LIMIT
+        assert caught.value.tokens_used == DEFAULT_CONTEXT_WINDOW_LIMIT
         assert caught.value.tool_calls_used == 0
         mock_client.assert_not_called()
 
